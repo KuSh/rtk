@@ -767,16 +767,11 @@ fn dotnet_tokens(args: &[String]) -> Vec<Token<'_>> {
 }
 
 fn dotnet_flag_value<'a>(tokens: &[Token<'a>], name: &str) -> Option<&'a str> {
-    tokens
-        .iter()
-        .find(|t| t.kind == TokenKind::Long && t.text.eq_ignore_ascii_case(name))
-        .and_then(|t| t.value(tokens))
+    arg_tokenizer::flag_value(tokens, Dialect::Msbuild, name)
 }
 
 fn dotnet_has_flag(tokens: &[Token<'_>], name: &str) -> bool {
-    tokens
-        .iter()
-        .any(|t| t.kind == TokenKind::Long && t.text.eq_ignore_ascii_case(name))
+    arg_tokenizer::has_flag(tokens, Dialect::Msbuild, name)
 }
 
 fn has_nologo_arg(args: &[String]) -> bool {

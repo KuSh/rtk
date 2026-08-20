@@ -69,6 +69,37 @@ impl<'a> Token<'a> {
     }
 }
 
+/// True if `text` (a `Long` token's name) matches `name` under `dialect`'s naming rules:
+/// exact for [`Dialect::Posix`] (git/cargo/rg/golangci-lint are case-sensitive), ASCII
+/// case-insensitive for [`Dialect::Msbuild`] (Windows/MSBuild-ecosystem tools fold case
+/// broadly — this isn't a dotnet-CLI particularity, e.g. classic MSBuild.exe's `/nologo` and
+/// `/NoLogo` are equally valid). `text` can't be case-folded once at tokenize time without
+/// giving up `Token`'s zero-copy `&'a str` (there's no borrowed "lowercased" view), so instead
+/// every dialect-aware lookup goes through this and [`flag_value`]/[`has_flag`].
+fn flag_name_matches(text: &str, name: &str, dialect: Dialect) -> bool {
+    match dialect {
+        Dialect::Msbuild => text.eq_ignore_ascii_case(name),
+        Dialect::Posix => text == name,
+    }
+}
+
+/// This flag's value, if `name` (matched per `dialect`, see [`flag_name_matches`]) appears as
+/// a `Long` token anywhere in `tokens`. `tokens` must have come from `tokenize_dialect(_, dialect,
+/// _)` — mixing dialects between tokenizing and looking up gives nonsensical results.
+pub fn flag_value<'a>(tokens: &[Token<'a>], dialect: Dialect, name: &str) -> Option<&'a str> {
+    tokens
+        .iter()
+        .find(|t| t.kind == TokenKind::Long && flag_name_matches(t.text, name, dialect))
+        .and_then(|t| t.value(tokens))
+}
+
+/// True if `name` (matched per `dialect`) appears as a `Long` token anywhere in `tokens`.
+pub fn has_flag(tokens: &[Token<'_>], dialect: Dialect, name: &str) -> bool {
+    tokens
+        .iter()
+        .any(|t| t.kind == TokenKind::Long && flag_name_matches(t.text, name, dialect))
+}
+
 /// Which CLI's flag grammar `tokenize_dialect` should apply. See [`tokenize_dialect`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
@@ -610,5 +641,39 @@ mod tests {
         assert_eq!(tokens[1].kind, TokenKind::Long);
         assert_eq!(tokens[1].text, "pretty:oops");
         assert_eq!(tokens[1].attached, None);
+    }
+
+    // --- has_flag / flag_value ---
+
+    #[test]
+    fn msbuild_has_flag_and_flag_value_are_case_insensitive() {
+        let args = owned(&["-NoLogo", "--Logger:trx"]);
+        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+
+        assert!(has_flag(&tokens, Dialect::Msbuild, "nologo"));
+        assert!(has_flag(&tokens, Dialect::Msbuild, "NOLOGO"));
+        assert_eq!(flag_value(&tokens, Dialect::Msbuild, "logger"), Some("trx"));
+        assert_eq!(flag_value(&tokens, Dialect::Msbuild, "LOGGER"), Some("trx"));
+    }
+
+    #[test]
+    fn posix_has_flag_and_flag_value_are_case_sensitive() {
+        // git/cargo/rg/golangci-lint don't fold case; "--Grep" is not "--grep".
+        let args = owned(&["--Grep"]);
+        let tokens = tokenize(&args, &no_values);
+
+        assert!(has_flag(&tokens, Dialect::Posix, "Grep"));
+        assert!(!has_flag(&tokens, Dialect::Posix, "grep"));
+    }
+
+    #[test]
+    fn has_flag_ignores_short_and_positional_tokens() {
+        // A Short "n" or a positional literally spelled "nologo" must not satisfy a Long
+        // flag-name lookup for "nologo".
+        let args = owned(&["-n", "nologo"]);
+        let tokens = tokenize(&args, &no_values);
+
+        assert!(!has_flag(&tokens, Dialect::Posix, "nologo"));
+        assert!(!has_flag(&tokens, Dialect::Posix, "n"));
     }
 }
