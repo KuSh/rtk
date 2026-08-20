@@ -25,10 +25,14 @@ pub enum TokenKind {
     /// A positional/value token — either free-standing or consumed by a preceding `Long`/`Short`
     /// as its separate-token value (see `Token::linked`).
     Positional,
-    /// The literal `--` end-of-options/pathspec separator. Emitted exactly once, for the first
-    /// `--` encountered; every token after it is `Positional` unconditionally and the
-    /// `takes_value` predicate is never consulted again. A second or later `--` comes back as a
-    /// plain `Positional` with `text == "--"`, matching real git/GNU semantics.
+    /// The literal `--` separator. Emitted exactly once, for the first `--` encountered. Under
+    /// [`Dialect::Posix`], this ends option parsing: every token after it is `Positional`
+    /// unconditionally and `takes_value` is never consulted again (a second or later `--` comes
+    /// back as a plain `Positional` with `text == "--"`, matching real git/GNU semantics). Under
+    /// [`Dialect::Msbuild`], `--` is an argument-*forwarding* boundary rather than an
+    /// end-of-options marker (dotnet's `--` hands the rest to a different receiving parser that
+    /// can share flag names with dotnet's own), so classification continues normally past it —
+    /// only its position is recorded.
     DashDash,
 }
 
@@ -122,7 +126,17 @@ pub fn tokenize_dialect<'a>(
                 linked: None,
                 source_index: i,
             });
-            seen_dash_dash = true;
+            // In Posix conventions `--` ends option parsing: everything after is a literal
+            // positional/pathspec, never a flag. dotnet's `--` means something different — an
+            // argument-*forwarding* boundary, not an end-of-options marker: what follows is
+            // still real flags, just meant for a different receiving parser (the VSTest/MTP
+            // test host) that can share flag names with dotnet's own (e.g. --logger,
+            // --results-directory are forwarded VSTest-console options). So only Posix stops
+            // classifying here; Msbuild keeps going, just with the separator's position on
+            // record via this DashDash token.
+            if dialect == Dialect::Posix {
+                seen_dash_dash = true;
+            }
             i += 1;
             continue;
         }
@@ -549,13 +563,32 @@ mod tests {
     }
 
     #[test]
-    fn msbuild_dashdash_still_ends_options() {
+    fn msbuild_dashdash_is_a_forwarding_boundary_not_end_of_options() {
+        // dotnet's `--` hands the rest to a different receiving parser (the VSTest/MTP test
+        // host); unlike Posix, that doesn't stop classification -- flags after it (e.g.
+        // --report-trx, forwarded to the test host) must still be recognized as flags.
         let args = owned(&["--", "-nologo"]);
         let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
 
         assert_eq!(tokens[0].kind, TokenKind::DashDash);
-        assert_eq!(tokens[1].kind, TokenKind::Positional);
-        assert_eq!(tokens[1].text, "-nologo");
+        assert_eq!(tokens[1].kind, TokenKind::Long);
+        assert_eq!(tokens[1].text, "nologo");
+    }
+
+    #[test]
+    fn msbuild_flag_after_dashdash_still_consumes_its_separate_value() {
+        // Regression: `dotnet test <proj> -- --results-directory /tmp/out` -- the value must
+        // still link to its flag even though it's past `--`, matching real forwarded-flag
+        // semantics (unlike Posix, where nothing after `--` is ever a flag at all).
+        let args = owned(&["--", "--results-directory", "/tmp/out"]);
+        let takes =
+            |kind: TokenKind, name: &str| kind == TokenKind::Long && name == "results-directory";
+        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &takes);
+
+        assert_eq!(tokens[0].kind, TokenKind::DashDash);
+        assert_eq!(tokens[1].kind, TokenKind::Long);
+        assert_eq!(tokens[1].linked, Some(2));
+        assert_eq!(tokens[2].text, "/tmp/out");
     }
 
     #[test]

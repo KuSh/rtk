@@ -762,15 +762,8 @@ fn dotnet_takes_value(kind: TokenKind, name: &str) -> bool {
         )
 }
 
-/// Unlike git/grep (where `--` genuinely ends option parsing), dotnet_cmd.rs's flag checks were
-/// never `--`-boundary aware: `--report-trx` is meaningful on either side of `--` depending on
-/// test runner mode (see TestRunnerMode::MtpVsTestBridge), so detecting it must not stop short
-/// there. Stripping `--` before tokenizing reproduces that scan-the-whole-command-line behavior;
-/// the filtered copy has to be owned here (not returned) since `Token` borrows from it.
-fn with_dotnet_tokens<T>(args: &[String], f: impl FnOnce(&[Token<'_>]) -> T) -> T {
-    let without_dashdash: Vec<String> = args.iter().filter(|a| *a != "--").cloned().collect();
-    let tokens = arg_tokenizer::tokenize_dialect(&without_dashdash, Dialect::Msbuild, &dotnet_takes_value);
-    f(&tokens)
+fn dotnet_tokens(args: &[String]) -> Vec<Token<'_>> {
+    arg_tokenizer::tokenize_dialect(args, Dialect::Msbuild, &dotnet_takes_value)
 }
 
 fn dotnet_flag_value<'a>(tokens: &[Token<'a>], name: &str) -> Option<&'a str> {
@@ -787,28 +780,26 @@ fn dotnet_has_flag(tokens: &[Token<'_>], name: &str) -> bool {
 }
 
 fn has_nologo_arg(args: &[String]) -> bool {
-    with_dotnet_tokens(args, |tokens| dotnet_has_flag(tokens, "nologo"))
+    dotnet_has_flag(&dotnet_tokens(args), "nologo")
 }
 
 fn has_trx_logger_arg(args: &[String]) -> bool {
-    with_dotnet_tokens(args, |tokens| {
-        dotnet_flag_value(tokens, "logger").is_some_and(|value| {
-            let lower = value.to_ascii_lowercase();
-            lower == "trx" || lower.starts_with("trx;")
-        })
+    dotnet_flag_value(&dotnet_tokens(args), "logger").is_some_and(|value| {
+        let lower = value.to_ascii_lowercase();
+        lower == "trx" || lower.starts_with("trx;")
     })
 }
 
 fn has_results_directory_arg(args: &[String]) -> bool {
-    with_dotnet_tokens(args, |tokens| dotnet_has_flag(tokens, "results-directory"))
+    dotnet_has_flag(&dotnet_tokens(args), "results-directory")
 }
 
 fn has_report_arg(args: &[String]) -> bool {
-    with_dotnet_tokens(args, |tokens| dotnet_has_flag(tokens, "report"))
+    dotnet_has_flag(&dotnet_tokens(args), "report")
 }
 
 fn has_report_trx_arg(args: &[String]) -> bool {
-    with_dotnet_tokens(args, |tokens| dotnet_has_flag(tokens, "report-trx"))
+    dotnet_has_flag(&dotnet_tokens(args), "report-trx")
 }
 
 /// Injects `--report-trx` after the `--` separator in `args`.
@@ -827,23 +818,19 @@ fn inject_report_trx_into_args(args: &[String]) -> Vec<String> {
 }
 
 fn extract_report_arg(args: &[String]) -> Option<PathBuf> {
-    with_dotnet_tokens(args, |tokens| {
-        dotnet_flag_value(tokens, "report").map(PathBuf::from)
-    })
+    dotnet_flag_value(&dotnet_tokens(args), "report").map(PathBuf::from)
 }
 
 fn has_verify_no_changes_arg(args: &[String]) -> bool {
-    with_dotnet_tokens(args, |tokens| dotnet_has_flag(tokens, "verify-no-changes"))
+    dotnet_has_flag(&dotnet_tokens(args), "verify-no-changes")
 }
 
 fn has_write_mode_override(args: &[String]) -> bool {
-    with_dotnet_tokens(args, |tokens| dotnet_has_flag(tokens, "write"))
+    dotnet_has_flag(&dotnet_tokens(args), "write")
 }
 
 fn extract_results_directory_arg(args: &[String]) -> Option<PathBuf> {
-    with_dotnet_tokens(args, |tokens| {
-        dotnet_flag_value(tokens, "results-directory").map(PathBuf::from)
-    })
+    dotnet_flag_value(&dotnet_tokens(args), "results-directory").map(PathBuf::from)
 }
 
 fn normalize_build_summary(
