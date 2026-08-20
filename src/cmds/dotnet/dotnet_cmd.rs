@@ -1,6 +1,7 @@
 //! Filters dotnet CLI output — build, test, and format results.
 
 use crate::binlog;
+use crate::core::args_utils;
 use crate::core::guard::never_worse;
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
@@ -34,6 +35,11 @@ pub fn run_restore(args: &[String], verbose: u8) -> Result<i32> {
 }
 
 pub fn run_format(args: &[String], verbose: u8) -> Result<i32> {
+    // Re-insert `--` when clap's trailing_var_arg consumed it (issue #1215) — see
+    // run_dotnet_with_binlog for why this matters even though `format` doesn't inject
+    // --report-trx: has_write_mode_override/build_effective_dotnet_format_args still need to
+    // see the user's actual `--` if they passed one.
+    let args = &args_utils::restore_double_dash(args);
     let timer = tracking::TimedExecution::start();
     let (report_path, cleanup_report_path) = resolve_format_report_path(args);
     let mut cmd = resolved_command("dotnet");
@@ -112,6 +118,11 @@ pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
 }
 
 fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Result<i32> {
+    // Re-insert `--` when clap's trailing_var_arg consumed it (issue #1215): without this,
+    // inject_report_trx_into_args's `--` detection can't tell "the user passed no --" from
+    // "the user passed -- but clap stripped it", and would append a spurious second `--
+    // --report-trx` after the user's own `-- <filter expression>` instead of reusing it.
+    let args = &args_utils::restore_double_dash(args);
     let timer = tracking::TimedExecution::start();
     let binlog_path = build_binlog_path(subcommand);
     let should_expect_binlog = subcommand != "test" || has_binlog_arg(args);
