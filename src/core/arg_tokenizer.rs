@@ -65,15 +65,40 @@ impl<'a> Token<'a> {
     }
 }
 
-/// Tokenizes `args` into [`Token`]s. `takes_value(kind, name)` is called for each `Long`/`Short`
-/// flag that has no attached value, to decide whether the following whole token should be
-/// consumed as its separate-token value; it is never called for tokens at or after `--`.
+/// Which CLI's flag grammar `tokenize_dialect` should apply. See [`tokenize_dialect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    /// GNU/POSIX-ish: git, cargo, rg, golangci-lint. `-xyz` is a cluster of short flags,
+    /// scanned char by char; only `=` attaches a value to a long flag.
+    Posix,
+    /// MSBuild/dotnet-CLI-ish. `-flag`, `--flag`, and `/flag` are all one atomic flag name —
+    /// there is no short-flag clustering — and a value can attach via either `=` or `:`
+    /// (`--logger:trx` and `--logger=trx` are both valid). Every atomic flag is tagged
+    /// `TokenKind::Long` regardless of which prefix introduced it; `TokenKind::Short` is never
+    /// produced in this dialect.
+    Msbuild,
+}
+
+/// Tokenizes `args` into [`Token`]s using [`Dialect::Posix`] conventions. `takes_value(kind,
+/// name)` is called for each `Long`/`Short` flag that has no attached value, to decide whether
+/// the following whole token should be consumed as its separate-token value; it is never called
+/// for tokens at or after `--`.
 ///
 /// Never panics and never fails to classify: a value-taking flag with nothing left to consume
 /// simply gets `attached: None, linked: None`, matching RTK's fallback/never-block-the-user
 /// convention.
 pub fn tokenize<'a>(
     args: &'a [String],
+    takes_value: &dyn Fn(TokenKind, &str) -> bool,
+) -> Vec<Token<'a>> {
+    tokenize_dialect(args, Dialect::Posix, takes_value)
+}
+
+/// Like [`tokenize`], but lets the caller pick a [`Dialect`] instead of assuming POSIX
+/// conventions.
+pub fn tokenize_dialect<'a>(
+    args: &'a [String],
+    dialect: Dialect,
     takes_value: &dyn Fn(TokenKind, &str) -> bool,
 ) -> Vec<Token<'a>> {
     let mut tokens: Vec<Token<'a>> = Vec::with_capacity(args.len());
@@ -103,35 +128,22 @@ pub fn tokenize<'a>(
         }
 
         if let Some(rest) = arg.strip_prefix("--") {
-            let (name, attached) = match rest.split_once('=') {
-                Some((name, value)) => (name, Some(value)),
-                None => (rest, None),
-            };
-            let flag_index = tokens.len();
-            tokens.push(Token {
-                kind: TokenKind::Long,
-                text: name,
-                attached,
-                linked: None,
-                source_index: i,
-            });
-            i += 1;
-
-            if attached.is_none() && takes_value(TokenKind::Long, name) {
-                if let Some(next) = args.get(i) {
-                    let value_index = tokens.len();
-                    tokens.push(Token {
-                        linked: Some(flag_index),
-                        ..positional(next.as_str(), i)
-                    });
-                    tokens[flag_index].linked = Some(value_index);
-                    i += 1;
-                }
-            }
+            push_atomic_flag(&mut tokens, args, &mut i, rest, dialect, takes_value);
             continue;
         }
 
-        if arg.len() > 1 && arg.starts_with('-') {
+        if dialect == Dialect::Msbuild {
+            if let Some(rest) = arg.strip_prefix('/') {
+                if !rest.is_empty() {
+                    push_atomic_flag(&mut tokens, args, &mut i, rest, dialect, takes_value);
+                    continue;
+                }
+            }
+            if arg.len() > 1 && arg.starts_with('-') {
+                push_atomic_flag(&mut tokens, args, &mut i, &arg[1..], dialect, takes_value);
+                continue;
+            }
+        } else if arg.len() > 1 && arg.starts_with('-') {
             let cluster = &arg[1..];
 
             if cluster.bytes().all(|b| b.is_ascii_digit()) {
@@ -186,6 +198,57 @@ pub fn tokenize<'a>(
     }
 
     tokens
+}
+
+/// Pushes one atomic (non-clustering) flag token — used for `--flag` in both dialects, and for
+/// `-flag`/`/flag` in [`Dialect::Msbuild`] — splitting off an attached value per `dialect` and,
+/// absent one, consulting `takes_value` to maybe consume the next whole token as a separate
+/// value. `rest` is the flag text with its prefix (`--`, `-`, or `/`) already stripped.
+fn push_atomic_flag<'a>(
+    tokens: &mut Vec<Token<'a>>,
+    args: &'a [String],
+    i: &mut usize,
+    rest: &'a str,
+    dialect: Dialect,
+    takes_value: &dyn Fn(TokenKind, &str) -> bool,
+) {
+    let (name, attached) = split_attached(rest, dialect);
+    let flag_index = tokens.len();
+    let source_index = *i;
+    tokens.push(Token {
+        kind: TokenKind::Long,
+        text: name,
+        attached,
+        linked: None,
+        source_index,
+    });
+    *i += 1;
+
+    if attached.is_none() && takes_value(TokenKind::Long, name) {
+        if let Some(next) = args.get(*i) {
+            let value_index = tokens.len();
+            tokens.push(Token {
+                linked: Some(flag_index),
+                ..positional(next.as_str(), *i)
+            });
+            tokens[flag_index].linked = Some(value_index);
+            *i += 1;
+        }
+    }
+}
+
+/// Splits `s` into `(name, attached_value)` on the first dialect-appropriate separator:
+/// `=` only for [`Dialect::Posix`], `=` or `:` (whichever comes first) for
+/// [`Dialect::Msbuild`] (`--logger:trx` and `--logger=trx` are both valid dotnet CLI syntax).
+fn split_attached(s: &str, dialect: Dialect) -> (&str, Option<&str>) {
+    let sep_pos = match dialect {
+        Dialect::Posix => s.find('='),
+        Dialect::Msbuild => s.find(['=', ':']),
+    };
+    match sep_pos {
+        Some(pos) => (&s[..pos], Some(&s[pos + 1..])),
+        None => (s, None),
+    }
 }
 
 fn positional(text: &str, source_index: usize) -> Token<'_> {
@@ -412,5 +475,107 @@ mod tests {
 
         assert_eq!(tokens.len(), 2);
         assert!(tokens.iter().all(|t| t.kind == TokenKind::Positional));
+    }
+
+    // --- Dialect::Msbuild ---
+
+    #[test]
+    fn msbuild_single_dash_flag_is_atomic_not_a_cluster() {
+        // dotnet's "-nologo" is one flag name, not a POSIX cluster of n/o/l/o/g/o.
+        let args = owned(&["-nologo"]);
+        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::Long);
+        assert_eq!(tokens[0].text, "nologo");
+    }
+
+    #[test]
+    fn msbuild_slash_prefix_is_recognized_as_a_flag() {
+        let args = owned(&["/nologo"]);
+        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::Long);
+        assert_eq!(tokens[0].text, "nologo");
+    }
+
+    #[test]
+    fn msbuild_slash_alone_is_positional() {
+        let args = owned(&["/"]);
+        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::Positional);
+        assert_eq!(tokens[0].text, "/");
+    }
+
+    #[test]
+    fn msbuild_absolute_path_positional_is_not_mistaken_for_a_flag_with_predicate_false() {
+        // "/tmp/results" has no recognized flag name, so it's still a positional even though
+        // it starts with '/' — the predicate, not the tokenizer, is what would gate this.
+        let takes = |kind: TokenKind, name: &str| kind == TokenKind::Long && name == "nologo";
+        let args = owned(&["/tmp/results"]);
+        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &takes);
+
+        // It's still classified as a Long flag named "tmp/results" (no recognized value-taking
+        // predicate matches it) — proving the *caller* must know not to treat arbitrary
+        // '/'-prefixed tokens as flags on Unix; the tokenizer only reports structure.
+        assert_eq!(tokens[0].kind, TokenKind::Long);
+        assert_eq!(tokens[0].text, "tmp/results");
+    }
+
+    #[test]
+    fn msbuild_colon_and_equals_both_attach_a_value() {
+        for arg in ["--logger:trx", "--logger=trx"] {
+            let args = owned(&[arg]);
+            let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+
+            assert_eq!(tokens[0].text, "logger", "for {arg}");
+            assert_eq!(tokens[0].attached, Some("trx"), "for {arg}");
+        }
+    }
+
+    #[test]
+    fn msbuild_separate_token_value_still_works() {
+        let args = owned(&["--results-directory", "/tmp/out"]);
+        let takes =
+            |kind: TokenKind, name: &str| kind == TokenKind::Long && name == "results-directory";
+        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &takes);
+
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].linked, Some(1));
+        assert_eq!(tokens[1].text, "/tmp/out");
+    }
+
+    #[test]
+    fn msbuild_dashdash_still_ends_options() {
+        let args = owned(&["--", "-nologo"]);
+        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+
+        assert_eq!(tokens[0].kind, TokenKind::DashDash);
+        assert_eq!(tokens[1].kind, TokenKind::Positional);
+        assert_eq!(tokens[1].text, "-nologo");
+    }
+
+    #[test]
+    fn msbuild_dialect_never_produces_short_tokens() {
+        let args = owned(&["-a", "-bc", "/d", "--e"]);
+        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+
+        assert!(tokens.iter().all(|t| t.kind != TokenKind::Short));
+    }
+
+    #[test]
+    fn posix_dialect_unaffected_by_slash_or_colon() {
+        // The default (tokenize == Dialect::Posix) must not gain '/' or ':' handling.
+        let args = owned(&["feature/auth", "--pretty:oops"]);
+        let tokens = tokenize(&args, &no_values);
+
+        assert_eq!(tokens[0].kind, TokenKind::Positional);
+        assert_eq!(tokens[0].text, "feature/auth");
+        assert_eq!(tokens[1].kind, TokenKind::Long);
+        assert_eq!(tokens[1].text, "pretty:oops");
+        assert_eq!(tokens[1].attached, None);
     }
 }

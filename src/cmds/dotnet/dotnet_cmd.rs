@@ -1,6 +1,7 @@
 //! Filters dotnet CLI output — build, test, and format results.
 
 use crate::binlog;
+use crate::core::arg_tokenizer::{self, Dialect, Token, TokenKind};
 use crate::core::args_utils;
 use crate::core::guard::never_worse;
 use crate::core::stream::exec_capture;
@@ -750,53 +751,64 @@ fn detect_test_runner_mode(args: &[String]) -> TestRunnerMode {
     TestRunnerMode::Classic
 }
 
+/// dotnet's CLI grammar isn't POSIX/GNU: `-flag`, `--flag`, and `/flag` are all one atomic
+/// name (no short-flag clustering) and a value may attach via `:` or `=`
+/// ([`Dialect::Msbuild`]); flag names are matched case-insensitively, same as the CLI itself.
+fn dotnet_takes_value(kind: TokenKind, name: &str) -> bool {
+    kind == TokenKind::Long
+        && matches!(
+            name.to_ascii_lowercase().as_str(),
+            "logger" | "results-directory" | "report"
+        )
+}
+
+/// Unlike git/grep (where `--` genuinely ends option parsing), dotnet_cmd.rs's flag checks were
+/// never `--`-boundary aware: `--report-trx` is meaningful on either side of `--` depending on
+/// test runner mode (see TestRunnerMode::MtpVsTestBridge), so detecting it must not stop short
+/// there. Stripping `--` before tokenizing reproduces that scan-the-whole-command-line behavior;
+/// the filtered copy has to be owned here (not returned) since `Token` borrows from it.
+fn with_dotnet_tokens<T>(args: &[String], f: impl FnOnce(&[Token<'_>]) -> T) -> T {
+    let without_dashdash: Vec<String> = args.iter().filter(|a| *a != "--").cloned().collect();
+    let tokens = arg_tokenizer::tokenize_dialect(&without_dashdash, Dialect::Msbuild, &dotnet_takes_value);
+    f(&tokens)
+}
+
+fn dotnet_flag_value<'a>(tokens: &[Token<'a>], name: &str) -> Option<&'a str> {
+    tokens
+        .iter()
+        .find(|t| t.kind == TokenKind::Long && t.text.eq_ignore_ascii_case(name))
+        .and_then(|t| t.value(tokens))
+}
+
+fn dotnet_has_flag(tokens: &[Token<'_>], name: &str) -> bool {
+    tokens
+        .iter()
+        .any(|t| t.kind == TokenKind::Long && t.text.eq_ignore_ascii_case(name))
+}
+
 fn has_nologo_arg(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| matches!(arg.to_ascii_lowercase().as_str(), "-nologo" | "/nologo"))
+    with_dotnet_tokens(args, |tokens| dotnet_has_flag(tokens, "nologo"))
 }
 
 fn has_trx_logger_arg(args: &[String]) -> bool {
-    let mut iter = args.iter().peekable();
-    while let Some(arg) = iter.next() {
-        let lower = arg.to_ascii_lowercase();
-        if lower == "--logger" {
-            if let Some(next) = iter.peek() {
-                let next_lower = next.to_ascii_lowercase();
-                if next_lower == "trx" || next_lower.starts_with("trx;") {
-                    return true;
-                }
-            }
-            continue;
-        }
-
-        for prefix in ["--logger:", "--logger="] {
-            if let Some(value) = lower.strip_prefix(prefix) {
-                if value == "trx" || value.starts_with("trx;") {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
+    with_dotnet_tokens(args, |tokens| {
+        dotnet_flag_value(tokens, "logger").is_some_and(|value| {
+            let lower = value.to_ascii_lowercase();
+            lower == "trx" || lower.starts_with("trx;")
+        })
+    })
 }
 
 fn has_results_directory_arg(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        let lower = arg.to_ascii_lowercase();
-        lower == "--results-directory" || lower.starts_with("--results-directory=")
-    })
+    with_dotnet_tokens(args, |tokens| dotnet_has_flag(tokens, "results-directory"))
 }
 
 fn has_report_arg(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        let lower = arg.to_ascii_lowercase();
-        lower == "--report" || lower.starts_with("--report=")
-    })
+    with_dotnet_tokens(args, |tokens| dotnet_has_flag(tokens, "report"))
 }
 
 fn has_report_trx_arg(args: &[String]) -> bool {
-    args.iter().any(|a| a.eq_ignore_ascii_case("--report-trx"))
+    with_dotnet_tokens(args, |tokens| dotnet_has_flag(tokens, "report-trx"))
 }
 
 /// Injects `--report-trx` after the `--` separator in `args`.
@@ -815,62 +827,23 @@ fn inject_report_trx_into_args(args: &[String]) -> Vec<String> {
 }
 
 fn extract_report_arg(args: &[String]) -> Option<PathBuf> {
-    let mut iter = args.iter().peekable();
-    while let Some(arg) = iter.next() {
-        if arg.eq_ignore_ascii_case("--report") {
-            if let Some(next) = iter.peek() {
-                return Some(PathBuf::from(next.as_str()));
-            }
-            continue;
-        }
-
-        if let Some((_, value)) = arg.split_once('=') {
-            if arg
-                .split('=')
-                .next()
-                .is_some_and(|key| key.eq_ignore_ascii_case("--report"))
-            {
-                return Some(PathBuf::from(value));
-            }
-        }
-    }
-
-    None
-}
-
-fn has_verify_no_changes_arg(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        let lower = arg.to_ascii_lowercase();
-        lower == "--verify-no-changes" || lower.starts_with("--verify-no-changes=")
+    with_dotnet_tokens(args, |tokens| {
+        dotnet_flag_value(tokens, "report").map(PathBuf::from)
     })
 }
 
+fn has_verify_no_changes_arg(args: &[String]) -> bool {
+    with_dotnet_tokens(args, |tokens| dotnet_has_flag(tokens, "verify-no-changes"))
+}
+
 fn has_write_mode_override(args: &[String]) -> bool {
-    args.iter().any(|arg| arg.eq_ignore_ascii_case("--write"))
+    with_dotnet_tokens(args, |tokens| dotnet_has_flag(tokens, "write"))
 }
 
 fn extract_results_directory_arg(args: &[String]) -> Option<PathBuf> {
-    let mut iter = args.iter().peekable();
-    while let Some(arg) = iter.next() {
-        if arg.eq_ignore_ascii_case("--results-directory") {
-            if let Some(next) = iter.peek() {
-                return Some(PathBuf::from(next.as_str()));
-            }
-            continue;
-        }
-
-        if let Some((_, value)) = arg.split_once('=') {
-            if arg
-                .split('=')
-                .next()
-                .is_some_and(|key| key.eq_ignore_ascii_case("--results-directory"))
-            {
-                return Some(PathBuf::from(value));
-            }
-        }
-    }
-
-    None
+    with_dotnet_tokens(args, |tokens| {
+        dotnet_flag_value(tokens, "results-directory").map(PathBuf::from)
+    })
 }
 
 fn normalize_build_summary(
