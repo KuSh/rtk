@@ -1,5 +1,6 @@
 //! Filters golangci-lint output, grouping issues by rule.
 
+use crate::core::arg_tokenizer::{self, TokenKind};
 use crate::core::config;
 use crate::core::runner;
 use crate::core::stream::exec_capture;
@@ -24,14 +25,18 @@ const GOLANGCI_SUBCOMMANDS: &[&str] = &[
     "version",
 ];
 
-const GLOBAL_FLAGS_WITH_VALUE: &[&str] = &[
-    "-c",
-    "--color",
-    "--config",
-    "--cpu-profile-path",
-    "--mem-profile-path",
-    "--trace-path",
-];
+/// True for golangci-lint global flags that take a separate-token value, passed to
+/// [`arg_tokenizer::tokenize`] as its value predicate. `-c` is `--config`'s shorthand.
+fn golangci_takes_value(kind: TokenKind, name: &str) -> bool {
+    match kind {
+        TokenKind::Short => name == "c",
+        TokenKind::Long => matches!(
+            name,
+            "color" | "config" | "cpu-profile-path" | "mem-profile-path" | "trace-path"
+        ),
+        TokenKind::Positional | TokenKind::DashDash => false,
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct RunInvocation {
@@ -180,56 +185,25 @@ fn classify_invocation(args: &[String]) -> Invocation {
     }
 }
 
+/// Finds the index in `args` of the first non-flag token, stopping (and returning `None`)
+/// entirely at `--` or at a non-flag token that isn't a recognized subcommand — mirroring
+/// golangci-lint's own arg parsing just enough to locate `run`, not fully replicate it.
 fn find_subcommand_index(args: &[String]) -> Option<usize> {
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i].as_str();
+    let tokens = arg_tokenizer::tokenize(args, &golangci_takes_value);
 
-        if arg == "--" {
-            return None;
-        }
-
-        if !arg.starts_with('-') {
-            if GOLANGCI_SUBCOMMANDS.contains(&arg) {
-                return Some(i);
+    for token in &tokens {
+        match token.kind {
+            TokenKind::DashDash => return None,
+            TokenKind::Positional if token.linked.is_none() => {
+                return GOLANGCI_SUBCOMMANDS
+                    .contains(&token.text)
+                    .then_some(token.source_index);
             }
-            return None;
+            _ => {}
         }
-
-        if let Some(flag) = split_flag_name(arg) {
-            if golangci_flag_takes_separate_value(arg, flag) {
-                i += 1;
-            }
-        }
-
-        i += 1;
     }
 
     None
-}
-
-fn split_flag_name(arg: &str) -> Option<&str> {
-    if arg.starts_with("--") {
-        return Some(arg.split_once('=').map(|(flag, _)| flag).unwrap_or(arg));
-    }
-
-    if arg.starts_with('-') {
-        return Some(arg);
-    }
-
-    None
-}
-
-fn golangci_flag_takes_separate_value(arg: &str, flag: &str) -> bool {
-    if !GLOBAL_FLAGS_WITH_VALUE.contains(&flag) {
-        return false;
-    }
-
-    if arg.starts_with("--") && arg.contains('=') {
-        return false;
-    }
-
-    true
 }
 
 fn build_filtered_args(invocation: &RunInvocation, version: u32) -> Vec<String> {
@@ -530,6 +504,34 @@ mod tests {
                 global_args: vec!["-v".into()],
                 run_args: vec!["./...".into()],
             })
+        );
+    }
+
+    #[test]
+    fn test_classify_invocation_with_short_flag_separate_value_uses_filtered_path() {
+        // -c takes a separate-token value; its value ("foo.yml") must not be mistaken for
+        // the subcommand.
+        assert_eq!(
+            classify_invocation(&[
+                "-c".into(),
+                "foo.yml".into(),
+                "run".into(),
+                "./...".into(),
+            ]),
+            Invocation::FilteredRun(RunInvocation {
+                global_args: vec!["-c".into(), "foo.yml".into()],
+                run_args: vec!["./...".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn test_classify_invocation_dashdash_before_subcommand_is_passthrough() {
+        // `--` ends option parsing before any subcommand was found; golangci-lint's own
+        // parser gets to decide what follows, not rtk's filter.
+        assert_eq!(
+            classify_invocation(&["--".into(), "run".into()]),
+            Invocation::Passthrough
         );
     }
 
