@@ -1,5 +1,6 @@
 //! Filters git output — log, status, diff, and more — keeping just the essential info.
 
+use crate::core::arg_tokenizer::{self, Token, TokenKind};
 use crate::core::args_utils;
 use crate::core::guard::never_worse;
 use crate::core::runner::{self, RunOptions};
@@ -848,19 +849,18 @@ fn run_log(
     // below by both the flag-presence checks and the limit parsing, and a
     // value belonging to --grep/--author/etc. (e.g. `--grep --pretty`) must
     // not be misread as one of the flags below.
-    let tokens = log_arg_tokens(args);
-    let flag_args = flag_args_from_tokens(&tokens);
+    let tokens = arg_tokenizer::tokenize(args, &log_takes_value);
 
     // Check if user provided format flags
-    let has_format_flag = flag_args.iter().any(|arg| {
-        arg.starts_with("--oneline") || arg.starts_with("--pretty") || arg.starts_with("--format")
-    });
+    let has_format_flag = tokens
+        .iter()
+        .any(|t| t.kind == TokenKind::Long && matches!(t.text, "oneline" | "pretty" | "format"));
 
     // Check if user provided limit flag (-N, -n N, --max-count=N, --max-count N)
-    let has_limit_flag = flag_args.iter().any(|arg| {
-        (arg.starts_with('-') && arg.chars().nth(1).is_some_and(|c| c.is_ascii_digit()))
-            || *arg == "-n"
-            || arg.starts_with("--max-count")
+    let has_limit_flag = tokens.iter().any(|t| match t.kind {
+        TokenKind::Short => t.text == "n" || is_digit_run(t.text),
+        TokenKind::Long => t.text == "max-count",
+        _ => false,
     });
 
     // Apply RTK defaults only if user didn't specify them
@@ -886,9 +886,12 @@ fn run_log(
     };
 
     // Only add --no-merges if user didn't explicitly request merge commits
-    let wants_merges = flag_args
-        .iter()
-        .any(|arg| *arg == "--merges" || *arg == "--min-parents=2" || *arg == "--no-merges");
+    let wants_merges = tokens.iter().any(|t| {
+        t.kind == TokenKind::Long
+            && (t.text == "merges"
+                || t.text == "no-merges"
+                || (t.text == "min-parents" && t.attached == Some("2")))
+    });
     // Don't add --no-merges if user explicitly requested merges or an exact count (-n N / --max-count)
     if !wants_merges && !has_limit_flag {
         cmd.arg("--no-merges");
@@ -929,110 +932,73 @@ fn run_log(
 /// space-delimited token (e.g. `--grep -p` searches messages for the
 /// literal string "-p"; it does not request patch output). Consuming
 /// that value token keeps flag-lookalike values from being misread as
-/// the corresponding boolean flag.
-fn consumes_next_token_as_value(arg: &str) -> bool {
-    matches!(
-        arg,
-        "--after"
-            | "--anchored"
-            | "--author"
-            | "--before"
-            | "--color-moved-ws"
-            | "--committer"
-            | "--date"
-            | "--decorate-refs"
-            | "--decorate-refs-exclude"
-            | "--diff-algorithm"
-            | "--diff-filter"
-            | "--diff-merges"
-            | "--dst-prefix"
-            | "--encoding"
-            | "--exclude"
-            | "--find-object"
-            | "--glob"
-            | "--grep"
-            | "--grep-reflog"
-            | "--inter-hunk-context"
-            | "--line-prefix"
-            | "--max-depth"
-            | "--output"
-            | "--output-indicator-context"
-            | "--output-indicator-new"
-            | "--output-indicator-old"
-            | "--rotate-to"
-            | "--since"
-            | "--since-as-filter"
-            | "--skip"
-            | "--skip-to"
-            | "--src-prefix"
-            | "--stat-count"
-            | "--stat-name-width"
-            | "--stat-width"
-            | "--until"
-            | "--word-diff-regex"
-            | "--ws-error-highlight"
-            | "-G"
-            | "-I"
-            | "-L"
-            | "-O"
-            | "-S"
-            | "-l"
-            | "-n"
-    )
-}
-
-/// A git log argument, classified as either a flag or the value consumed
-/// by the preceding flag.
-enum LogArg<'a> {
-    Flag(&'a str),
-    Value { flag: &'a str, value: &'a str },
-}
-
-/// Tokenizes git log `args` into [`LogArg`]s, stopping at the `--` pathspec
-/// separator (tokens after it are paths, never flags or their values —
-/// e.g. `git log -- -5` means "history for the path literally named -5").
-/// `-n`/`--max-count`'s own count and every option in
-/// [`consumes_next_token_as_value`] are paired with the flag that consumes
-/// them. Shared by every git-log flag/value/limit check in [`run_log`] so
-/// `--`-handling and option-value handling live in one place instead of
-/// being reimplemented per check.
-fn log_arg_tokens(args: &[String]) -> Vec<LogArg<'_>> {
-    let mut tokens = Vec::with_capacity(args.len());
-    let mut iter = args.iter().take_while(|arg| *arg != "--");
-    while let Some(arg) = iter.next() {
-        let arg_str = arg.as_str();
-        if arg_str == "--max-count" || consumes_next_token_as_value(arg_str) {
-            if let Some(value) = iter.next() {
-                tokens.push(LogArg::Value {
-                    flag: arg_str,
-                    value: value.as_str(),
-                });
-                continue;
-            }
-        }
-        tokens.push(LogArg::Flag(arg_str));
+/// the corresponding boolean flag. Passed to [`arg_tokenizer::tokenize`]
+/// as its value predicate; `--max-count` lives here too rather than as a
+/// bolted-on special case, since it's the same question for every caller.
+fn log_takes_value(kind: TokenKind, name: &str) -> bool {
+    match kind {
+        TokenKind::Long => matches!(
+            name,
+            "after"
+                | "anchored"
+                | "author"
+                | "before"
+                | "color-moved-ws"
+                | "committer"
+                | "date"
+                | "decorate-refs"
+                | "decorate-refs-exclude"
+                | "diff-algorithm"
+                | "diff-filter"
+                | "diff-merges"
+                | "dst-prefix"
+                | "encoding"
+                | "exclude"
+                | "find-object"
+                | "glob"
+                | "grep"
+                | "grep-reflog"
+                | "inter-hunk-context"
+                | "line-prefix"
+                | "max-count"
+                | "max-depth"
+                | "output"
+                | "output-indicator-context"
+                | "output-indicator-new"
+                | "output-indicator-old"
+                | "rotate-to"
+                | "since"
+                | "since-as-filter"
+                | "skip"
+                | "skip-to"
+                | "src-prefix"
+                | "stat-count"
+                | "stat-name-width"
+                | "stat-width"
+                | "until"
+                | "word-diff-regex"
+                | "ws-error-highlight"
+        ),
+        TokenKind::Short => matches!(name, "G" | "I" | "L" | "O" | "S" | "l" | "n"),
+        TokenKind::Positional | TokenKind::DashDash => false,
     }
-    tokens
 }
 
-/// Filters `tokens` down to the flags themselves, dropping every value
-/// consumed by the preceding option.
-fn flag_args_from_tokens<'a>(tokens: &[LogArg<'a>]) -> Vec<&'a str> {
-    tokens
+/// Filters `args` down to the tokens that are actual flags (dash-free flag
+/// name, e.g. "grep" not "--grep"), dropping every token consumed as a value
+/// by the preceding option. Test-only convenience wrapper; `run_log` shares
+/// a single [`arg_tokenizer::tokenize`] call directly instead.
+#[cfg(test)]
+fn real_flag_args(args: &[String]) -> Vec<&str> {
+    arg_tokenizer::tokenize(args, &log_takes_value)
         .iter()
-        .map(|token| match token {
-            LogArg::Flag(flag) | LogArg::Value { flag, .. } => *flag,
-        })
+        .filter(|t| matches!(t.kind, TokenKind::Long | TokenKind::Short))
+        .map(|t| t.text)
         .collect()
 }
 
-/// Filters `args` down to the tokens that are actual flags, dropping every
-/// token consumed as a value by the preceding option. `run_log` shares a
-/// single tokenization via [`flag_args_from_tokens`] instead; this
-/// convenience wrapper exists for tests that only care about the flags.
-#[cfg(test)]
-fn real_flag_args(args: &[String]) -> Vec<&str> {
-    flag_args_from_tokens(&log_arg_tokens(args))
+fn is_digit_run(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// True for git log/diff flags that change the *shape* of git's raw output
@@ -1040,29 +1006,31 @@ fn real_flag_args(args: &[String]) -> Vec<&str> {
 /// `--pretty=format` + `---END---` markers can't coexist with — matching
 /// this must request the untouched passthrough path instead of RTK's
 /// filtered one (see [`requests_raw_log_output`]).
-fn requests_raw_diff_shape(flag: &str) -> bool {
-    matches!(
-        flag,
-        "-p" | "-u"
-            | "--dirstat"
-            | "--name-only"
-            | "--name-status"
-            | "--numstat"
-            | "--patch"
-            | "--patch-with-raw"
-            | "--patch-with-stat"
-            | "--raw"
-            | "--shortstat"
-            | "--stat"
-            | "--summary"
-    ) || flag.starts_with("--stat=")
-        || flag.starts_with("--dirstat=")
+fn requests_raw_diff_shape(token: &Token<'_>) -> bool {
+    match token.kind {
+        TokenKind::Short => matches!(token.text, "p" | "u"),
+        TokenKind::Long => matches!(
+            token.text,
+            "dirstat"
+                | "name-only"
+                | "name-status"
+                | "numstat"
+                | "patch"
+                | "patch-with-raw"
+                | "patch-with-stat"
+                | "raw"
+                | "shortstat"
+                | "stat"
+                | "summary"
+        ),
+        TokenKind::Positional | TokenKind::DashDash => false,
+    }
 }
 
 fn requests_raw_log_output(args: &[String]) -> bool {
-    log_arg_tokens(args)
+    arg_tokenizer::tokenize(args, &log_takes_value)
         .iter()
-        .any(|token| matches!(token, LogArg::Flag(flag) if requests_raw_diff_shape(flag)))
+        .any(requests_raw_diff_shape)
 }
 
 /// Parse the user-specified limit from git log args.
@@ -1071,43 +1039,33 @@ fn requests_raw_log_output(args: &[String]) -> bool {
 /// instead; this convenience wrapper exists for tests.
 #[cfg(test)]
 fn parse_user_limit(args: &[String]) -> Option<usize> {
-    parse_limit_from_tokens(&log_arg_tokens(args))
+    parse_limit_from_tokens(&arg_tokenizer::tokenize(args, &log_takes_value))
 }
 
-fn parse_limit_from_tokens(tokens: &[LogArg<'_>]) -> Option<usize> {
+fn parse_limit_from_tokens(tokens: &[Token<'_>]) -> Option<usize> {
     for token in tokens {
-        match token {
-            // -20 (combined digit form)
-            LogArg::Flag(flag)
-                if flag.starts_with('-')
-                    && flag.len() > 1
-                    && flag.chars().nth(1).is_some_and(|c| c.is_ascii_digit()) =>
-            {
-                if let Ok(n) = flag[1..].parse::<usize>() {
-                    return Some(n);
-                }
+        let value = match token.kind {
+            // -20 (combined digit form): the token itself is the count.
+            TokenKind::Short if is_digit_run(token.text) => Some(token.text),
+            // -n 20 (two-token form) or -n's value if ever attached.
+            TokenKind::Short if token.text == "n" => {
+                token.attached.or_else(|| linked_value(tokens, token))
             }
-            // -n 20 / --max-count 20 (two-token form)
-            LogArg::Value {
-                flag: "-n" | "--max-count",
-                value,
-            } => {
-                if let Ok(n) = value.parse::<usize>() {
-                    return Some(n);
-                }
+            // --max-count=20 (attached) or --max-count 20 (two-token form).
+            TokenKind::Long if token.text == "max-count" => {
+                token.attached.or_else(|| linked_value(tokens, token))
             }
-            // --max-count=20
-            LogArg::Flag(flag) => {
-                if let Some(rest) = flag.strip_prefix("--max-count=") {
-                    if let Ok(n) = rest.parse::<usize>() {
-                        return Some(n);
-                    }
-                }
-            }
-            LogArg::Value { .. } => {}
+            _ => None,
+        };
+        if let Some(n) = value.and_then(|v| v.parse::<usize>().ok()) {
+            return Some(n);
         }
     }
     None
+}
+
+fn linked_value<'a>(tokens: &[Token<'a>], flag: &Token<'a>) -> Option<&'a str> {
+    flag.linked.map(|idx| tokens[idx].text)
 }
 
 /// When `user_set_limit` is true, the user explicitly passed `-N` to git log,
@@ -1684,14 +1642,16 @@ fn format_checkout_output(args: &[String], raw: &str, exit_code: i32) -> String 
 }
 
 fn format_checkout_success(args: &[String], raw: &str) -> String {
-    if let Some(restored) = checkout_restored_count(args) {
+    let tokens = arg_tokenizer::tokenize(args, &checkout_takes_value);
+
+    if let Some(restored) = checkout_restored_count(&tokens) {
         return format!(
             "ok {} {}",
             restored,
             pluralize(restored, "file restored", "files restored")
         );
     }
-    if let Some(branch) = checkout_reset_branch_arg(args) {
+    if let Some(branch) = checkout_reset_branch_arg(&tokens) {
         return format!("ok {}", branch);
     }
 
@@ -1714,70 +1674,65 @@ fn format_checkout_success(args: &[String], raw: &str) -> String {
         }
     }
 
-    if let Some(branch) = checkout_new_branch_arg(args) {
+    if let Some(branch) = checkout_new_branch_arg(&tokens) {
         return format!("ok {} (new)", branch);
     }
-    if let Some(branch) = checkout_branch_arg(args) {
+    if let Some(branch) = checkout_branch_arg(&tokens) {
         return format!("ok {}", branch);
     }
 
     "ok".to_string()
 }
 
-fn checkout_restored_count(args: &[String]) -> Option<usize> {
-    let separator = args.iter().position(|arg| arg == "--")?;
-    let count = args[separator + 1..]
+/// `-b`/`-B`/`--orphan` all take a branch-name value; `-t`/`--track`/`--detach` and any other
+/// `-`-prefixed token are booleans. Shared by every `checkout_*_arg` helper below via one
+/// [`arg_tokenizer::tokenize`] call instead of each hand-rolling its own scan over `args`.
+fn checkout_takes_value(kind: TokenKind, name: &str) -> bool {
+    match kind {
+        TokenKind::Long => name == "orphan",
+        TokenKind::Short => matches!(name, "b" | "B"),
+        TokenKind::Positional | TokenKind::DashDash => false,
+    }
+}
+
+fn checkout_restored_count(tokens: &[Token<'_>]) -> Option<usize> {
+    let separator = tokens.iter().position(|t| t.kind == TokenKind::DashDash)?;
+    let count = tokens[separator + 1..]
         .iter()
-        .filter(|arg| !arg.is_empty())
+        .filter(|t| !t.text.is_empty())
         .count();
     (count > 0).then_some(count)
 }
 
-fn checkout_new_branch_arg(args: &[String]) -> Option<&str> {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "-b" | "--orphan" => return iter.next().map(String::as_str),
-            "-B" => {
-                iter.next();
-            }
-            _ => {
-                if let Some(branch) = arg.strip_prefix("--orphan=") {
-                    return Some(branch);
-                }
-            }
-        }
-    }
-    None
+fn checkout_new_branch_arg<'a>(tokens: &[Token<'a>]) -> Option<&'a str> {
+    tokens.iter().find_map(|t| match t.kind {
+        TokenKind::Short if t.text == "b" => flag_value(tokens, t),
+        TokenKind::Long if t.text == "orphan" => flag_value(tokens, t),
+        _ => None,
+    })
 }
 
-fn checkout_reset_branch_arg(args: &[String]) -> Option<&str> {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if arg == "-B" {
-            return iter.next().map(String::as_str);
-        }
-    }
-    None
+fn checkout_reset_branch_arg<'a>(tokens: &[Token<'a>]) -> Option<&'a str> {
+    tokens
+        .iter()
+        .find(|t| t.kind == TokenKind::Short && t.text == "B")
+        .and_then(|t| flag_value(tokens, t))
 }
 
-fn checkout_branch_arg(args: &[String]) -> Option<&str> {
-    if args.iter().any(|arg| arg == "--") {
+fn checkout_branch_arg<'a>(tokens: &[Token<'a>]) -> Option<&'a str> {
+    if tokens.iter().any(|t| t.kind == TokenKind::DashDash) {
         return None;
     }
+    tokens
+        .iter()
+        .find(|t| t.kind == TokenKind::Positional && t.linked.is_none())
+        .map(|t| t.text)
+}
 
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "-b" | "-B" | "--orphan" => {
-                iter.next();
-            }
-            "-t" | "--track" | "--detach" => {}
-            _ if arg.starts_with('-') => {}
-            _ => return Some(arg),
-        }
-    }
-    None
+/// A flag token's value, whether attached (`-bname`, `--orphan=name`) or consumed as a
+/// separate token (`-b name`).
+fn flag_value<'a>(tokens: &[Token<'a>], flag: &Token<'a>) -> Option<&'a str> {
+    flag.attached.or_else(|| linked_value(tokens, flag))
 }
 
 fn quoted_suffix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
@@ -4007,22 +3962,22 @@ A  added.rs
         // `--grep`'s value is not itself a flag and must not appear in the
         // filtered set, even when it looks like -N, --pretty, or --merges.
         let args = vec!["--grep".to_string(), "-5".to_string()];
-        assert_eq!(real_flag_args(&args), vec!["--grep"]);
+        assert_eq!(real_flag_args(&args), vec!["grep"]);
     }
 
     #[test]
     fn test_real_flag_args_keeps_limit_flag_drops_its_value() {
         let args = vec!["-n".to_string(), "15".to_string()];
-        assert_eq!(real_flag_args(&args), vec!["-n"]);
+        assert_eq!(real_flag_args(&args), vec!["n"]);
 
         let args = vec!["--max-count".to_string(), "25".to_string()];
-        assert_eq!(real_flag_args(&args), vec!["--max-count"]);
+        assert_eq!(real_flag_args(&args), vec!["max-count"]);
     }
 
     #[test]
     fn test_real_flag_args_keeps_genuine_flags() {
         let args = vec!["--grep".to_string(), "fix".to_string(), "--oneline".to_string()];
-        assert_eq!(real_flag_args(&args), vec!["--grep", "--oneline"]);
+        assert_eq!(real_flag_args(&args), vec!["grep", "oneline"]);
     }
 
     #[test]
@@ -4031,9 +3986,7 @@ A  added.rs
         // string "-5"; it is not a request to limit output to 5 commits.
         let args = vec!["--grep".to_string(), "-5".to_string()];
         assert!(
-            !real_flag_args(&args)
-                .iter()
-                .any(|arg| arg.starts_with('-') && arg.chars().nth(1).is_some_and(|c| c.is_ascii_digit())),
+            !real_flag_args(&args).iter().any(|arg| is_digit_run(arg)),
             "-5 as the value of --grep should not be seen as a limit flag"
         );
         assert_eq!(
@@ -4049,9 +4002,7 @@ A  added.rs
         // "--pretty"; git consumes it as --grep's value, not a format flag.
         let args = vec!["--grep".to_string(), "--pretty".to_string()];
         assert!(
-            !real_flag_args(&args)
-                .iter()
-                .any(|arg| arg.starts_with("--pretty")),
+            !real_flag_args(&args).contains(&"pretty"),
             "--pretty as the value of --grep should not be seen as a format flag"
         );
     }
@@ -4062,7 +4013,7 @@ A  added.rs
         // "--merges"; git consumes it as --grep's value, not --merges.
         let args = vec!["--grep".to_string(), "--merges".to_string()];
         assert!(
-            !real_flag_args(&args).contains(&"--merges"),
+            !real_flag_args(&args).contains(&"merges"),
             "--merges as the value of --grep should not be seen as the --merges flag"
         );
     }
