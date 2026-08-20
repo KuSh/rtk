@@ -47,6 +47,22 @@ pub struct Token<'a> {
     /// was no attached value). For a consumed `Positional`: index of the flag token that owns
     /// it. `None` for a free-standing positional, an unconsumed flag, or `DashDash`.
     pub linked: Option<usize>,
+    /// Index into the original `args` slice this token was produced from. Every `Short` token
+    /// from the same `-xyz` cluster shares one `source_index` (they came from one arg); a
+    /// consumed separate-token value always has its own, since it's a distinct arg. Lets a
+    /// caller that needs to rebuild exact per-arg boundaries (e.g. whether `-r`/`-n` were typed
+    /// as one cluster or two separate flags) do so without re-scanning `args` itself.
+    pub source_index: usize,
+}
+
+impl<'a> Token<'a> {
+    /// This token's value, whether attached (`--flag=value`, `-fvalue`) or consumed as a
+    /// separate token (`--flag value`, `-f value`). `None` for a boolean flag, an unrecognized
+    /// flag, or a non-flag token. `tokens` must be the same slice `self` came from.
+    pub fn value(&self, tokens: &[Token<'a>]) -> Option<&'a str> {
+        self.attached
+            .or_else(|| self.linked.map(|idx| tokens[idx].text))
+    }
 }
 
 /// Tokenizes `args` into [`Token`]s. `takes_value(kind, name)` is called for each `Long`/`Short`
@@ -68,7 +84,7 @@ pub fn tokenize<'a>(
         let arg = args[i].as_str();
 
         if seen_dash_dash {
-            tokens.push(positional(arg));
+            tokens.push(positional(arg, i));
             i += 1;
             continue;
         }
@@ -79,6 +95,7 @@ pub fn tokenize<'a>(
                 text: "",
                 attached: None,
                 linked: None,
+                source_index: i,
             });
             seen_dash_dash = true;
             i += 1;
@@ -96,6 +113,7 @@ pub fn tokenize<'a>(
                 text: name,
                 attached,
                 linked: None,
+                source_index: i,
             });
             i += 1;
 
@@ -104,7 +122,7 @@ pub fn tokenize<'a>(
                     let value_index = tokens.len();
                     tokens.push(Token {
                         linked: Some(flag_index),
-                        ..positional(next.as_str())
+                        ..positional(next.as_str(), i)
                     });
                     tokens[flag_index].linked = Some(value_index);
                     i += 1;
@@ -122,6 +140,7 @@ pub fn tokenize<'a>(
                     text: cluster,
                     attached: None,
                     linked: None,
+                    source_index: i,
                 });
                 i += 1;
                 continue;
@@ -138,6 +157,7 @@ pub fn tokenize<'a>(
                     text: char_text,
                     attached: None,
                     linked: None,
+                    source_index: i,
                 });
 
                 if takes_value(TokenKind::Short, char_text) {
@@ -148,7 +168,7 @@ pub fn tokenize<'a>(
                         let value_index = tokens.len();
                         tokens.push(Token {
                             linked: Some(flag_index),
-                            ..positional(next.as_str())
+                            ..positional(next.as_str(), i + 1)
                         });
                         tokens[flag_index].linked = Some(value_index);
                         consumed_next = true;
@@ -161,19 +181,20 @@ pub fn tokenize<'a>(
             continue;
         }
 
-        tokens.push(positional(arg));
+        tokens.push(positional(arg, i));
         i += 1;
     }
 
     tokens
 }
 
-fn positional(text: &str) -> Token<'_> {
+fn positional(text: &str, source_index: usize) -> Token<'_> {
     Token {
         kind: TokenKind::Positional,
         text,
         attached: None,
         linked: None,
+        source_index,
     }
 }
 
@@ -307,6 +328,22 @@ mod tests {
         assert_eq!(tokens[1].text, "i");
         assert_eq!(tokens[2].text, "I");
         assert!(tokens.iter().all(|t| t.kind == TokenKind::Short));
+        // All three chars came from the one "-riI" arg.
+        assert!(tokens.iter().all(|t| t.source_index == 0));
+    }
+
+    #[test]
+    fn source_index_distinguishes_one_cluster_from_separate_flags() {
+        // "-rn" (one arg, one cluster) vs "-r" "-n" (two separate args) classify
+        // identically char-by-char, but a caller that needs to know whether they
+        // were typed together can tell via source_index.
+        let clustered = owned(&["-rn"]);
+        let tokens = tokenize(&clustered, &no_values);
+        assert_eq!(tokens[0].source_index, tokens[1].source_index);
+
+        let separate = owned(&["-r", "-n"]);
+        let tokens = tokenize(&separate, &no_values);
+        assert_ne!(tokens[0].source_index, tokens[1].source_index);
     }
 
     #[test]

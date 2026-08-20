@@ -6,6 +6,7 @@
 //! used (see `Engine`); the compression is identical because both emit the same
 //! `file:line:content` shape.
 
+use crate::core::arg_tokenizer::{self, TokenKind};
 use crate::core::stream::{
     self, exec_capture, exec_capture_stdin, CaptureResult, FilterMode, StdinMode, StreamFilter,
 };
@@ -31,83 +32,47 @@ const VALUE_FLAGS_SHORT: &[u8] = b"ABCMTdfgjmt";
 /// `--regexp` is handled separately (its value goes to `patterns`).
 /// `--encoding` value is consumed correctly here; dialect routing is #2138's job.
 const VALUE_FLAGS_LONG: &[&str] = &[
-    "--after-context",
-    "--before-context",
-    "--color",
-    "--colors",
-    "--context",
-    "--context-separator",
-    "--encoding",
-    "--engine",
-    "--field-context-separator",
-    "--field-match-separator",
-    "--file",
-    "--glob",
-    "--iglob",
-    "--ignore-file",
-    "--max-columns",
-    "--max-count",
-    "--max-depth",
-    "--max-filesize",
-    "--path-separator",
-    "--pre",
-    "--pre-glob",
-    "--replace",
-    "--sort",
-    "--sortr",
-    "--threads",
-    "--type",
-    "--type-add",
-    "--type-clear",
-    "--type-not",
+    "after-context",
+    "before-context",
+    "color",
+    "colors",
+    "context",
+    "context-separator",
+    "encoding",
+    "engine",
+    "field-context-separator",
+    "field-match-separator",
+    "file",
+    "glob",
+    "iglob",
+    "ignore-file",
+    "max-columns",
+    "max-count",
+    "max-depth",
+    "max-filesize",
+    "path-separator",
+    "pre",
+    "pre-glob",
+    "replace",
+    "sort",
+    "sortr",
+    "threads",
+    "type",
+    "type-add",
+    "type-clear",
+    "type-not",
 ];
 
-/// Result of parsing the content of a short flag cluster (the part after `-`).
-#[derive(Debug, PartialEq)]
-enum ClusterResult {
-    /// All chars were boolean flags or `r`/`R` (stripped).
-    /// `None` when the entire cluster reduces to nothing after stripping.
-    Boolean(Option<String>),
-    /// A value-taking flag was encountered. Scanning stops here.
-    ValueTaking {
-        /// Boolean flags before the value-taking char, `r`/`R` stripped.
-        prefix: Option<String>,
-        /// The value-taking flag char (`e`, `A`, `g`, etc.).
-        flag: char,
-        /// Bytes after `flag` in the cluster — its inline value.
-        /// Empty string means "consume the next token instead."
-        inline: String,
-    },
+fn is_short_value_flag(name: &str) -> bool {
+    name.len() == 1 && (name == "e" || VALUE_FLAGS_SHORT.contains(&name.as_bytes()[0]))
 }
 
-/// Parse the content of a short flag cluster (everything after the leading `-`).
-///
-/// Scans left-to-right, accumulating boolean flag letters — including `r`/`R`,
-/// which pass through to grep (recursion is the agent's choice, not RTK's) — and
-/// stops at the first value-taking flag (from `VALUE_FLAGS_SHORT` or `e`).
-/// Everything after that flag char is its inline value, returned verbatim.
-fn parse_cluster(rest: &str) -> ClusterResult {
-    let bytes = rest.as_bytes();
-    let mut raw_prefix = String::new();
-    let mut j = 0;
-    while j < bytes.len() {
-        let ch = bytes[j];
-        let is_e = ch == b'e';
-        if is_e || VALUE_FLAGS_SHORT.contains(&ch) {
-            let inline = std::str::from_utf8(&bytes[j + 1..])
-                .unwrap_or("")
-                .to_string();
-            let prefix = (!raw_prefix.is_empty()).then_some(raw_prefix);
-            return ClusterResult::ValueTaking {
-                prefix,
-                flag: ch as char,
-                inline,
-            };
-        }
-        raw_prefix.push(ch as char);
-        j += 1;
+fn search_takes_value(kind: TokenKind, name: &str) -> bool {
+    match kind {
+        TokenKind::Short => is_short_value_flag(name),
+        TokenKind::Long => name == "regexp" || VALUE_FLAGS_LONG.contains(&name),
+        TokenKind::Positional | TokenKind::DashDash => false,
     }
-    ClusterResult::Boolean((!raw_prefix.is_empty()).then_some(raw_prefix))
 }
 
 /// Unique, descriptive tee slug for a file's overflow matches. `idx` disambiguates
@@ -143,100 +108,78 @@ fn match_block(path: &str, entries: &[(usize, bool, String)]) -> String {
 /// separate flag. Long value-taking flags consume the next token. `--` marks
 /// everything after it as positional.
 fn extract_pattern_path<T: AsRef<str>>(args: &[T]) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let owned: Vec<String> = args.iter().map(|a| a.as_ref().to_string()).collect();
+    let tokens = arg_tokenizer::tokenize(&owned, &search_takes_value);
+
     let mut e_patterns: Vec<String> = Vec::new();
     let mut positionals: Vec<String> = Vec::new();
     let mut flags: Vec<String> = Vec::new();
-    let mut past_dashdash = false;
     let mut i = 0;
 
-    while i < args.len() {
-        let arg = args[i].as_ref();
-
-        if past_dashdash {
-            positionals.push(arg.to_string());
-            i += 1;
-            continue;
-        }
-
-        if arg == "--" {
-            past_dashdash = true;
-            i += 1;
-            continue;
-        }
-
-        if arg.starts_with("--") {
-            // --regexp is the long form of -e: value goes to patterns.
-            if arg == "--regexp" {
-                if i + 1 < args.len() {
-                    e_patterns.push(args[i + 1].as_ref().to_string());
-                    i += 2;
-                } else {
-                    i += 1;
+    while i < tokens.len() {
+        let t = &tokens[i];
+        match t.kind {
+            TokenKind::DashDash => {}
+            TokenKind::Positional => {
+                // A value consumed by a preceding flag is handled there instead.
+                if t.linked.is_none() {
+                    positionals.push(t.text.to_string());
                 }
-                continue;
             }
-            // Other long value-taking flags: consume next token as value.
-            if VALUE_FLAGS_LONG.contains(&arg) {
-                flags.push(arg.to_string());
-                if i + 1 < args.len() {
-                    flags.push(args[i + 1].as_ref().to_string());
-                    i += 2;
-                } else {
-                    i += 1;
+            TokenKind::Long if t.text == "regexp" => {
+                if let Some(v) = t.value(&tokens) {
+                    e_patterns.push(v.to_string());
                 }
-                continue;
             }
-            flags.push(arg.to_string());
-            i += 1;
-            continue;
-        }
-
-        match arg.strip_prefix('-') {
-            Some(rest) if !rest.is_empty() => match parse_cluster(rest) {
-                ClusterResult::Boolean(prefix) => {
-                    if let Some(s) = prefix {
-                        flags.push(format!("-{}", s));
-                    }
-                    i += 1;
-                }
-                ClusterResult::ValueTaking {
-                    prefix,
-                    flag,
-                    inline,
-                } => {
-                    if let Some(s) = prefix {
-                        flags.push(format!("-{}", s));
-                    }
-                    if flag == 'e' {
-                        if !inline.is_empty() {
-                            e_patterns.push(inline);
-                            i += 1;
-                        } else if i + 1 < args.len() {
-                            e_patterns.push(args[i + 1].as_ref().to_string());
-                            i += 2;
-                        } else {
-                            flags.push("-e".to_string());
-                            i += 1;
-                        }
-                    } else {
-                        flags.push(format!("-{}", flag));
-                        if !inline.is_empty() {
-                            flags.push(inline);
-                            i += 1;
-                        } else if i + 1 < args.len() {
-                            flags.push(args[i + 1].as_ref().to_string());
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
+            TokenKind::Long => match t.attached {
+                Some(v) => flags.push(format!("--{}={v}", t.text)),
+                None => {
+                    flags.push(format!("--{}", t.text));
+                    if let Some(v) = t.value(&tokens) {
+                        flags.push(v.to_string());
                     }
                 }
             },
-            _ => {
-                positionals.push(arg.to_string());
-                i += 1;
+            TokenKind::Short => {
+                // A cluster's boolean prefix (e.g. "r" in "-rA") stays glued into one
+                // flag string, matching how the user typed it; only the trailing
+                // value-taking char (if any) and its value are their own tokens.
+                let source = t.source_index;
+                let start = i;
+                while i + 1 < tokens.len()
+                    && tokens[i + 1].kind == TokenKind::Short
+                    && tokens[i + 1].source_index == source
+                {
+                    i += 1;
+                }
+                let cluster = &tokens[start..=i];
+                let (bool_chars, value_char) = match cluster.split_last() {
+                    Some((last, rest)) if is_short_value_flag(last.text) => (rest, Some(last)),
+                    _ => (cluster, None),
+                };
+
+                if !bool_chars.is_empty() {
+                    let glued: String = bool_chars.iter().map(|c| c.text).collect();
+                    flags.push(format!("-{glued}"));
+                }
+
+                if let Some(vt) = value_char {
+                    let value = vt.value(&tokens);
+                    if vt.text == "e" {
+                        match value {
+                            Some(v) => e_patterns.push(v.to_string()),
+                            None => flags.push("-e".to_string()),
+                        }
+                    } else {
+                        flags.push(format!("-{}", vt.text));
+                        if let Some(v) = value {
+                            flags.push(v.to_string());
+                        }
+                    }
+                }
             }
         }
+        i += 1;
     }
 
     // If -e/--regexp was used: all positionals are paths.
@@ -927,118 +870,11 @@ mod tests {
         assert!(!cleaned.is_empty());
     }
 
-    // --- parse_cluster ---
-
-    fn vt(prefix: Option<&str>, flag: char, inline: &str) -> ClusterResult {
-        ClusterResult::ValueTaking {
-            prefix: prefix.map(|s| s.to_string()),
-            flag,
-            inline: inline.to_string(),
-        }
-    }
-
-    #[test]
-    fn test_parse_cluster_boolean_only() {
-        // Pure boolean clusters: r/R kept and passed through to grep
-        assert_eq!(
-            parse_cluster("r"),
-            ClusterResult::Boolean(Some("r".to_string()))
-        );
-        assert_eq!(
-            parse_cluster("R"),
-            ClusterResult::Boolean(Some("R".to_string()))
-        );
-        assert_eq!(
-            parse_cluster("rR"),
-            ClusterResult::Boolean(Some("rR".to_string()))
-        );
-        assert_eq!(
-            parse_cluster("rn"),
-            ClusterResult::Boolean(Some("rn".to_string()))
-        );
-        assert_eq!(
-            parse_cluster("Rni"),
-            ClusterResult::Boolean(Some("Rni".to_string()))
-        );
-        assert_eq!(
-            parse_cluster("n"),
-            ClusterResult::Boolean(Some("n".to_string()))
-        );
-        assert_eq!(
-            parse_cluster("ni"),
-            ClusterResult::Boolean(Some("ni".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_parse_cluster_e_no_inline() {
-        // -e: value-taking, empty inline → caller consumes next token
-        assert_eq!(parse_cluster("e"), vt(None, 'e', ""));
-    }
-
-    #[test]
-    fn test_parse_cluster_e_inline_value() {
-        // -ecarrot: inline="carrot" — no r/R stripping on the value bytes
-        assert_eq!(parse_cluster("ecarrot"), vt(None, 'e', "carrot"));
-    }
-
-    #[test]
-    fn test_parse_cluster_e_inline_value_no_rstrip() {
-        // The 'r' chars in "carrot" must survive verbatim in the inline field.
-        // If strip_r were called on inline bytes, this would return "caot".
-        let ClusterResult::ValueTaking { inline, .. } = parse_cluster("ecarrot") else {
-            panic!("expected ValueTaking");
-        };
-        assert_eq!(inline, "carrot");
-    }
-
-    #[test]
-    fn test_parse_cluster_g_inline_glob() {
-        // -g*.rs: inline="*.rs" — 'r' in "*.rs" must not be stripped
-        assert_eq!(parse_cluster("g*.rs"), vt(None, 'g', "*.rs"));
-        let ClusterResult::ValueTaking { inline, .. } = parse_cluster("g*.rs") else {
-            panic!("expected ValueTaking");
-        };
-        assert_eq!(inline, "*.rs");
-    }
-
-    #[test]
-    fn test_parse_cluster_rne() {
-        // r/R pass through; e is value-taking (empty inline)
-        assert_eq!(parse_cluster("rne"), vt(Some("rn"), 'e', ""));
-    }
-
-    #[test]
-    fn test_parse_cluster_r_a() {
-        // r passes through in the prefix; A is value-taking
-        assert_eq!(parse_cluster("rA"), vt(Some("r"), 'A', ""));
-    }
-
-    #[test]
-    fn test_parse_cluster_ni_a() {
-        // -niA: n and i boolean, A value-taking
-        assert_eq!(parse_cluster("niA"), vt(Some("ni"), 'A', ""));
-    }
-
-    #[test]
-    fn test_parse_cluster_ai_inline() {
-        // -Ai: A value-taking, inline="i" (the 'i' is A's value, not a separate flag)
-        assert_eq!(parse_cluster("Ai"), vt(None, 'A', "i"));
-    }
-
-    #[test]
-    fn test_parse_cluster_short_type() {
-        assert_eq!(parse_cluster("t"), vt(None, 't', ""));
-        assert_eq!(parse_cluster("tpy"), vt(None, 't', "py")); // inline type name
-    }
-
-    #[test]
-    fn test_parse_cluster_short_max_columns() {
-        assert_eq!(parse_cluster("M"), vt(None, 'M', ""));
-        assert_eq!(parse_cluster("M120"), vt(None, 'M', "120"));
-    }
-
     // --- extract_pattern_path ---
+    //
+    // parse_cluster/ClusterResult were replaced by arg_tokenizer::tokenize; the
+    // extract_pattern_path tests below exercise the same short-cluster/value-taking/`-e`
+    // behavior end-to-end instead of unit-testing the internal cluster scanner directly.
 
     #[test]
     fn test_extract_simple() {

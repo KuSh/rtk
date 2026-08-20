@@ -1048,13 +1048,9 @@ fn parse_limit_from_tokens(tokens: &[Token<'_>]) -> Option<usize> {
             // -20 (combined digit form): the token itself is the count.
             TokenKind::Short if is_digit_run(token.text) => Some(token.text),
             // -n 20 (two-token form) or -n's value if ever attached.
-            TokenKind::Short if token.text == "n" => {
-                token.attached.or_else(|| linked_value(tokens, token))
-            }
+            TokenKind::Short if token.text == "n" => token.value(tokens),
             // --max-count=20 (attached) or --max-count 20 (two-token form).
-            TokenKind::Long if token.text == "max-count" => {
-                token.attached.or_else(|| linked_value(tokens, token))
-            }
+            TokenKind::Long if token.text == "max-count" => token.value(tokens),
             _ => None,
         };
         if let Some(n) = value.and_then(|v| v.parse::<usize>().ok()) {
@@ -1062,10 +1058,6 @@ fn parse_limit_from_tokens(tokens: &[Token<'_>]) -> Option<usize> {
         }
     }
     None
-}
-
-fn linked_value<'a>(tokens: &[Token<'a>], flag: &Token<'a>) -> Option<&'a str> {
-    flag.linked.map(|idx| tokens[idx].text)
 }
 
 /// When `user_set_limit` is true, the user explicitly passed `-N` to git log,
@@ -1706,8 +1698,8 @@ fn checkout_restored_count(tokens: &[Token<'_>]) -> Option<usize> {
 
 fn checkout_new_branch_arg<'a>(tokens: &[Token<'a>]) -> Option<&'a str> {
     tokens.iter().find_map(|t| match t.kind {
-        TokenKind::Short if t.text == "b" => flag_value(tokens, t),
-        TokenKind::Long if t.text == "orphan" => flag_value(tokens, t),
+        TokenKind::Short if t.text == "b" => t.value(tokens),
+        TokenKind::Long if t.text == "orphan" => t.value(tokens),
         _ => None,
     })
 }
@@ -1716,7 +1708,7 @@ fn checkout_reset_branch_arg<'a>(tokens: &[Token<'a>]) -> Option<&'a str> {
     tokens
         .iter()
         .find(|t| t.kind == TokenKind::Short && t.text == "B")
-        .and_then(|t| flag_value(tokens, t))
+        .and_then(|t| t.value(tokens))
 }
 
 fn checkout_branch_arg<'a>(tokens: &[Token<'a>]) -> Option<&'a str> {
@@ -1727,12 +1719,6 @@ fn checkout_branch_arg<'a>(tokens: &[Token<'a>]) -> Option<&'a str> {
         .iter()
         .find(|t| t.kind == TokenKind::Positional && t.linked.is_none())
         .map(|t| t.text)
-}
-
-/// A flag token's value, whether attached (`-bname`, `--orphan=name`) or consumed as a
-/// separate token (`-b name`).
-fn flag_value<'a>(tokens: &[Token<'a>], flag: &Token<'a>) -> Option<&'a str> {
-    flag.attached.or_else(|| linked_value(tokens, flag))
 }
 
 fn quoted_suffix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
