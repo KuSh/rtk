@@ -11,30 +11,33 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::OsString;
 
-const GOLANGCI_SUBCOMMANDS: &[&str] = &[
-    "cache",
-    "completion",
-    "config",
-    "custom",
-    "fmt",
-    "formatters",
-    "help",
-    "linters",
-    "migrate",
-    "run",
-    "version",
-];
+fn is_golangci_subcommand(name: &str) -> bool {
+    matches!(
+        name,
+        "cache"
+            | "completion"
+            | "config"
+            | "custom"
+            | "fmt"
+            | "formatters"
+            | "help"
+            | "linters"
+            | "migrate"
+            | "run"
+            | "version"
+    )
+}
 
 /// True for golangci-lint global flags that take a separate-token value, passed to
 /// [`arg_tokenizer::tokenize`] as its value predicate. `-c` is `--config`'s shorthand.
 fn golangci_takes_value(kind: TokenKind, name: &str) -> bool {
     match kind {
-        TokenKind::Short => name == "c",
         TokenKind::Long => matches!(
             name,
             "color" | "config" | "cpu-profile-path" | "mem-profile-path" | "trace-path"
         ),
-        TokenKind::Positional | TokenKind::DashDash => false,
+        TokenKind::Short => name == "c",
+        _ => false,
     }
 }
 
@@ -195,9 +198,7 @@ fn find_subcommand_index(args: &[String]) -> Option<usize> {
         match token.kind {
             TokenKind::DashDash => return None,
             TokenKind::Positional if token.linked.is_none() => {
-                return GOLANGCI_SUBCOMMANDS
-                    .contains(&token.text)
-                    .then_some(token.source_index);
+                return is_golangci_subcommand(token.text).then_some(token.source_index);
             }
             _ => {}
         }

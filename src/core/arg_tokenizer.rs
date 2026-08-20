@@ -14,17 +14,6 @@
 /// What kind of unit a [`Token`] represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
-    /// `--name` (see `Token::text` for the name, without the leading `--`).
-    Long,
-    /// One character of a `-x` / `-xyz` short-option cluster (see `Token::text`, without the
-    /// leading `-`). A run of only digits (`-20`) is a widely-used shorthand for a numeric
-    /// value in its own right (git log/head/tail's `-N` count) rather than a cluster of
-    /// per-digit boolean flags, so it is kept as one `Short` token with the whole digit run as
-    /// `text`, never decomposed.
-    Short,
-    /// A positional/value token — either free-standing or consumed by a preceding `Long`/`Short`
-    /// as its separate-token value (see `Token::linked`).
-    Positional,
     /// The literal `--` separator. Emitted exactly once, for the first `--` encountered. Under
     /// [`Dialect::Posix`], this ends option parsing: every token after it is `Positional`
     /// unconditionally and `takes_value` is never consulted again (a second or later `--` comes
@@ -34,6 +23,17 @@ pub enum TokenKind {
     /// can share flag names with dotnet's own), so classification continues normally past it —
     /// only its position is recorded.
     DashDash,
+    /// `--name` (see `Token::text` for the name, without the leading `--`).
+    Long,
+    /// A positional/value token — either free-standing or consumed by a preceding `Long`/`Short`
+    /// as its separate-token value (see `Token::linked`).
+    Positional,
+    /// One character of a `-x` / `-xyz` short-option cluster (see `Token::text`, without the
+    /// leading `-`). A run of only digits (`-20`) is a widely-used shorthand for a numeric
+    /// value in its own right (git log/head/tail's `-N` count) rather than a cluster of
+    /// per-digit boolean flags, so it is kept as one `Short` token with the whole digit run as
+    /// `text`, never decomposed.
+    Short,
 }
 
 /// One classified unit of an args slice, as produced by [`tokenize`].
@@ -72,15 +72,15 @@ impl<'a> Token<'a> {
 /// Which CLI's flag grammar `tokenize_dialect` should apply. See [`tokenize_dialect`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
-    /// GNU/POSIX-ish: git, cargo, rg, golangci-lint. `-xyz` is a cluster of short flags,
-    /// scanned char by char; only `=` attaches a value to a long flag.
-    Posix,
     /// MSBuild/dotnet-CLI-ish. `-flag`, `--flag`, and `/flag` are all one atomic flag name —
     /// there is no short-flag clustering — and a value can attach via either `=` or `:`
     /// (`--logger:trx` and `--logger=trx` are both valid). Every atomic flag is tagged
     /// `TokenKind::Long` regardless of which prefix introduced it; `TokenKind::Short` is never
     /// produced in this dialect.
     Msbuild,
+    /// GNU/POSIX-ish: git, cargo, rg, golangci-lint. `-xyz` is a cluster of short flags,
+    /// scanned char by char; only `=` attaches a value to a long flag.
+    Posix,
 }
 
 /// Tokenizes `args` into [`Token`]s using [`Dialect::Posix`] conventions. `takes_value(kind,

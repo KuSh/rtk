@@ -758,7 +758,7 @@ fn dotnet_takes_value(kind: TokenKind, name: &str) -> bool {
     kind == TokenKind::Long
         && matches!(
             name.to_ascii_lowercase().as_str(),
-            "logger" | "results-directory" | "report"
+            "logger" | "report" | "results-directory"
         )
 }
 

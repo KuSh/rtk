@@ -20,58 +20,64 @@ use std::io::IsTerminal;
 use std::process::Command;
 use std::sync::LazyLock;
 
-/// Short single-char flags that consume one following token (or inline remainder)
-/// as their value. `-e` is handled separately — its value goes to `patterns`.
-/// Includes all rg short flags that take a value argument except `-e` and `-r`
-/// (stripped) and `-E` (dialect, left to #2138). Failure mode for a missing
-/// entry: the value becomes a positional (visible wrong result, not silent).
-const VALUE_FLAGS_SHORT: &[u8] = b"ABCMTdfgjmt";
-
-/// Long flags that consume the NEXT token as their value (space-separated form).
-/// Inline `=` form (`--flag=value`) is one token and passes through unchanged.
-/// `--regexp` is handled separately (its value goes to `patterns`).
-/// `--encoding` value is consumed correctly here; dialect routing is #2138's job.
-const VALUE_FLAGS_LONG: &[&str] = &[
-    "after-context",
-    "before-context",
-    "color",
-    "colors",
-    "context",
-    "context-separator",
-    "encoding",
-    "engine",
-    "field-context-separator",
-    "field-match-separator",
-    "file",
-    "glob",
-    "iglob",
-    "ignore-file",
-    "max-columns",
-    "max-count",
-    "max-depth",
-    "max-filesize",
-    "path-separator",
-    "pre",
-    "pre-glob",
-    "replace",
-    "sort",
-    "sortr",
-    "threads",
-    "type",
-    "type-add",
-    "type-clear",
-    "type-not",
-];
-
+/// Short single-char flags that consume one following token (or inline remainder) as their
+/// value, plus `-e` (handled separately downstream — its value goes to `patterns`, not
+/// `flags`). Includes all rg short flags that take a value argument except `-r` (stripped) and
+/// `-E` (dialect, left to #2138). Failure mode for a missing entry: the value becomes a
+/// positional (visible wrong result, not silent).
 fn is_short_value_flag(name: &str) -> bool {
-    name.len() == 1 && (name == "e" || VALUE_FLAGS_SHORT.contains(&name.as_bytes()[0]))
+    matches!(
+        name,
+        "A" | "B" | "C" | "M" | "T" | "d" | "e" | "f" | "g" | "j" | "m" | "t"
+    )
+}
+
+/// Long flags that consume the NEXT token as their value (space-separated form). Inline `=`
+/// form (`--flag=value`) is one token and passes through unchanged. `--regexp`'s value is
+/// routed to `patterns` downstream (`extract_pattern_path`), not `flags`, but it's included
+/// here too since this only answers "does the next token belong to this flag." `--encoding`
+/// value is consumed correctly here; dialect routing is #2138's job.
+fn is_long_value_flag(name: &str) -> bool {
+    matches!(
+        name,
+        "after-context"
+            | "before-context"
+            | "color"
+            | "colors"
+            | "context"
+            | "context-separator"
+            | "encoding"
+            | "engine"
+            | "field-context-separator"
+            | "field-match-separator"
+            | "file"
+            | "glob"
+            | "iglob"
+            | "ignore-file"
+            | "max-columns"
+            | "max-count"
+            | "max-depth"
+            | "max-filesize"
+            | "path-separator"
+            | "pre"
+            | "pre-glob"
+            | "regexp"
+            | "replace"
+            | "sort"
+            | "sortr"
+            | "threads"
+            | "type"
+            | "type-add"
+            | "type-clear"
+            | "type-not"
+    )
 }
 
 fn search_takes_value(kind: TokenKind, name: &str) -> bool {
     match kind {
+        TokenKind::Long => is_long_value_flag(name),
         TokenKind::Short => is_short_value_flag(name),
-        TokenKind::Long => name == "regexp" || VALUE_FLAGS_LONG.contains(&name),
-        TokenKind::Positional | TokenKind::DashDash => false,
+        _ => false,
     }
 }
 
@@ -119,13 +125,6 @@ fn extract_pattern_path<T: AsRef<str>>(args: &[T]) -> (Vec<String>, Vec<String>,
     while i < tokens.len() {
         let t = &tokens[i];
         match t.kind {
-            TokenKind::DashDash => {}
-            TokenKind::Positional => {
-                // A value consumed by a preceding flag is handled there instead.
-                if t.linked.is_none() {
-                    positionals.push(t.text.to_string());
-                }
-            }
             TokenKind::Long if t.text == "regexp" => {
                 if let Some(v) = t.value(&tokens) {
                     e_patterns.push(v.to_string());
@@ -140,6 +139,10 @@ fn extract_pattern_path<T: AsRef<str>>(args: &[T]) -> (Vec<String>, Vec<String>,
                     }
                 }
             },
+            // A value consumed by a preceding flag is handled there instead.
+            TokenKind::Positional if t.linked.is_none() => {
+                positionals.push(t.text.to_string());
+            }
             TokenKind::Short => {
                 // A cluster's boolean prefix (e.g. "r" in "-rA") stays glued into one
                 // flag string, matching how the user typed it; only the trailing
@@ -178,6 +181,9 @@ fn extract_pattern_path<T: AsRef<str>>(args: &[T]) -> (Vec<String>, Vec<String>,
                     }
                 }
             }
+            // DashDash itself carries nothing to emit — the `--` boundary is handled by the
+            // tokenizer (everything after it already comes back as Positional).
+            _ => {}
         }
         i += 1;
     }

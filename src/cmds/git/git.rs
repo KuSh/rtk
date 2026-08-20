@@ -854,12 +854,12 @@ fn run_log(
     // Check if user provided format flags
     let has_format_flag = tokens
         .iter()
-        .any(|t| t.kind == TokenKind::Long && matches!(t.text, "oneline" | "pretty" | "format"));
+        .any(|t| t.kind == TokenKind::Long && matches!(t.text, "format" | "oneline" | "pretty"));
 
     // Check if user provided limit flag (-N, -n N, --max-count=N, --max-count N)
     let has_limit_flag = tokens.iter().any(|t| match t.kind {
-        TokenKind::Short => t.text == "n" || is_digit_run(t.text),
         TokenKind::Long => t.text == "max-count",
+        TokenKind::Short => t.text == "n" || is_digit_run(t.text),
         _ => false,
     });
 
@@ -889,8 +889,8 @@ fn run_log(
     let wants_merges = tokens.iter().any(|t| {
         t.kind == TokenKind::Long
             && (t.text == "merges"
-                || t.text == "no-merges"
-                || (t.text == "min-parents" && t.attached == Some("2")))
+                || (t.text == "min-parents" && t.attached == Some("2"))
+                || t.text == "no-merges")
     });
     // Don't add --no-merges if user explicitly requested merges or an exact count (-n N / --max-count)
     if !wants_merges && !has_limit_flag {
@@ -980,7 +980,7 @@ fn log_takes_value(kind: TokenKind, name: &str) -> bool {
                 | "ws-error-highlight"
         ),
         TokenKind::Short => matches!(name, "G" | "I" | "L" | "O" | "S" | "l" | "n"),
-        TokenKind::Positional | TokenKind::DashDash => false,
+        _ => false,
     }
 }
 
@@ -1008,7 +1008,6 @@ fn is_digit_run(text: &str) -> bool {
 /// filtered one (see [`requests_raw_log_output`]).
 fn requests_raw_diff_shape(token: &Token<'_>) -> bool {
     match token.kind {
-        TokenKind::Short => matches!(token.text, "p" | "u"),
         TokenKind::Long => matches!(
             token.text,
             "dirstat"
@@ -1023,7 +1022,8 @@ fn requests_raw_diff_shape(token: &Token<'_>) -> bool {
                 | "stat"
                 | "summary"
         ),
-        TokenKind::Positional | TokenKind::DashDash => false,
+        TokenKind::Short => matches!(token.text, "p" | "u"),
+        _ => false,
     }
 }
 
@@ -1045,12 +1045,12 @@ fn parse_user_limit(args: &[String]) -> Option<usize> {
 fn parse_limit_from_tokens(tokens: &[Token<'_>]) -> Option<usize> {
     for token in tokens {
         let value = match token.kind {
+            // --max-count=20 (attached) or --max-count 20 (two-token form).
+            TokenKind::Long if token.text == "max-count" => token.value(tokens),
             // -20 (combined digit form): the token itself is the count.
             TokenKind::Short if is_digit_run(token.text) => Some(token.text),
             // -n 20 (two-token form) or -n's value if ever attached.
             TokenKind::Short if token.text == "n" => token.value(tokens),
-            // --max-count=20 (attached) or --max-count 20 (two-token form).
-            TokenKind::Long if token.text == "max-count" => token.value(tokens),
             _ => None,
         };
         if let Some(n) = value.and_then(|v| v.parse::<usize>().ok()) {
@@ -1682,8 +1682,8 @@ fn format_checkout_success(args: &[String], raw: &str) -> String {
 fn checkout_takes_value(kind: TokenKind, name: &str) -> bool {
     match kind {
         TokenKind::Long => name == "orphan",
-        TokenKind::Short => matches!(name, "b" | "B"),
-        TokenKind::Positional | TokenKind::DashDash => false,
+        TokenKind::Short => matches!(name, "B" | "b"),
+        _ => false,
     }
 }
 
@@ -1698,8 +1698,8 @@ fn checkout_restored_count(tokens: &[Token<'_>]) -> Option<usize> {
 
 fn checkout_new_branch_arg<'a>(tokens: &[Token<'a>]) -> Option<&'a str> {
     tokens.iter().find_map(|t| match t.kind {
-        TokenKind::Short if t.text == "b" => t.value(tokens),
         TokenKind::Long if t.text == "orphan" => t.value(tokens),
+        TokenKind::Short if t.text == "b" => t.value(tokens),
         _ => None,
     })
 }
