@@ -833,7 +833,13 @@ fn run_log(
     // `-p` is a pathspec, not the real patch flag.
     let args = &args_utils::restore_double_dash(args);
 
-    if requests_raw_log_output(args) {
+    // Tokenize once and share it: flag-vs-value classification is reused below by the raw-shape
+    // check, the flag-presence checks, and the limit parsing, and a value belonging to
+    // --grep/--author/etc. (e.g. `--grep --pretty`) must not be misread as one of the flags
+    // below.
+    let tokens = arg_tokenizer::tokenize(args, &log_takes_value);
+
+    if tokens.iter().any(requests_raw_diff_shape) {
         let passthrough_args: Vec<OsString> = std::iter::once(OsString::from("log"))
             .chain(args.iter().map(OsString::from))
             .collect();
@@ -844,12 +850,6 @@ fn run_log(
 
     let mut cmd = git_cmd(global_args);
     cmd.arg("log");
-
-    // Tokenize once and share it: flag-vs-value classification is reused
-    // below by both the flag-presence checks and the limit parsing, and a
-    // value belonging to --grep/--author/etc. (e.g. `--grep --pretty`) must
-    // not be misread as one of the flags below.
-    let tokens = arg_tokenizer::tokenize(args, &log_takes_value);
 
     // Check if user provided format flags
     let has_format_flag = tokens
@@ -1027,6 +1027,9 @@ fn requests_raw_diff_shape(token: &Token<'_>) -> bool {
     }
 }
 
+/// Test-only convenience wrapper; `run_log` shares a single tokenization with
+/// [`requests_raw_diff_shape`] directly instead, to avoid tokenizing `args` twice.
+#[cfg(test)]
 fn requests_raw_log_output(args: &[String]) -> bool {
     arg_tokenizer::tokenize(args, &log_takes_value)
         .iter()
