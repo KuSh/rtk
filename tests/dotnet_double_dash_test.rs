@@ -10,11 +10,15 @@
 //! Stubs `dotnet` on PATH with a script that records its argv, since the real
 //! dotnet SDK isn't available in this environment.
 
-use std::process::Command;
-
 #[cfg(unix)]
 #[test]
 fn dotnet_test_reuses_users_double_dash_for_report_trx_injection() {
+    use std::process::Command;
+
+    fn shell_quote(path: &std::path::Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+    }
+
     let dir = tempfile::tempdir().expect("tempdir");
     let argv_file = dir.path().join("argv.txt");
     let stub_path = dir.path().join("dotnet");
@@ -92,8 +96,4 @@ fn dotnet_test_reuses_users_double_dash_for_report_trx_injection() {
         "the user's filter expression must stay AFTER --, not be pulled before it \
          when clap's stripped -- gets a fresh one appended at the end: {argv:?}"
     );
-}
-
-fn shell_quote(path: &std::path::Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
