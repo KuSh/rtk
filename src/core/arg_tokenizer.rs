@@ -83,13 +83,6 @@ impl<'a> Token<'a> {
     }
 }
 
-/// True if `text` (a `Long` token's name) matches `name` under `dialect`'s naming rules:
-/// exact for [`Dialect::Posix`] (git/cargo/rg/golangci-lint are case-sensitive), ASCII
-/// case-insensitive for [`Dialect::Msbuild`] (Windows/MSBuild-ecosystem tools fold case
-/// broadly — this isn't a dotnet-CLI particularity, e.g. classic MSBuild.exe's `/nologo` and
-/// `/NoLogo` are equally valid). `text` can't be case-folded once at tokenize time without
-/// giving up `Token`'s zero-copy `&'a str` (there's no borrowed "lowercased" view), so instead
-/// every dialect-aware lookup goes through this and [`has_flag`]/[`double_dash_flag_value`].
 /// True if `text` is a non-empty run of ASCII digits, e.g. a `Short` token's text for `-20`
 /// (git/head/tail's `-N` count shorthand — see [`TokenKind::Short`]). Exposed so callers that
 /// need to tell "this Short token is a digit-run flag" from "this Short token is a single
@@ -99,6 +92,13 @@ pub fn is_digit_run(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// True if `text` (a `Long` token's name) matches `name` under `dialect`'s naming rules:
+/// exact for [`Dialect::Posix`] (git/cargo/rg/golangci-lint are case-sensitive), ASCII
+/// case-insensitive for [`Dialect::Msbuild`] (Windows/MSBuild-ecosystem tools fold case
+/// broadly — this isn't a dotnet-CLI particularity, e.g. classic MSBuild.exe's `/nologo` and
+/// `/NoLogo` are equally valid). `text` can't be case-folded once at tokenize time without
+/// giving up `Token`'s zero-copy `&'a str` (there's no borrowed "lowercased" view), so instead
+/// every dialect-aware lookup goes through this and [`has_flag`]/[`double_dash_flag_value`].
 fn flag_name_matches(text: &str, name: &str, dialect: Dialect) -> bool {
     match dialect {
         Dialect::Msbuild => text.eq_ignore_ascii_case(name),
