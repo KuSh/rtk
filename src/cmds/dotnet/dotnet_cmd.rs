@@ -582,11 +582,11 @@ fn build_effective_dotnet_args(
 }
 
 fn has_binlog_arg(tokens: &[Token<'_>]) -> bool {
-    dotnet_has_flag(tokens, "bl")
+    dotnet_has_loose_flag(tokens, "bl")
 }
 
 fn has_verbosity_arg(tokens: &[Token<'_>]) -> bool {
-    dotnet_has_flag(tokens, "v") || dotnet_has_flag(tokens, "verbosity")
+    dotnet_has_loose_flag(tokens, "v") || dotnet_has_loose_flag(tokens, "verbosity")
 }
 
 /// How the targeted test project(s) run tests — determines which TRX injection strategy to use.
@@ -772,34 +772,38 @@ fn dotnet_tokens(args: &[String]) -> Vec<Token<'_>> {
     arg_tokenizer::tokenize_dialect(args, Dialect::Msbuild, &dotnet_takes_value)
 }
 
-/// Loose lookup: `-flag`/`--flag`/`/flag` all match. Only correct for the handful of options
-/// that are genuine legacy MSBuild.exe passthrough switches (`nologo`, `bl`, `v`/`verbosity`)
-/// -- see [`arg_tokenizer::has_double_dash_flag`] for why every other dotnet_cmd.rs flag must
-/// use [`dotnet_has_double_dash_flag`]/[`dotnet_double_dash_flag_value`] instead.
-fn dotnet_has_flag(tokens: &[Token<'_>], name: &str) -> bool {
-    arg_tokenizer::has_flag(tokens, Dialect::Msbuild, name)
-}
-
-/// Strict lookup: only a literal `--flag` matches, never `-flag`/`/flag`. Required for every
-/// dotnet_cmd.rs flag that isn't a legacy MSBuild.exe passthrough switch -- confirmed against a
-/// real dotnet 9 SDK (Docker) that `dotnet format`'s `--verify-no-changes`/`--report` and
-/// `dotnet test`'s `--logger`/`--results-directory` are double-dash-only, and a single-dash or
-/// slash spelling doesn't just get rejected, it gets *misparsed* as an unrelated MSBuild switch
-/// (`-results-directory` reads as MSBuild's own unrecognized switch "results-directory";
-/// `-logger` collides with MSBuild's own `-logger` switch, which wants a logger assembly spec,
-/// not "trx" -- both silently produce `MSB100x` errors instead of doing what the user meant).
+/// Strict lookup (the safe default -- prefer this name): only a literal `--flag` matches, never
+/// `-flag`/`/flag`. Required for every dotnet_cmd.rs flag that isn't a legacy MSBuild.exe
+/// passthrough switch -- confirmed against a real dotnet 9 SDK (Docker) that `dotnet format`'s
+/// `--verify-no-changes`/`--report` and `dotnet test`'s `--logger`/`--results-directory` are
+/// double-dash-only, and a single-dash or slash spelling doesn't just get rejected, it gets
+/// *misparsed* as an unrelated MSBuild switch (`-results-directory` reads as MSBuild's own
+/// unrecognized switch "results-directory"; `-logger` collides with MSBuild's own `-logger`
+/// switch, which wants a logger assembly spec, not "trx" -- both silently produce `MSB100x`
+/// errors instead of doing what the user meant). See [`dotnet_has_loose_flag`] for the handful
+/// of exceptions.
 fn dotnet_double_dash_flag_value<'a>(tokens: &[Token<'a>], name: &str) -> Option<&'a str> {
     arg_tokenizer::double_dash_flag_value(tokens, Dialect::Msbuild, name)
 }
 
-fn dotnet_has_double_dash_flag(tokens: &[Token<'_>], name: &str) -> bool {
+fn dotnet_has_flag(tokens: &[Token<'_>], name: &str) -> bool {
     arg_tokenizer::has_double_dash_flag(tokens, Dialect::Msbuild, name)
+}
+
+/// Loose lookup: `-flag`/`--flag`/`/flag` all match. Named deliberately longer/scarier than
+/// [`dotnet_has_flag`] -- it's only correct for the handful of options that are genuine legacy
+/// MSBuild.exe passthrough switches (`nologo`, `bl`, `v`/`verbosity`); reaching for this on any
+/// other dotnet_cmd.rs flag reintroduces the exact bug commit a1c8302 fixed (a single-dash or
+/// slash spelling of a modern System.CommandLine option gets misparsed as an unrelated MSBuild
+/// switch instead of being rejected outright). See [`arg_tokenizer::has_double_dash_flag`].
+fn dotnet_has_loose_flag(tokens: &[Token<'_>], name: &str) -> bool {
+    arg_tokenizer::has_flag(tokens, Dialect::Msbuild, name)
 }
 
 fn has_nologo_arg(tokens: &[Token<'_>]) -> bool {
     // Unlike -v/-verbosity, -nologo is a pure boolean switch (confirmed via a real dotnet 9 SDK,
     // Docker: `-nologo:true` fails with "MSB1002: This switch does not take any parameters").
-    // dotnet_has_flag alone ignores `attached`, so it would treat the broken "-nologo:true"
+    // dotnet_has_loose_flag alone ignores `attached`, so it would treat the broken "-nologo:true"
     // spelling as "user already passed -nologo" and skip RTK's own injection while still
     // forwarding the invalid flag through untouched.
     tokens.iter().any(|t| {
@@ -817,15 +821,15 @@ fn has_trx_logger_arg(tokens: &[Token<'_>]) -> bool {
 }
 
 fn has_results_directory_arg(tokens: &[Token<'_>]) -> bool {
-    dotnet_has_double_dash_flag(tokens, "results-directory")
+    dotnet_has_flag(tokens, "results-directory")
 }
 
 fn has_report_arg(tokens: &[Token<'_>]) -> bool {
-    dotnet_has_double_dash_flag(tokens, "report")
+    dotnet_has_flag(tokens, "report")
 }
 
 fn has_report_trx_arg(tokens: &[Token<'_>]) -> bool {
-    dotnet_has_double_dash_flag(tokens, "report-trx")
+    dotnet_has_flag(tokens, "report-trx")
 }
 
 /// Injects `--report-trx` after the `--` separator in `args`.
@@ -852,7 +856,7 @@ fn extract_report_arg(tokens: &[Token<'_>]) -> Option<PathBuf> {
 }
 
 fn has_verify_no_changes_arg(tokens: &[Token<'_>]) -> bool {
-    dotnet_has_double_dash_flag(tokens, "verify-no-changes")
+    dotnet_has_flag(tokens, "verify-no-changes")
 }
 
 fn has_write_mode_override(tokens: &[Token<'_>]) -> bool {
@@ -2803,7 +2807,7 @@ mod tests {
     fn test_has_nologo_arg_rejects_attached_value() {
         // Regression: -nologo is a pure boolean MSBuild.exe switch (confirmed via Docker: a real
         // dotnet 9 SDK rejects "-nologo:true" with "MSB1002: This switch does not take any
-        // parameters"). has_nologo_arg used to match via the loose dotnet_has_flag lookup, which
+        // parameters"). has_nologo_arg used to match via the loose dotnet_has_loose_flag lookup, which
         // ignores `attached` entirely -- so it treated the broken "-nologo:true" spelling as
         // "user already passed -nologo" and skipped RTK's own -nologo injection while still
         // forwarding the invalid flag straight through to real dotnet.
