@@ -1,6 +1,6 @@
 //! Filters golangci-lint output, grouping issues by rule.
 
-use crate::core::arg_tokenizer::{self, TokenKind};
+use crate::core::arg_tokenizer::{self, Dialect, TokenKind};
 use crate::core::config;
 use crate::core::runner;
 use crate::core::stream::exec_capture;
@@ -228,12 +228,9 @@ fn build_filtered_args(invocation: &RunInvocation, version: u32) -> Vec<String> 
 }
 
 fn has_output_flag(args: &[String]) -> bool {
-    args.iter().any(|a| {
-        a == "--out-format"
-            || a.starts_with("--out-format=")
-            || a == "--output.json.path"
-            || a.starts_with("--output.json.path=")
-    })
+    let tokens = arg_tokenizer::tokenize(args, &golangci_takes_value);
+    arg_tokenizer::has_flag(&tokens, Dialect::Posix, "out-format")
+        || arg_tokenizer::has_flag(&tokens, Dialect::Posix, "output.json.path")
 }
 
 fn format_command(base: &str, args: &[String]) -> String {
@@ -606,6 +603,19 @@ mod tests {
             build_filtered_args(&invocation, 2),
             vec!["run", "--output.json.path", "stdout", "./..."]
         );
+    }
+
+    #[test]
+    fn test_has_output_flag_ignores_positional_after_dashdash() {
+        // Regression: a positional argument literally named "--out-format" after `--` (e.g.
+        // a package path to lint) must not be mistaken for the real flag.
+        assert!(!has_output_flag(&[
+            "./...".to_string(),
+            "--".to_string(),
+            "--out-format".to_string(),
+        ]));
+        assert!(has_output_flag(&["--out-format=json".to_string()]));
+        assert!(has_output_flag(&["--output.json.path".to_string()]));
     }
 
     #[test]
