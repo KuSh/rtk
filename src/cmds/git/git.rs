@@ -937,8 +937,9 @@ fn run_log(
 /// as its value predicate; `--max-count` lives here too rather than as a
 /// bolted-on special case, since it's the same question for every caller.
 /// Which of `log_takes_value`'s `Short` flags may consume a separate next-token value, passed to
-/// [`arg_tokenizer::tokenize_git`]. `is_solo` is true only when the flag is the entire arg on its
-/// own (`-n`), false when clustered with anything else (`-cn`'s `n`). Confirmed against real git:
+/// [`arg_tokenizer::tokenize_with_separate_value`]. `is_solo` is true only when the flag is the
+/// entire arg on its own (`-n`), false when clustered with anything else (`-cn`'s `n`). Confirmed
+/// against real git:
 /// `-n`/`-l` accept a separate-token value only when solo (`-n 2` works, `-cn 2` fails with
 /// "ambiguous argument"); `-M`/`-U`/`-C`/`-B` never do, solo or clustered (`git log -U 3` fails
 /// the same way). `-G`/`-I`/`-O`/`-S` are left at their pre-existing "always eligible" behavior
@@ -1011,9 +1012,10 @@ fn log_takes_value(kind: TokenKind, name: &str) -> bool {
 
 /// Tokenizes `args` with git log/diff/show's shared value-taking-flag predicates
 /// (log_takes_value/log_takes_separate_value), reused by run_log/run_diff/run_show/run_stash
-/// and their test helpers instead of each repeating the same `tokenize_git(...)` call.
+/// and their test helpers instead of each repeating the same `tokenize_with_separate_value(...)`
+/// call.
 fn git_log_tokens(args: &[String]) -> Vec<Token<'_>> {
-    arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value)
+    arg_tokenizer::tokenize_with_separate_value(args, &log_takes_value, &log_takes_separate_value)
 }
 
 /// Filters `args` down to the tokens that are actual flags (dash-free flag
