@@ -91,6 +91,11 @@ pub fn run(
     verbose: u8,
     global_args: &[String],
 ) -> Result<i32> {
+    // Re-insert `--` when clap's trailing_var_arg consumed it (issue #1215), once here for every
+    // subcommand rather than ad hoc per handler: restore_double_dash is a no-op when `--` wasn't
+    // stripped, so centralizing it costs nothing for handlers that don't need it, and closes the
+    // gap for any handler whose own boundary-sensitive logic forgets to call it.
+    let args = &args_utils::restore_double_dash(args);
     match cmd {
         GitCommand::Diff => run_diff(args, max_lines, verbose, global_args),
         GitCommand::Log => run_log(args, max_lines, verbose, global_args),
@@ -117,9 +122,6 @@ fn run_diff(
     global_args: &[String],
 ) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
-
-    // Re-insert `--` when clap's trailing_var_arg consumed it (issue #1215)
-    let args = &args_utils::restore_double_dash(args);
 
     // Check if user wants stat output
     let wants_stat = args
@@ -222,10 +224,6 @@ fn run_show(
     verbose: u8,
     global_args: &[String],
 ) -> Result<i32> {
-    // Re-insert `--` when clap's trailing_var_arg consumed it (issue #1215): without this, the
-    // wants_stat_only/wants_format checks below can't tell a pathspec literally named "--stat"
-    // or "--pretty" (after `--`) from the real flag.
-    let args = &args_utils::restore_double_dash(args);
     let timer = tracking::TimedExecution::start();
 
     // If user wants --stat or --format only, pass through. Shares git log's value-taking-flag
@@ -833,12 +831,6 @@ fn run_log(
     verbose: u8,
     global_args: &[String],
 ) -> Result<i32> {
-    // Re-insert `--` when clap's trailing_var_arg consumed it (issue #1215):
-    // without this, `rtk git log -- -p` loses its literal "--" and
-    // `requests_raw_log_output`/`log_arg_tokens` can no longer tell that
-    // `-p` is a pathspec, not the real patch flag.
-    let args = &args_utils::restore_double_dash(args);
-
     // Tokenize once and share it: flag-vs-value classification is reused below by the raw-shape
     // check, the flag-presence checks, and the limit parsing, and a value belonging to
     // --grep/--author/etc. (e.g. `--grep --pretty`) must not be misread as one of the flags
@@ -1447,11 +1439,6 @@ fn run_status(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
 }
 
 fn run_add(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32> {
-    // Re-insert `--` when clap's trailing_var_arg consumed it (issue #1215): without this,
-    // `rtk git add -- -weird-filename` (the standard idiom for staging a flag-like filename)
-    // loses its `--` before reaching git, which then rejects "-weird-filename" as an
-    // unrecognized option instead of staging it.
-    let args = &args_utils::restore_double_dash(args);
     let timer = tracking::TimedExecution::start();
 
     let mut cmd = git_cmd(global_args);
@@ -1616,20 +1603,18 @@ fn classify_commit_outcome(success: bool, stdout: &str, exit_code: i32) -> Commi
 }
 
 fn run_checkout(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32> {
-    let args = args_utils::restore_double_dash(args);
-
     if verbose > 0 {
         eprintln!("git checkout");
     }
 
     let mut cmd = git_cmd(global_args);
     cmd.arg("checkout");
-    for arg in &args {
+    for arg in args {
         cmd.arg(arg);
     }
 
     let args_display = args.join(" ");
-    let args_for_filter = args.clone();
+    let args_for_filter = args.to_vec();
     runner::run_filtered_with_exit(
         cmd,
         "git checkout",
@@ -1972,10 +1957,6 @@ fn branch_takes_value(kind: TokenKind, name: &str) -> bool {
 }
 
 fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32> {
-    // Re-insert `--` when clap's trailing_var_arg consumed it (issue #1215): without this, a
-    // branch name literally starting with '-' after `--` (e.g. `git branch -- -weird`) is
-    // misclassified as a flag rather than the positional branch name to create.
-    let args = &args_utils::restore_double_dash(args);
     let timer = tracking::TimedExecution::start();
 
     if verbose > 0 {
