@@ -439,6 +439,15 @@ fn passthrough<T: AsRef<str>>(
     Ok(exit_code)
 }
 
+/// KNOWN LIMITATION, not fixed here: `flags` is the reconstructed `Vec<String>` extract_pattern_path
+/// builds, which also contains value-taking flags' own separate-token values (e.g. `--replace`'s
+/// value) as bare, unmarked strings alongside real flags. If such a value both starts with a
+/// literal single `-` and contains `ch`, this misreads it as the real flag (e.g. `--replace
+/// '-Chart' pattern src` would misdetect a context flag from `ch == 'C'`). A correct fix needs
+/// token-level tracking (kind/linked) threaded out of extract_pattern_path's own walk, the way
+/// is_format_flag_token's check already is -- deferred rather than done here since it would mean
+/// restructuring extract_pattern_path's return type and the existing has_context_flag unit tests
+/// (which test directly against reconstructed-string input) for a narrow trigger condition.
 fn has_short_flag(flags: &[String], ch: char) -> bool {
     flags
         .iter()
