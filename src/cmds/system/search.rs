@@ -103,23 +103,29 @@ fn match_block(path: &str, entries: &[(usize, bool, String)]) -> String {
     s
 }
 
-/// Extracts `(patterns, paths, flags)` from the raw trailing args.
+/// Extracts `(patterns, paths, flags, has_format_flag)` from the raw trailing args.
 ///
 /// - `patterns`: positional pattern + all `-e`/`--regexp` values. Empty → error.
 /// - `paths`: subsequent non-flag positionals. Empty → caller defaults to `["."]`.
 /// - `flags`: other flags forwarded to rg (`-r`/`-R`/`--recursive` stripped).
+/// - `has_format_flag`: true if `flags` includes a minimal/shape flag (`-c`/`-l`/`--json`/...,
+///   see [`is_format_flag_token`]), computed from the same token pass instead of a second
+///   tokenize call over the reconstructed `flags` strings.
 ///
 /// Short clusters are scanned left-to-right; the first value-taking letter
 /// terminates the cluster — everything after it is its inline value, not a
 /// separate flag. Long value-taking flags consume the next token. `--` marks
 /// everything after it as positional.
 ///
-fn extract_pattern_path<T: AsRef<str>>(args: &[T]) -> (Vec<String>, Vec<String>, Vec<String>) {
+fn extract_pattern_path<T: AsRef<str>>(
+    args: &[T],
+) -> (Vec<String>, Vec<String>, Vec<String>, bool) {
     let tokens = arg_tokenizer::tokenize(args, &search_takes_value);
 
     let mut e_patterns: Vec<String> = Vec::new();
     let mut positionals: Vec<String> = Vec::new();
     let mut flags: Vec<String> = Vec::new();
+    let mut has_format_flag = false;
     let mut i = 0;
 
     while i < tokens.len() {
@@ -130,15 +136,20 @@ fn extract_pattern_path<T: AsRef<str>>(args: &[T]) -> (Vec<String>, Vec<String>,
                     e_patterns.push(v.to_string());
                 }
             }
-            TokenKind::Long => match t.attached {
-                Some(v) => flags.push(format!("--{}={v}", t.text)),
-                None => {
-                    flags.push(format!("--{}", t.text));
-                    if let Some(v) = t.value(&tokens) {
-                        flags.push(v.to_string());
+            TokenKind::Long => {
+                if is_format_flag_token(t.kind, t.text) {
+                    has_format_flag = true;
+                }
+                match t.attached {
+                    Some(v) => flags.push(format!("--{}={v}", t.text)),
+                    None => {
+                        flags.push(format!("--{}", t.text));
+                        if let Some(v) = t.value(&tokens) {
+                            flags.push(v.to_string());
+                        }
                     }
                 }
-            },
+            }
             // A value consumed by a preceding flag is handled there instead.
             TokenKind::Positional if t.linked.is_none() => {
                 positionals.push(t.text.to_string());
@@ -156,6 +167,12 @@ fn extract_pattern_path<T: AsRef<str>>(args: &[T]) -> (Vec<String>, Vec<String>,
                     i += 1;
                 }
                 let cluster = &tokens[start..=i];
+                if cluster
+                    .iter()
+                    .any(|c| is_format_flag_token(c.kind, c.text))
+                {
+                    has_format_flag = true;
+                }
                 let (bool_chars, value_char) = match cluster.split_last() {
                     Some((last, rest)) if is_short_value_flag(last.text) => (rest, Some(last)),
                     _ => (cluster, None),
@@ -198,7 +215,7 @@ fn extract_pattern_path<T: AsRef<str>>(args: &[T]) -> (Vec<String>, Vec<String>,
         (patterns, paths)
     };
 
-    (patterns, paths, flags)
+    (patterns, paths, flags, has_format_flag)
 }
 
 fn unparsed_signal(stdout: &str) -> usize {
@@ -473,7 +490,7 @@ pub fn run(
     let real_cmd = format!("{} {}", engine.label(), args.join(" "));
     let rtk_label = format!("rtk {}", engine.label());
 
-    let (patterns, paths, extra_args) = extract_pattern_path(&args);
+    let (patterns, paths, extra_args, extra_args_has_format_flag) = extract_pattern_path(&args);
 
     if patterns.is_empty() {
         return passthrough(&timer, engine, &args, &real_cmd, false);
@@ -495,7 +512,7 @@ pub fn run(
         && (paths.is_empty() || paths.iter().any(|path| path == "-"));
 
     // format/shape flags (-c/-l/-o/...): already-minimal native output, passthrough.
-    if has_format_flag(&extra_args) {
+    if extra_args_has_format_flag {
         return passthrough(&timer, engine, &args, &real_cmd, reads_piped_stdin);
     }
 
@@ -697,12 +714,9 @@ fn parse_match_line(line: &str) -> Option<(String, usize, bool, &str)> {
     })
 }
 
-fn has_format_flag<T: AsRef<str>>(extra_args: &[T]) -> bool {
-    // Minimal/shape forms the agent already chose; short flags scanned per-letter
-    // so clusters like -rl/-rq route through, plus their long forms. Shares
-    // search_takes_value with extract_pattern_path so a value-taking flag's value (e.g. `-e
-    // --json`, where "--json" is -e's pattern, not the real --json flag) is never misread as
-    // one of these.
+/// Minimal/shape forms the agent already chose; short flags matched per-letter so clusters
+/// like -rl/-rq route through, plus their long forms.
+fn is_format_flag_token(kind: TokenKind, text: &str) -> bool {
     const LONG: &[&str] = &[
         "byte-offset",
         "column",
@@ -720,13 +734,26 @@ fn has_format_flag<T: AsRef<str>>(extra_args: &[T]) -> bool {
         "silent",
         "vimgrep",
     ];
-    let tokens = arg_tokenizer::tokenize(extra_args, &search_takes_value);
-    tokens.iter().any(|t| match t.kind {
-        TokenKind::Long => LONG.contains(&t.text),
+    match kind {
+        TokenKind::Long => LONG.contains(&text),
         // -c count, -l/-L lists, -o only-matching, -q quiet, -b byte-offset, -Z/-z NUL
-        TokenKind::Short => matches!(t.text, "c" | "l" | "L" | "o" | "q" | "b" | "Z" | "z"),
+        TokenKind::Short => matches!(text, "c" | "l" | "L" | "o" | "q" | "b" | "Z" | "z"),
         _ => false,
-    })
+    }
+}
+
+/// Test-only convenience wrapper; the production call site gets this from the
+/// `has_format_flag` extract_pattern_path already returns, computed in the same token pass
+/// instead of tokenizing the reconstructed `flags` strings a second time.
+#[cfg(test)]
+fn has_format_flag<T: AsRef<str>>(extra_args: &[T]) -> bool {
+    // Shares search_takes_value with extract_pattern_path so a value-taking flag's value (e.g.
+    // `-e --json`, where "--json" is -e's pattern, not the real --json flag) is never misread as
+    // one of these.
+    let tokens = arg_tokenizer::tokenize(extra_args, &search_takes_value);
+    tokens
+        .iter()
+        .any(|t| is_format_flag_token(t.kind, t.text))
 }
 
 fn clean_line(line: &str, max_len: usize, context_re: Option<&Regex>, pattern: &str) -> String {
@@ -881,7 +908,7 @@ mod tests {
 
     #[test]
     fn test_extract_simple() {
-        let (patterns, paths, flags) = extract_pattern_path(&["foo", "src/"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["foo", "src/"]);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src/"]);
         assert!(flags.is_empty());
@@ -889,7 +916,7 @@ mod tests {
 
     #[test]
     fn test_extract_with_bool_flag() {
-        let (patterns, paths, flags) = extract_pattern_path(&["-i", "foo", "src/"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-i", "foo", "src/"]);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src/"]);
         assert_eq!(flags, vec!["-i"]);
@@ -898,7 +925,7 @@ mod tests {
     #[test]
     fn test_extract_value_taking_flag() {
         // -A 2 must not steal "error" as its value
-        let (patterns, paths, flags) = extract_pattern_path(&["-A", "2", "error", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-A", "2", "error", "src"]);
         assert_eq!(patterns, vec!["error"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-A", "2"]);
@@ -907,7 +934,7 @@ mod tests {
     #[test]
     fn test_extract_cluster_keeps_r() {
         // -rn: r kept, passed straight to grep
-        let (patterns, paths, flags) = extract_pattern_path(&["-rn", "foo", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-rn", "foo", "src"]);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-rn"]);
@@ -916,7 +943,7 @@ mod tests {
     #[test]
     fn test_extract_cluster_ending_in_e() {
         // -rne PATTERN: rn kept, e consumes PATTERN as the pattern
-        let (patterns, paths, flags) = extract_pattern_path(&["-rne", "PATTERN", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-rne", "PATTERN", "src"]);
         assert_eq!(patterns, vec!["PATTERN"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-rn"]);
@@ -925,7 +952,7 @@ mod tests {
     #[test]
     fn test_extract_cluster_ending_in_value_flag() {
         // -rA 2: r kept as its own flag, A consumes 2 as context value
-        let (patterns, paths, flags) = extract_pattern_path(&["-rA", "2", "foo", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-rA", "2", "foo", "src"]);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-r", "-A", "2"]);
@@ -933,7 +960,7 @@ mod tests {
 
     #[test]
     fn test_extract_multi_path() {
-        let (patterns, paths, flags) = extract_pattern_path(&["TODO", "src", "tests"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["TODO", "src", "tests"]);
         assert_eq!(patterns, vec!["TODO"]);
         assert_eq!(paths, vec!["src", "tests"]);
         assert!(flags.is_empty());
@@ -942,7 +969,7 @@ mod tests {
     #[test]
     fn test_extract_glob_value() {
         // -g '*.md' must not steal "agent" as its value
-        let (patterns, paths, flags) = extract_pattern_path(&["-i", "x", "agent", "-g", "*.md"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-i", "x", "agent", "-g", "*.md"]);
         assert_eq!(patterns, vec!["x"]);
         assert_eq!(paths, vec!["agent"]);
         assert_eq!(flags, vec!["-i", "-g", "*.md"]);
@@ -950,7 +977,7 @@ mod tests {
 
     #[test]
     fn test_extract_e_flag() {
-        let (patterns, paths, flags) = extract_pattern_path(&["-e", "fn run", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-e", "fn run", "src"]);
         assert_eq!(patterns, vec!["fn run"]);
         assert_eq!(paths, vec!["src"]);
         assert!(flags.is_empty());
@@ -958,7 +985,7 @@ mod tests {
 
     #[test]
     fn test_extract_multi_e() {
-        let (patterns, paths, flags) = extract_pattern_path(&["-e", "foo", "-e", "bar", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-e", "foo", "-e", "bar", "src"]);
         assert_eq!(patterns, vec!["foo", "bar"]);
         assert_eq!(paths, vec!["src"]);
         assert!(flags.is_empty());
@@ -967,7 +994,7 @@ mod tests {
     #[test]
     fn test_extract_dashdash_boundary() {
         // After --, args are positional even if they look like flags
-        let (patterns, paths, flags) = extract_pattern_path(&["--", "--version"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["--", "--version"]);
         assert_eq!(patterns, vec!["--version"]);
         assert!(paths.is_empty());
         assert!(flags.is_empty());
@@ -975,7 +1002,7 @@ mod tests {
 
     #[test]
     fn test_extract_no_args() {
-        let (patterns, paths, flags) = extract_pattern_path::<&str>(&[]);
+        let (patterns, paths, flags, _) = extract_pattern_path::<&str>(&[]);
         assert!(patterns.is_empty());
         assert!(paths.is_empty());
         assert!(flags.is_empty());
@@ -984,14 +1011,14 @@ mod tests {
     #[test]
     fn test_extract_default_path_empty() {
         // Caller is responsible for defaulting empty paths to ["."]
-        let (patterns, paths, _) = extract_pattern_path(&["foo"]);
+        let (patterns, paths, _, _) = extract_pattern_path(&["foo"]);
         assert_eq!(patterns, vec!["foo"]);
         assert!(paths.is_empty());
     }
 
     #[test]
     fn test_extract_ending_e() {
-        let (patterns, paths, flags) =
+        let (patterns, paths, flags, _) =
             extract_pattern_path(&["-e", "foo", "-e", "bar", "src", "-e"]);
         assert_eq!(patterns, vec!["foo", "bar"]);
         assert_eq!(paths, vec!["src"]);
@@ -1003,7 +1030,7 @@ mod tests {
     #[test]
     fn test_extract_inline_e_value() {
         // -ecarrot: e hits at j=0, inline="carrot", no r-stripping on value
-        let (patterns, paths, flags) = extract_pattern_path(&["-ecarrot", "file"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-ecarrot", "file"]);
         assert_eq!(patterns, vec!["carrot"]);
         assert_eq!(paths, vec!["file"]);
         assert!(flags.is_empty());
@@ -1012,7 +1039,7 @@ mod tests {
     #[test]
     fn test_extract_inline_e_value_no_rstrip() {
         // -ecarrot: the 'r' in "carrot" must NOT be stripped (it's value, not a flag)
-        let (patterns, _, _) = extract_pattern_path(&["-ecarrot", "file"]);
+        let (patterns, _, _, _) = extract_pattern_path(&["-ecarrot", "file"]);
         assert_eq!(
             patterns,
             vec!["carrot"],
@@ -1023,7 +1050,7 @@ mod tests {
     #[test]
     fn test_extract_inline_g_value() {
         // -g*.rs: g hits at j=0, inline="*.rs", no r-stripping on value
-        let (patterns, paths, flags) = extract_pattern_path(&["aaa", "sub", "-g*.rs"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["aaa", "sub", "-g*.rs"]);
         assert_eq!(patterns, vec!["aaa"]);
         assert_eq!(paths, vec!["sub"]);
         assert_eq!(flags, vec!["-g", "*.rs"]);
@@ -1032,7 +1059,7 @@ mod tests {
     #[test]
     fn test_extract_inline_g_value_no_rstrip() {
         // -g*.rs: the 'r' in "*.rs" must NOT be stripped
-        let (_, _, flags) = extract_pattern_path(&["aaa", "sub", "-g*.rs"]);
+        let (_, _, flags, _) = extract_pattern_path(&["aaa", "sub", "-g*.rs"]);
         assert!(
             flags.contains(&"*.rs".to_string()),
             "r in glob value must not be stripped"
@@ -1043,7 +1070,7 @@ mod tests {
 
     #[test]
     fn test_extract_long_glob_value() {
-        let (patterns, paths, flags) = extract_pattern_path(&["compact", "sub", "--glob", "*.md"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["compact", "sub", "--glob", "*.md"]);
         assert_eq!(patterns, vec!["compact"]);
         assert_eq!(paths, vec!["sub"]);
         assert_eq!(flags, vec!["--glob", "*.md"]);
@@ -1051,7 +1078,7 @@ mod tests {
 
     #[test]
     fn test_extract_long_max_count() {
-        let (patterns, paths, flags) = extract_pattern_path(&["--max-count", "1", "fn", "file"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["--max-count", "1", "fn", "file"]);
         assert_eq!(patterns, vec!["fn"]);
         assert_eq!(paths, vec!["file"]);
         assert_eq!(flags, vec!["--max-count", "1"]);
@@ -1060,7 +1087,7 @@ mod tests {
     #[test]
     fn test_extract_short_type() {
         // -t rust: type filter, value must not become pattern
-        let (patterns, paths, flags) = extract_pattern_path(&["-t", "rust", "fn", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-t", "rust", "fn", "src"]);
         assert_eq!(patterns, vec!["fn"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-t", "rust"]);
@@ -1069,7 +1096,7 @@ mod tests {
     #[test]
     fn test_extract_short_max_depth() {
         // -d 3: max-depth, value must not become pattern
-        let (patterns, paths, flags) = extract_pattern_path(&["-d", "3", "foo", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-d", "3", "foo", "src"]);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-d", "3"]);
@@ -1078,7 +1105,7 @@ mod tests {
     #[test]
     fn test_extract_short_max_columns() {
         // -M 120: max-columns, value must not become pattern
-        let (patterns, paths, flags) = extract_pattern_path(&["-M", "120", "foo", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-M", "120", "foo", "src"]);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-M", "120"]);
@@ -1087,7 +1114,7 @@ mod tests {
     #[test]
     fn test_extract_long_regexp() {
         // --regexp is the long form of -e; value goes to patterns
-        let (patterns, paths, flags) = extract_pattern_path(&["--regexp", "fn run", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["--regexp", "fn run", "src"]);
         assert_eq!(patterns, vec!["fn run"]);
         assert_eq!(paths, vec!["src"]);
         assert!(flags.is_empty());
@@ -1096,14 +1123,14 @@ mod tests {
     #[test]
     fn test_extract_long_regexp_multi() {
         // --regexp can be combined with -e
-        let (patterns, paths, _) = extract_pattern_path(&["--regexp", "foo", "-e", "bar", "src"]);
+        let (patterns, paths, _, _) = extract_pattern_path(&["--regexp", "foo", "-e", "bar", "src"]);
         assert_eq!(patterns, vec!["foo", "bar"]);
         assert_eq!(paths, vec!["src"]);
     }
 
     #[test]
     fn test_extract_long_ignore_file() {
-        let (patterns, paths, flags) =
+        let (patterns, paths, flags, _) =
             extract_pattern_path(&["--ignore-file", ".myignore", "foo", "src"]);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
@@ -1112,7 +1139,7 @@ mod tests {
 
     #[test]
     fn test_extract_long_engine() {
-        let (patterns, paths, flags) = extract_pattern_path(&["--engine", "pcre2", "foo", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["--engine", "pcre2", "foo", "src"]);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["--engine", "pcre2"]);
@@ -1120,7 +1147,7 @@ mod tests {
 
     #[test]
     fn test_extract_long_type_clear() {
-        let (patterns, paths, flags) =
+        let (patterns, paths, flags, _) =
             extract_pattern_path(&["--type-clear", "rust", "foo", "src"]);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
@@ -1129,7 +1156,7 @@ mod tests {
 
     #[test]
     fn test_extract_long_path_separator() {
-        let (patterns, paths, flags) =
+        let (patterns, paths, flags, _) =
             extract_pattern_path(&["--path-separator", "/", "foo", "src"]);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
@@ -1139,7 +1166,7 @@ mod tests {
     #[test]
     fn test_extract_long_flag_inline_eq_passthrough() {
         // --glob=*.rs is one token (inline =): passes through as-is, not consumed as pair
-        let (patterns, paths, flags) = extract_pattern_path(&["foo", "src", "--glob=*.rs"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["foo", "src", "--glob=*.rs"]);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["--glob=*.rs"]);
@@ -1235,6 +1262,30 @@ mod tests {
         assert!(!has_format_flag(&["-e", "--json"]));
         // Same for the long-flag form of a value-taking option.
         assert!(!has_format_flag(&["--regexp", "--quiet"]));
+    }
+
+    #[test]
+    fn test_extract_pattern_path_has_format_flag_matches_single_pass() {
+        // extract_pattern_path computes has_format_flag from its own token pass instead of
+        // tokenizing the reconstructed `flags` strings a second time; pin that it agrees with
+        // has_format_flag's own (test-only) from-scratch computation on representative cases.
+        let (_, _, _, has_format) = extract_pattern_path(&["foo", "src", "-q"]);
+        assert!(has_format, "-q (quiet) should be detected");
+
+        let (_, _, _, has_format) = extract_pattern_path(&["foo", "src", "-rl"]);
+        assert!(has_format, "-l inside the -rl cluster should be detected");
+
+        let (_, _, _, has_format) = extract_pattern_path(&["foo", "src", "--json"]);
+        assert!(has_format, "--json should be detected");
+
+        let (_, _, _, has_format) = extract_pattern_path(&["-e", "--json", "src"]);
+        assert!(
+            !has_format,
+            "-e's value must not be misread as the real --json flag"
+        );
+
+        let (_, _, _, has_format) = extract_pattern_path(&["foo", "src", "-i", "-w"]);
+        assert!(!has_format, "plain boolean flags aren't format flags");
     }
 
     #[test]
