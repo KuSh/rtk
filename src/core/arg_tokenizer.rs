@@ -274,6 +274,82 @@ pub fn tokenize_dialect<'a, T: AsRef<str>>(
     tokenize_dialect_ex(args, dialect, takes_value, &|_name, _is_solo| true)
 }
 
+/// Groups the mutable scan state threaded through [`tokenize_dialect_ex`]'s helper methods
+/// (`push_atomic_flag`/`link_next_value`), so adding a future piece of shared state (as this
+/// module already had to once, adding `takes_separate_value`) means adding one field instead of
+/// a parameter to every helper and every call site.
+struct Scanner<'a, 'p, T> {
+    tokens: Vec<Token<'a>>,
+    args: &'a [T],
+    i: usize,
+    dialect: Dialect,
+    emitted_dash_dash: bool,
+    takes_value: &'p dyn Fn(TokenKind, &str) -> bool,
+    takes_separate_value: &'p dyn Fn(&str, bool) -> bool,
+}
+
+impl<'a, 'p, T: AsRef<str>> Scanner<'a, 'p, T> {
+    /// Pushes one atomic (non-clustering) flag token — used for `--flag` in both dialects, and
+    /// for `-flag`/`/flag` in [`Dialect::Msbuild`] — splitting off an attached value per
+    /// `self.dialect` and, absent one, consulting `self.takes_value` to maybe consume the next
+    /// whole token as a separate value. `rest` is the flag text with its prefix (`--`, `-`, or
+    /// `/`) already stripped; `double_dash` records which prefix that was (see
+    /// `Token::double_dash`). Advances `self.i` past both the flag and, if consumed, its
+    /// separate-token value. `separate_value` is false for the `/flag` spelling: an MSBuild
+    /// switch attaches its value with `:` (`/bl:x.binlog`) and never consumes the next argument,
+    /// so `/r` (MSBuild's `restore`) must not swallow the token after it the way dotnet's own
+    /// `-r <rid>` does.
+    fn push_atomic_flag(&mut self, rest: &'a str, double_dash: bool, separate_value: bool) {
+        let (name, attached) = split_attached(rest, self.dialect);
+        let flag_index = self.tokens.len();
+        let source_index = self.i;
+        self.tokens.push(Token {
+            kind: TokenKind::Long,
+            text: name,
+            attached,
+            linked: None,
+            source_index,
+            double_dash,
+        });
+        self.i += 1;
+
+        if attached.is_none()
+            && separate_value
+            && (self.takes_value)(TokenKind::Long, name)
+            && self.link_next_value(flag_index, self.i)
+        {
+            self.i += 1;
+        }
+    }
+
+    /// If `self.args[value_index]` exists and isn't the still-unseen boundary `--`, pushes it as
+    /// a `Positional` token linked to `flag_index` (and links `flag_index` back to it). Returns
+    /// whether a value was consumed. Shared by `push_atomic_flag` and the `Short`-cluster path
+    /// so the boundary guard lives in exactly one place. Does *not* itself advance `self.i` --
+    /// each caller decides how (a Long flag always consumes exactly one more token; a Short
+    /// cluster's caller already accounts for the whole cluster being one arg).
+    ///
+    /// The still-unseen boundary `--` can never be swallowed as a value (verified against real
+    /// git: `git log --grep -- pattern` fails with "Option '--grep' requires a value" rather
+    /// than treating `--` as the pattern) -- once the boundary has already been emitted, a later
+    /// `--` is just ordinary text and fair game (`git log -- -- pattern` works).
+    fn link_next_value(&mut self, flag_index: usize, value_index: usize) -> bool {
+        let Some(next) = self.args.get(value_index) else {
+            return false;
+        };
+        if next.as_ref() == "--" && !self.emitted_dash_dash {
+            return false;
+        }
+        let token_index = self.tokens.len();
+        self.tokens.push(Token {
+            linked: Some(flag_index),
+            ..positional(next.as_ref(), value_index)
+        });
+        self.tokens[flag_index].linked = Some(token_index);
+        true
+    }
+}
+
 /// Core implementation shared by [`tokenize_dialect`] and [`tokenize_git`]. See [`tokenize_git`]
 /// for `takes_separate_value`'s contract; [`tokenize_dialect`] passes `|_, _| true`, preserving
 /// its original "always eligible" behavior for every existing caller.
@@ -283,12 +359,18 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
     takes_value: &dyn Fn(TokenKind, &str) -> bool,
     takes_separate_value: &dyn Fn(&str, bool) -> bool,
 ) -> Vec<Token<'a>> {
-    let mut tokens: Vec<Token<'a>> = Vec::with_capacity(args.len());
-    let mut i = 0;
-    let mut emitted_dash_dash = false;
+    let mut scanner = Scanner {
+        tokens: Vec::with_capacity(args.len()),
+        args,
+        i: 0,
+        dialect,
+        emitted_dash_dash: false,
+        takes_value,
+        takes_separate_value,
+    };
 
-    while i < args.len() {
-        let arg = args[i].as_ref();
+    while scanner.i < scanner.args.len() {
+        let arg = scanner.args[scanner.i].as_ref();
 
         // In Posix conventions `--` ends option parsing: everything after is a literal
         // positional/pathspec, never a flag. dotnet's `--` means something different -- an
@@ -298,48 +380,38 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
         // forwarded VSTest-console options). So only Posix stops classifying at the boundary;
         // Msbuild keeps going, just with the separator's position on record via the DashDash
         // token below.
-        if emitted_dash_dash && dialect == Dialect::Posix {
-            tokens.push(positional(arg, i));
-            i += 1;
+        if scanner.emitted_dash_dash && scanner.dialect == Dialect::Posix {
+            scanner.tokens.push(positional(arg, scanner.i));
+            scanner.i += 1;
             continue;
         }
 
         if arg == "--" {
-            if emitted_dash_dash {
+            if scanner.emitted_dash_dash {
                 // A second (or later) literal "--" is never itself the boundary — it's just
                 // ordinary text at this point, in both dialects.
-                tokens.push(positional(arg, i));
+                scanner.tokens.push(positional(arg, scanner.i));
             } else {
-                tokens.push(Token {
+                scanner.tokens.push(Token {
                     kind: TokenKind::DashDash,
                     text: "",
                     attached: None,
                     linked: None,
-                    source_index: i,
+                    source_index: scanner.i,
                     double_dash: false,
                 });
-                emitted_dash_dash = true;
+                scanner.emitted_dash_dash = true;
             }
-            i += 1;
+            scanner.i += 1;
             continue;
         }
 
         if let Some(rest) = arg.strip_prefix("--") {
-            push_atomic_flag(
-                &mut tokens,
-                args,
-                &mut i,
-                rest,
-                true,
-                true,
-                emitted_dash_dash,
-                dialect,
-                takes_value,
-            );
+            scanner.push_atomic_flag(rest, true, true);
             continue;
         }
 
-        if dialect == Dialect::Msbuild {
+        if scanner.dialect == Dialect::Msbuild {
             if let Some(rest) = arg.strip_prefix('/') {
                 // A real MSBuild switch name never contains another '/' (confirmed via a real
                 // dotnet 9 SDK, Docker: `dotnet build /abs/path/Project.csproj` builds the
@@ -361,172 +433,72 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
                 // switch names ("nologo", "bl", "v", "verbosity").
                 let name_part = rest.split(['=', ':']).next().unwrap_or(rest);
                 if !rest.is_empty() && !name_part.contains('/') {
-                    push_atomic_flag(
-                        &mut tokens,
-                        args,
-                        &mut i,
-                        rest,
-                        false,
-                        false,
-                        emitted_dash_dash,
-                        dialect,
-                        takes_value,
-                    );
+                    scanner.push_atomic_flag(rest, false, false);
                     continue;
                 }
             }
             if arg.len() > 1 && arg.starts_with('-') {
-                push_atomic_flag(
-                    &mut tokens,
-                    args,
-                    &mut i,
-                    &arg[1..],
-                    false,
-                    true,
-                    emitted_dash_dash,
-                    dialect,
-                    takes_value,
-                );
+                scanner.push_atomic_flag(&arg[1..], false, true);
                 continue;
             }
         } else if arg.len() > 1 && arg.starts_with('-') {
             let cluster = &arg[1..];
 
             if is_digit_run(cluster) {
-                tokens.push(Token {
+                scanner.tokens.push(Token {
                     kind: TokenKind::Short,
                     text: cluster,
                     attached: None,
                     linked: None,
-                    source_index: i,
+                    source_index: scanner.i,
                     double_dash: false,
                 });
-                i += 1;
+                scanner.i += 1;
                 continue;
             }
 
             let mut consumed_next = false;
+            let source_index = scanner.i;
 
             for (offset, ch) in cluster.char_indices() {
                 let char_len = ch.len_utf8();
                 let char_text = &cluster[offset..offset + char_len];
-                let flag_index = tokens.len();
-                tokens.push(Token {
+                let flag_index = scanner.tokens.len();
+                scanner.tokens.push(Token {
                     kind: TokenKind::Short,
                     text: char_text,
                     attached: None,
                     linked: None,
-                    source_index: i,
+                    source_index,
                     double_dash: false,
                 });
 
-                if takes_value(TokenKind::Short, char_text) {
+                if (scanner.takes_value)(TokenKind::Short, char_text) {
                     let remainder = &cluster[offset + char_len..];
                     if !remainder.is_empty() {
-                        tokens[flag_index].attached = Some(remainder);
+                        scanner.tokens[flag_index].attached = Some(remainder);
                     } else {
                         // is_solo: offset == 0 with an empty remainder means this char is the
                         // *entire* cluster (the arg was e.g. just "-n"); a later offset, or any
                         // remainder, means it's genuinely clustered with something else.
                         let is_solo = offset == 0;
-                        if takes_separate_value(char_text, is_solo) {
-                            consumed_next = link_next_value(
-                                &mut tokens,
-                                args,
-                                flag_index,
-                                i + 1,
-                                emitted_dash_dash,
-                            );
+                        if (scanner.takes_separate_value)(char_text, is_solo) {
+                            consumed_next = scanner.link_next_value(flag_index, source_index + 1);
                         }
                     }
                     break;
                 }
             }
 
-            i += if consumed_next { 2 } else { 1 };
+            scanner.i += if consumed_next { 2 } else { 1 };
             continue;
         }
 
-        tokens.push(positional(arg, i));
-        i += 1;
+        scanner.tokens.push(positional(arg, scanner.i));
+        scanner.i += 1;
     }
 
-    tokens
-}
-
-/// Pushes one atomic (non-clustering) flag token — used for `--flag` in both dialects, and for
-/// `-flag`/`/flag` in [`Dialect::Msbuild`] — splitting off an attached value per `dialect` and,
-/// absent one, consulting `takes_value` to maybe consume the next whole token as a separate
-/// value. `rest` is the flag text with its prefix (`--`, `-`, or `/`) already stripped;
-/// `double_dash` records which prefix that was (see `Token::double_dash`). `emitted_dash_dash`
-/// is the caller's current boundary state: the still-unseen boundary `--` can never be
-/// swallowed as this flag's value (verified against real git: `git log --grep -- pattern` fails
-/// with "Option '--grep' requires a value" rather than treating `--` as the pattern); a `--`
-/// encountered after the boundary was already emitted is just ordinary text and fair game
-/// (`git log -- -- pattern` works).
-#[allow(clippy::too_many_arguments)]
-fn push_atomic_flag<'a, T: AsRef<str>>(
-    tokens: &mut Vec<Token<'a>>,
-    args: &'a [T],
-    i: &mut usize,
-    rest: &'a str,
-    double_dash: bool,
-    separate_value: bool,
-    emitted_dash_dash: bool,
-    dialect: Dialect,
-    takes_value: &dyn Fn(TokenKind, &str) -> bool,
-) {
-    let (name, attached) = split_attached(rest, dialect);
-    let flag_index = tokens.len();
-    let source_index = *i;
-    tokens.push(Token {
-        kind: TokenKind::Long,
-        text: name,
-        attached,
-        linked: None,
-        source_index,
-        double_dash,
-    });
-    *i += 1;
-
-    if attached.is_none()
-        && separate_value
-        && takes_value(TokenKind::Long, name)
-        && link_next_value(tokens, args, flag_index, *i, emitted_dash_dash)
-    {
-        *i += 1;
-    }
-}
-
-/// If `args[value_index]` exists and isn't the still-unseen boundary `--`, pushes it as a
-/// `Positional` token linked to `flag_index` (and links `flag_index` back to it). Returns
-/// whether a value was consumed. Shared by the `Long`/[`Dialect::Msbuild`]-atomic-flag path and
-/// the `Short`-cluster path so the boundary guard lives in exactly one place.
-///
-/// The still-unseen boundary `--` can never be swallowed as a value (verified against real
-/// git: `git log --grep -- pattern` fails with "Option '--grep' requires a value" rather than
-/// treating `--` as the pattern) -- once the boundary has already been emitted, a later `--` is
-/// just ordinary text and fair game (`git log -- -- pattern` works).
-fn link_next_value<'a, T: AsRef<str>>(
-    tokens: &mut Vec<Token<'a>>,
-    args: &'a [T],
-    flag_index: usize,
-    value_index: usize,
-    emitted_dash_dash: bool,
-) -> bool {
-    let Some(next) = args.get(value_index) else {
-        return false;
-    };
-    if next.as_ref() == "--" && !emitted_dash_dash {
-        return false;
-    }
-    let token_index = tokens.len();
-    tokens.push(Token {
-        linked: Some(flag_index),
-        ..positional(next.as_ref(), value_index)
-    });
-    tokens[flag_index].linked = Some(token_index);
-    true
+    scanner.tokens
 }
 
 /// Splits `s` into `(name, attached_value)` on the first dialect-appropriate separator:
