@@ -844,15 +844,34 @@ fn dotnet_has_loose_flag(tokens: &[Token<'_>], name: &str) -> bool {
     arg_tokenizer::has_flag(tokens, Dialect::Msbuild, name)
 }
 
+/// True if a bare (no attached value) `Long` flag named `name` (case-insensitive) appears --
+/// loose match: `-flag`/`--flag`/`/flag` all count, like [`dotnet_has_loose_flag`]. Neither
+/// `dotnet_has_loose_flag` nor `arg_tokenizer::has_flag` check `attached` at all, so a pure
+/// boolean switch's broken attached-value spelling (e.g. `-nologo:true`) would otherwise be
+/// misread as "already present" by a plain presence check.
+fn dotnet_has_bare_loose_flag(tokens: &[Token<'_>], name: &str) -> bool {
+    tokens.iter().any(|t| {
+        t.kind == TokenKind::Long && t.attached.is_none() && t.text.eq_ignore_ascii_case(name)
+    })
+}
+
+/// Strict double-dash-only counterpart to [`dotnet_has_bare_loose_flag`], matching
+/// [`dotnet_has_flag`]'s strictness.
+fn dotnet_has_bare_double_dash_flag(tokens: &[Token<'_>], name: &str) -> bool {
+    tokens.iter().any(|t| {
+        t.kind == TokenKind::Long
+            && t.double_dash
+            && t.attached.is_none()
+            && t.text.eq_ignore_ascii_case(name)
+    })
+}
+
 fn has_nologo_arg(tokens: &[Token<'_>]) -> bool {
     // Unlike -v/-verbosity, -nologo is a pure boolean switch (confirmed via a real dotnet 9 SDK,
-    // Docker: `-nologo:true` fails with "MSB1002: This switch does not take any parameters").
-    // dotnet_has_loose_flag alone ignores `attached`, so it would treat the broken "-nologo:true"
-    // spelling as "user already passed -nologo" and skip RTK's own injection while still
-    // forwarding the invalid flag through untouched.
-    tokens.iter().any(|t| {
-        t.kind == TokenKind::Long && t.attached.is_none() && t.text.eq_ignore_ascii_case("nologo")
-    })
+    // Docker: `-nologo:true` fails with "MSB1002: This switch does not take any parameters"), so
+    // an attached-value spelling must not count as "already present" -- see
+    // dotnet_has_bare_loose_flag.
+    dotnet_has_bare_loose_flag(tokens, "nologo")
 }
 
 fn has_trx_logger_arg(tokens: &[Token<'_>]) -> bool {
@@ -915,16 +934,11 @@ fn has_write_mode_override(tokens: &[Token<'_>]) -> bool {
     // other dotnet-format-level flags here, so it's kept double-dash-only too for consistency
     // and predictability rather than inventing its own laxer convention. It's a pure boolean
     // switch (never meant to take a value), so an attached-value spelling like "--write=true"
-    // must not match here either: build_effective_dotnet_format_args's strip filter only
-    // removes the exact bare "--write" token, and detecting-but-not-stripping an attached form
-    // would leave it forwarded verbatim to real dotnet, which has no --write option at all and
-    // would reject it.
-    tokens.iter().any(|t| {
-        t.kind == TokenKind::Long
-            && t.double_dash
-            && t.attached.is_none()
-            && t.text.eq_ignore_ascii_case("write")
-    })
+    // must not match here either (see dotnet_has_bare_double_dash_flag):
+    // build_effective_dotnet_format_args's strip filter only removes the exact bare "--write"
+    // token, and detecting-but-not-stripping an attached form would leave it forwarded verbatim
+    // to real dotnet, which has no --write option at all and would reject it.
+    dotnet_has_bare_double_dash_flag(tokens, "write")
 }
 
 fn extract_results_directory_arg(tokens: &[Token<'_>]) -> Option<PathBuf> {
