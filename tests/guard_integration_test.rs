@@ -213,6 +213,34 @@ fn git_log_dash_p_pathspec_after_double_dash_is_not_patch_flag() {
 }
 
 #[test]
+fn git_show_dash_dash_stat_pathspec_after_double_dash_is_not_stat_flag() {
+    // Regression: `rtk git show -- --stat` must not be misread as a request for the real
+    // `--stat` summary flag. Before restore_double_dash + arg_tokenizer, run_show's
+    // wants_stat_only check was a raw `arg == "--stat"` scan with no `--`-boundary awareness, so
+    // a file literally named "--stat" after the boundary was wrongly treated as the flag and
+    // sent down the raw-passthrough path instead of RTK's own compacted-diff path.
+    let dir = init_git_repo();
+    std::fs::write(dir.path().join("--stat"), "not a summary flag\n").expect("write --stat file");
+    git_in_dir(dir.path(), &["add", "--", "--stat"]);
+    git_in_dir(
+        dir.path(),
+        &["commit", "-q", "-m", "add dash-dash-stat file"],
+    );
+
+    let (stdout, stderr, code) = rtk_output_in_dir(dir.path(), &["git", "show", "--", "--stat"]);
+
+    assert_eq!(code, Some(0), "rtk stderr: {stderr}");
+    assert!(
+        !stdout.contains("diff --git"),
+        "-- --stat should stay on RTK's compacted-diff path, not raw passthrough: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("--stat") && stdout.contains("+1"),
+        "expected RTK's compacted diff summary for the --stat file: {stdout:?}"
+    );
+}
+
+#[test]
 fn git_log_malformed_digit_run_propagates_real_git_error() {
     // "-5x" isn't a valid git log limit; real git rejects it outright ("fatal: '5x': not an
     // integer", verified against git 2.51). run_log's internal limit-parsing for this
