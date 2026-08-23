@@ -568,7 +568,7 @@ fn build_effective_dotnet_args(
                 // In VsTestBridge mode (supported on .NET 9 SDK and earlier), --report-trx
                 // goes after the -- separator so it reaches the MTP runtime.
                 if !has_report_trx_arg(tokens) {
-                    effective.extend(inject_report_trx_into_args(args));
+                    effective.extend(inject_report_trx_into_args(args, tokens));
                 } else {
                     effective.extend(args.iter().cloned());
                 }
@@ -830,8 +830,12 @@ fn has_report_trx_arg(tokens: &[Token<'_>]) -> bool {
 
 /// Injects `--report-trx` after the `--` separator in `args`.
 /// If no `--` separator exists, appends `-- --report-trx` at the end.
-fn inject_report_trx_into_args(args: &[String]) -> Vec<String> {
-    if let Some(sep) = args.iter().position(|a| a == "--") {
+fn inject_report_trx_into_args(args: &[String], tokens: &[Token<'_>]) -> Vec<String> {
+    let sep = tokens
+        .iter()
+        .find(|t| t.kind == TokenKind::DashDash)
+        .map(|t| t.source_index);
+    if let Some(sep) = sep {
         let mut result = args.to_vec();
         result.insert(sep + 1, "--report-trx".to_string());
         result
