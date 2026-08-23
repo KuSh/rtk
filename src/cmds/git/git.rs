@@ -123,12 +123,11 @@ fn run_diff(
 ) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
-    // Check if user wants stat output. Shares git log's value-taking-flag predicate
-    // (log_takes_value): `diff` uses the same diff option grammar.
+    // Check if user wants a raw-shaped diff output. Shares git log's value-taking-flag predicate
+    // (log_takes_value) and shape-flag predicate (requests_raw_diff_shape): `diff` uses the same
+    // diff option grammar.
     let tokens = arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value);
-    let wants_stat = tokens.iter().any(|t| {
-        t.kind == TokenKind::Long && matches!(t.text, "numstat" | "shortstat" | "stat")
-    });
+    let wants_stat = tokens.iter().any(requests_raw_diff_shape);
 
     // Check if user wants compact diff (default RTK behavior). --no-compact is RTK's own
     // pseudo-flag, always double-dash (never a real git diff option), so no loose matching
@@ -233,12 +232,11 @@ fn run_show(
 ) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
-    // If user wants --stat or --format only, pass through. Shares git log's value-taking-flag
-    // predicate (log_takes_value): `show` uses the same diff/log option grammar.
+    // If user wants a raw-shaped diff or --format only, pass through. Shares git log's
+    // value-taking-flag predicate (log_takes_value) and shape-flag predicate
+    // (requests_raw_diff_shape): `show` uses the same diff/log option grammar.
     let tokens = arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value);
-    let wants_stat_only = tokens.iter().any(|t| {
-        t.kind == TokenKind::Long && matches!(t.text, "numstat" | "shortstat" | "stat")
-    });
+    let wants_stat_only = tokens.iter().any(requests_raw_diff_shape);
 
     let wants_format = tokens
         .iter()

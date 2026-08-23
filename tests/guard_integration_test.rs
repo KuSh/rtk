@@ -270,6 +270,29 @@ fn git_diff_dash_dash_stat_pathspec_after_double_dash_is_not_stat_flag() {
 }
 
 #[test]
+fn git_diff_name_only_passes_through_raw() {
+    // Regression: run_diff's wants_stat check only recognized --stat/--numstat/--shortstat, a
+    // narrower list than requests_raw_diff_shape (which run_log already used, covering
+    // --name-only/--name-status/--raw/--dirstat/--summary/-p/-u too). `--name-only` fell through
+    // to RTK's default stat+compacted-diff path instead of a raw passthrough of git's own
+    // name-only output.
+    let dir = init_git_repo();
+    std::fs::write(dir.path().join("file.txt"), "one\n").expect("write file");
+    git_in_dir(dir.path(), &["add", "file.txt"]);
+    git_in_dir(dir.path(), &["commit", "-q", "-m", "add file"]);
+    std::fs::write(dir.path().join("file.txt"), "one\ntwo\n").expect("modify file");
+
+    let (stdout, stderr, code) = rtk_output_in_dir(dir.path(), &["git", "diff", "--name-only"]);
+
+    assert_eq!(code, Some(0), "rtk stderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "file.txt",
+        "--name-only should pass through as git's own bare filename list: {stdout:?}"
+    );
+}
+
+#[test]
 fn git_branch_dash_prefixed_name_after_double_dash_attempts_creation_not_a_silent_list() {
     // Regression: `rtk git branch -- -weird` must be classified as a branch-creation attempt
     // (and let real git's own ref-name validation reject it), not silently fall through to list
