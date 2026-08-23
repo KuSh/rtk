@@ -124,10 +124,11 @@ fn run_diff(
     let timer = tracking::TimedExecution::start();
 
     // Check if user wants a raw-shaped diff output. Shares git log's value-taking-flag predicate
-    // (log_takes_value) and shape-flag predicate (requests_raw_diff_shape): `diff` uses the same
-    // diff option grammar.
+    // (log_takes_value) and diff option grammar, but uses the narrower
+    // requests_diff_show_raw_shape (not requests_raw_diff_shape): unlike log, diff's default
+    // output already is patch text, so -p/-u/--patch don't need the raw passthrough path.
     let tokens = git_log_tokens(args);
-    let wants_stat = tokens.iter().any(requests_raw_diff_shape);
+    let wants_stat = tokens.iter().any(requests_diff_show_raw_shape);
 
     // Check if user wants compact diff (default RTK behavior). --no-compact is RTK's own
     // pseudo-flag, always double-dash (never a real git diff option), so no loose matching
@@ -233,10 +234,11 @@ fn run_show(
     let timer = tracking::TimedExecution::start();
 
     // If user wants a raw-shaped diff or --format only, pass through. Shares git log's
-    // value-taking-flag predicate (log_takes_value) and shape-flag predicate
-    // (requests_raw_diff_shape): `show` uses the same diff/log option grammar.
+    // value-taking-flag predicate (log_takes_value) and diff/log option grammar, but uses the
+    // narrower requests_diff_show_raw_shape (not requests_raw_diff_shape): unlike log, show's
+    // default output already is patch text, so -p/-u/--patch don't need the raw passthrough path.
     let tokens = git_log_tokens(args);
-    let wants_stat_only = tokens.iter().any(requests_raw_diff_shape);
+    let wants_stat_only = tokens.iter().any(requests_diff_show_raw_shape);
 
     let wants_format = tokens
         .iter()
@@ -1027,11 +1029,14 @@ fn real_flag_args(args: &[String]) -> Vec<&str> {
         .collect()
 }
 
-/// True for git log/diff flags that change the *shape* of git's raw output
+/// True for git log flags that change the *shape* of git's raw output
 /// (patch text, diffstat, name lists) in a way RTK's injected
 /// `--pretty=format` + `---END---` markers can't coexist with — matching
 /// this must request the untouched passthrough path instead of RTK's
-/// filtered one (see [`requests_raw_log_output`]).
+/// filtered one (see [`requests_raw_log_output`]). `log`'s own default output has no diff
+/// content at all, so `-p`/`-u`/`--patch` belong here too: they request something RTK's
+/// filtered log path never produces. `diff`/`show` use the narrower
+/// [`requests_diff_show_raw_shape`] instead, since their default output already is patch text.
 fn requests_raw_diff_shape(token: &Token<'_>) -> bool {
     match token.kind {
         TokenKind::Long => matches!(
@@ -1049,6 +1054,32 @@ fn requests_raw_diff_shape(token: &Token<'_>) -> bool {
                 | "summary"
         ),
         TokenKind::Short => matches!(token.text, "p" | "u"),
+        _ => false,
+    }
+}
+
+/// Like [`requests_raw_diff_shape`], but for `diff`/`show`: excludes `--patch`/`-p`/`-u`. Unlike
+/// `log` (whose default output has no diff content at all), `diff`/`show`'s default output
+/// already *is* patch text -- so an explicit `-p`/`--patch`/`-u` there is redundant with the
+/// default, not a request for a shape RTK's own stat + compacted-diff pipeline can't produce,
+/// and must not divert onto the raw passthrough path. `--patch-with-raw`/`--patch-with-stat`
+/// still do: they mix patch text with a raw/stat format RTK's own extra `--stat` step would
+/// double up against.
+fn requests_diff_show_raw_shape(token: &Token<'_>) -> bool {
+    match token.kind {
+        TokenKind::Long => matches!(
+            token.text,
+            "dirstat"
+                | "name-only"
+                | "name-status"
+                | "numstat"
+                | "patch-with-raw"
+                | "patch-with-stat"
+                | "raw"
+                | "shortstat"
+                | "stat"
+                | "summary"
+        ),
         _ => false,
     }
 }
@@ -3998,6 +4029,46 @@ A  added.rs
             assert!(
                 requests_raw_log_output(&args),
                 "{flag} changes output shape and should request raw output"
+            );
+        }
+    }
+
+    #[test]
+    fn test_diff_show_raw_shape_excludes_patch_flags() {
+        // Regression: git diff/show's default output already IS patch text, unlike log's plain
+        // commit-message default -- so an explicit -p/-u/--patch is redundant with the default,
+        // not a request for an incompatible shape, and must not divert diff/show onto the raw
+        // passthrough path (that would defeat RTK's whole compaction purpose for a very common
+        // invocation: `git diff -p`, `git show -p <rev>`).
+        for flag in ["--patch", "-p", "-u"] {
+            let args = vec![flag.to_string()];
+            let tokens = git_log_tokens(&args);
+            assert!(
+                !tokens.iter().any(requests_diff_show_raw_shape),
+                "{flag} must stay on diff/show's compact path, not the raw passthrough path"
+            );
+        }
+    }
+
+    #[test]
+    fn test_diff_show_raw_shape_still_includes_other_shape_flags() {
+        for flag in [
+            "--dirstat",
+            "--name-only",
+            "--name-status",
+            "--numstat",
+            "--patch-with-raw",
+            "--patch-with-stat",
+            "--raw",
+            "--shortstat",
+            "--stat",
+            "--summary",
+        ] {
+            let args = vec![flag.to_string()];
+            let tokens = git_log_tokens(&args);
+            assert!(
+                tokens.iter().any(requests_diff_show_raw_shape),
+                "{flag} changes output shape and should still request the raw passthrough path"
             );
         }
     }
