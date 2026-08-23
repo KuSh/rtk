@@ -689,6 +689,20 @@ fn is_global_json_mtp_mode() -> bool {
 ///
 /// Priority order: global.json (MtpNative) > project-file/Directory.Build.props (MtpVsTestBridge) > Classic.
 /// `global.json` MTP mode is checked first because it overrides all project-level properties.
+///
+/// KNOWN LIMITATION, not fixed here: `explicit_projects` below (via `dotnet_takes_value`) has no
+/// filesystem backstop -- it relies entirely on `dotnet_takes_value`'s allowlist being exhaustive
+/// for every dotnet flag that takes a separate-token value. `dotnet_takes_value`'s own doc admits
+/// it "not exhaustive"; a real value-taking flag missing from it (e.g. `--property`/`-p`,
+/// `--collect`, `--diag`, `--settings`, `--blame`, `--output`/`-o`, `--source`, `--sln`) whose
+/// value happens to end in `.csproj`/`.fsproj`/`.vbproj` would be misread as an explicit project
+/// path the same way three earlier commits in this branch (89b735d, f7732dc, a915494) each closed
+/// for one flag at a time. Same root cause as `arg_tokenizer.rs`'s Msbuild single-segment-path
+/// limitation: real MSBuild resolves the analogous ambiguity with an actual filesystem `stat()`
+/// call, which this function -- despite already doing other filesystem I/O (`scan_dir` below) --
+/// doesn't use here, since teaching `explicit_projects` to stat() every candidate would be a
+/// materially different (and slower, syscall-per-candidate) design than a pure allowlist check,
+/// not a one-line addition.
 fn detect_test_runner_mode(tokens: &[Token<'_>]) -> TestRunnerMode {
     detect_test_runner_mode_in_dir(tokens, Path::new("."))
 }
