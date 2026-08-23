@@ -222,16 +222,22 @@ fn run_show(
     verbose: u8,
     global_args: &[String],
 ) -> Result<i32> {
+    // Re-insert `--` when clap's trailing_var_arg consumed it (issue #1215): without this, the
+    // wants_stat_only/wants_format checks below can't tell a pathspec literally named "--stat"
+    // or "--pretty" (after `--`) from the real flag.
+    let args = &args_utils::restore_double_dash(args);
     let timer = tracking::TimedExecution::start();
 
-    // If user wants --stat or --format only, pass through
-    let wants_stat_only = args
-        .iter()
-        .any(|arg| arg == "--stat" || arg == "--numstat" || arg == "--shortstat");
+    // If user wants --stat or --format only, pass through. Shares git log's value-taking-flag
+    // predicate (log_takes_value): `show` uses the same diff/log option grammar.
+    let tokens = arg_tokenizer::tokenize(args, &log_takes_value);
+    let wants_stat_only = tokens.iter().any(|t| {
+        t.kind == TokenKind::Long && matches!(t.text, "numstat" | "shortstat" | "stat")
+    });
 
-    let wants_format = args
+    let wants_format = tokens
         .iter()
-        .any(|arg| arg.starts_with("--pretty") || arg.starts_with("--format"));
+        .any(|t| t.kind == TokenKind::Long && matches!(t.text, "format" | "pretty"));
 
     // `git show rev:path` prints a blob, not a commit diff. In this mode we should
     // pass through directly to avoid duplicated output from compact-show steps.
@@ -1441,6 +1447,11 @@ fn run_status(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
 }
 
 fn run_add(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32> {
+    // Re-insert `--` when clap's trailing_var_arg consumed it (issue #1215): without this,
+    // `rtk git add -- -weird-filename` (the standard idiom for staging a flag-like filename)
+    // loses its `--` before reaching git, which then rejects "-weird-filename" as an
+    // unrecognized option instead of staging it.
+    let args = &args_utils::restore_double_dash(args);
     let timer = tracking::TimedExecution::start();
 
     let mut cmd = git_cmd(global_args);
