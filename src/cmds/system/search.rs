@@ -699,36 +699,33 @@ fn parse_match_line(line: &str) -> Option<(String, usize, bool, &str)> {
 
 fn has_format_flag<T: AsRef<str>>(extra_args: &[T]) -> bool {
     // Minimal/shape forms the agent already chose; short flags scanned per-letter
-    // so clusters like -rl/-rq route through, plus their long forms.
+    // so clusters like -rl/-rq route through, plus their long forms. Shares
+    // search_takes_value with extract_pattern_path so a value-taking flag's value (e.g. `-e
+    // --json`, where "--json" is -e's pattern, not the real --json flag) is never misread as
+    // one of these.
     const LONG: &[&str] = &[
-        "--count",
-        "--count-matches",
-        "--files-with-matches",
-        "--files-without-match",
-        "--only-matching",
-        "--quiet",
-        "--silent",
-        "--byte-offset",
-        "--column",
-        "--vimgrep",
-        "--null",
-        "--null-data",
-        "--json",
-        "--passthru",
-        "--files",
+        "byte-offset",
+        "column",
+        "count",
+        "count-matches",
+        "files",
+        "files-with-matches",
+        "files-without-match",
+        "json",
+        "null",
+        "null-data",
+        "only-matching",
+        "passthru",
+        "quiet",
+        "silent",
+        "vimgrep",
     ];
-    extra_args.iter().any(|arg| {
-        let a = arg.as_ref();
-        if a.starts_with("--") {
-            LONG.contains(&a.split('=').next().unwrap_or(a))
-        } else if let Some(letters) = a.strip_prefix('-').filter(|s| !s.is_empty()) {
-            // -c count, -l/-L lists, -o only-matching, -q quiet, -b byte-offset, -Z/-z NUL
-            letters
-                .chars()
-                .any(|ch| matches!(ch, 'c' | 'l' | 'L' | 'o' | 'q' | 'b' | 'Z' | 'z'))
-        } else {
-            false
-        }
+    let tokens = arg_tokenizer::tokenize(extra_args, &search_takes_value);
+    tokens.iter().any(|t| match t.kind {
+        TokenKind::Long => LONG.contains(&t.text),
+        // -c count, -l/-L lists, -o only-matching, -q quiet, -b byte-offset, -Z/-z NUL
+        TokenKind::Short => matches!(t.text, "c" | "l" | "L" | "o" | "q" | "b" | "Z" | "z"),
+        _ => false,
     })
 }
 
@@ -1226,6 +1223,18 @@ mod tests {
     #[test]
     fn test_format_flag_ignores_normal_flags() {
         assert!(!has_format_flag(&["-i", "-w", "-A", "3"]));
+    }
+
+    #[test]
+    fn test_format_flag_ignores_value_of_value_taking_flag() {
+        // Regression: has_format_flag used to be its own mini-tokenizer that scanned every raw
+        // arg string independently, with no notion of "this token is another flag's value."
+        // `-e --json` means "--json" is -e's pattern argument (is_short_value_flag("e") is
+        // true), not the real --json format flag -- but the old per-arg scan matched "--json"
+        // regardless of position.
+        assert!(!has_format_flag(&["-e", "--json"]));
+        // Same for the long-flag form of a value-taking option.
+        assert!(!has_format_flag(&["--regexp", "--quiet"]));
     }
 
     #[test]
