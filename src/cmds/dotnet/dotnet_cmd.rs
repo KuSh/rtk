@@ -779,10 +779,14 @@ fn has_nologo_arg(args: &[String]) -> bool {
 }
 
 fn has_trx_logger_arg(args: &[String]) -> bool {
-    dotnet_flag_value(&dotnet_tokens(args), "logger").is_some_and(|value| {
+    // --logger can legitimately repeat (e.g. `--logger "console;verbosity=normal" --logger
+    // trx`), so every occurrence must be checked, not just the first.
+    let tokens = dotnet_tokens(args);
+    let has_trx = arg_tokenizer::flag_values(&tokens, Dialect::Msbuild, "logger").any(|value| {
         let lower = value.to_ascii_lowercase();
         lower == "trx" || lower.starts_with("trx;")
-    })
+    });
+    has_trx
 }
 
 fn has_results_directory_arg(args: &[String]) -> bool {
@@ -2057,6 +2061,22 @@ mod tests {
         let injected = build_dotnet_args_for_test("test", &args, true);
         let trx_logger_count = injected.iter().filter(|a| *a == "trx").count();
         assert_eq!(trx_logger_count, 1);
+    }
+
+    #[test]
+    fn test_second_of_multiple_loggers_being_trx_does_not_duplicate() {
+        // Regression: --logger can legitimately repeat (a documented VSTest pattern); a trx
+        // logger that isn't the FIRST --logger occurrence must still be detected.
+        let args = vec![
+            "--logger".to_string(),
+            "console;verbosity=normal".to_string(),
+            "--logger".to_string(),
+            "trx".to_string(),
+        ];
+
+        let injected = build_dotnet_args_for_test("test", &args, true);
+        let trx_logger_count = injected.iter().filter(|a| *a == "trx").count();
+        assert_eq!(trx_logger_count, 1, "must not inject a duplicate trx logger: {injected:?}");
     }
 
     #[test]

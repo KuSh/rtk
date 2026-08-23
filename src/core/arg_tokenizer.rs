@@ -100,6 +100,22 @@ pub fn has_flag(tokens: &[Token<'_>], dialect: Dialect, name: &str) -> bool {
         .any(|t| t.kind == TokenKind::Long && flag_name_matches(t.text, name, dialect))
 }
 
+/// Every value for `name` (matched per `dialect`), in order, for a flag that can legitimately
+/// be repeated (e.g. dotnet test's `--logger console;verbosity=normal --logger trx`, where each
+/// occurrence must be checked, not just the first — [`flag_value`] only reports the first
+/// match). Occurrences with no value (bare flag, or a value-taking flag with nothing left to
+/// consume) are skipped rather than yielding `None`.
+pub fn flag_values<'a, 't>(
+    tokens: &'t [Token<'a>],
+    dialect: Dialect,
+    name: &'t str,
+) -> impl Iterator<Item = &'a str> + 't {
+    tokens
+        .iter()
+        .filter(move |t| t.kind == TokenKind::Long && flag_name_matches(t.text, name, dialect))
+        .filter_map(|t| t.value(tokens))
+}
+
 /// Which CLI's flag grammar `tokenize_dialect` should apply. See [`tokenize_dialect`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
@@ -139,6 +155,7 @@ pub fn tokenize_dialect<'a>(
     let mut tokens: Vec<Token<'a>> = Vec::with_capacity(args.len());
     let mut i = 0;
     let mut seen_dash_dash = false;
+    let mut emitted_dash_dash = false;
 
     while i < args.len() {
         let arg = args[i].as_str();
@@ -150,23 +167,30 @@ pub fn tokenize_dialect<'a>(
         }
 
         if arg == "--" {
-            tokens.push(Token {
-                kind: TokenKind::DashDash,
-                text: "",
-                attached: None,
-                linked: None,
-                source_index: i,
-            });
-            // In Posix conventions `--` ends option parsing: everything after is a literal
-            // positional/pathspec, never a flag. dotnet's `--` means something different — an
-            // argument-*forwarding* boundary, not an end-of-options marker: what follows is
-            // still real flags, just meant for a different receiving parser (the VSTest/MTP
-            // test host) that can share flag names with dotnet's own (e.g. --logger,
-            // --results-directory are forwarded VSTest-console options). So only Posix stops
-            // classifying here; Msbuild keeps going, just with the separator's position on
-            // record via this DashDash token.
-            if dialect == Dialect::Posix {
-                seen_dash_dash = true;
+            if emitted_dash_dash {
+                // A second (or later) literal "--" is never itself the boundary — it's just
+                // ordinary text at this point, in both dialects.
+                tokens.push(positional(arg, i));
+            } else {
+                tokens.push(Token {
+                    kind: TokenKind::DashDash,
+                    text: "",
+                    attached: None,
+                    linked: None,
+                    source_index: i,
+                });
+                emitted_dash_dash = true;
+                // In Posix conventions `--` ends option parsing: everything after is a literal
+                // positional/pathspec, never a flag. dotnet's `--` means something different —
+                // an argument-*forwarding* boundary, not an end-of-options marker: what follows
+                // is still real flags, just meant for a different receiving parser (the
+                // VSTest/MTP test host) that can share flag names with dotnet's own (e.g.
+                // --logger, --results-directory are forwarded VSTest-console options). So only
+                // Posix stops classifying here; Msbuild keeps going, just with the separator's
+                // position on record via this DashDash token.
+                if dialect == Dialect::Posix {
+                    seen_dash_dash = true;
+                }
             }
             i += 1;
             continue;
@@ -623,6 +647,30 @@ mod tests {
     }
 
     #[test]
+    fn msbuild_second_dashdash_is_positional_not_another_boundary() {
+        // Regression: DashDash must be emitted exactly once even under Msbuild, where
+        // classification doesn't stop at `--` (unlike Posix, where a second `--` already falls
+        // into the seen_dash_dash positional catch-all for free).
+        let args = owned(&["--", "a", "--", "b"]);
+        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+
+        assert_eq!(tokens[0].kind, TokenKind::DashDash);
+        assert_eq!(tokens[1].kind, TokenKind::Positional);
+        assert_eq!(tokens[1].text, "a");
+        assert_eq!(tokens[2].kind, TokenKind::Positional);
+        assert_eq!(tokens[2].text, "--");
+        assert_eq!(tokens[3].kind, TokenKind::Positional);
+        assert_eq!(tokens[3].text, "b");
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|t| t.kind == TokenKind::DashDash)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn msbuild_dialect_never_produces_short_tokens() {
         let args = owned(&["-a", "-bc", "/d", "--e"]);
         let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
@@ -675,5 +723,18 @@ mod tests {
 
         assert!(!has_flag(&tokens, Dialect::Posix, "nologo"));
         assert!(!has_flag(&tokens, Dialect::Posix, "n"));
+    }
+
+    #[test]
+    fn flag_values_reports_every_occurrence_not_just_the_first() {
+        // Regression: dotnet test's --logger can legitimately repeat
+        // (`--logger "console;verbosity=normal" --logger trx`) -- unlike flag_value, which
+        // only reports the first match, every occurrence must be checkable.
+        let args = owned(&["--logger:console;verbosity=normal", "--logger", "trx"]);
+        let takes = |kind: TokenKind, name: &str| kind == TokenKind::Long && name == "logger";
+        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &takes);
+
+        let values: Vec<&str> = flag_values(&tokens, Dialect::Msbuild, "logger").collect();
+        assert_eq!(values, vec!["console;verbosity=normal", "trx"]);
     }
 }

@@ -113,9 +113,18 @@ fn match_block(path: &str, entries: &[(usize, bool, String)]) -> String {
 /// terminates the cluster — everything after it is its inline value, not a
 /// separate flag. Long value-taking flags consume the next token. `--` marks
 /// everything after it as positional.
+///
+/// Test-only convenience over `&[T: AsRef<str>]`; the real call site already owns a
+/// `Vec<String>` (from `args_utils::restore_double_dash`) and uses
+/// [`extract_pattern_path_owned`] directly to avoid cloning it again.
+#[cfg(test)]
 fn extract_pattern_path<T: AsRef<str>>(args: &[T]) -> (Vec<String>, Vec<String>, Vec<String>) {
     let owned: Vec<String> = args.iter().map(|a| a.as_ref().to_string()).collect();
-    let tokens = arg_tokenizer::tokenize(&owned, &search_takes_value);
+    extract_pattern_path_owned(&owned)
+}
+
+fn extract_pattern_path_owned(args: &[String]) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let tokens = arg_tokenizer::tokenize(args, &search_takes_value);
 
     let mut e_patterns: Vec<String> = Vec::new();
     let mut positionals: Vec<String> = Vec::new();
@@ -473,7 +482,7 @@ pub fn run(
     let real_cmd = format!("{} {}", engine.label(), args.join(" "));
     let rtk_label = format!("rtk {}", engine.label());
 
-    let (patterns, paths, extra_args) = extract_pattern_path(&args);
+    let (patterns, paths, extra_args) = extract_pattern_path_owned(&args);
 
     if patterns.is_empty() {
         return passthrough(&timer, engine, &args, &real_cmd, false);

@@ -197,7 +197,10 @@ fn find_subcommand_index(args: &[String]) -> Option<usize> {
     for token in &tokens {
         match token.kind {
             TokenKind::DashDash => return None,
-            TokenKind::Positional if token.linked.is_none() => {
+            // A bare "-" (e.g. a stdin placeholder) is unrecognized-flag-like, not a stopping
+            // condition -- keep scanning past it, same as any other unrecognized `-`-prefixed
+            // token, instead of treating it as "no subcommand found."
+            TokenKind::Positional if token.linked.is_none() && token.text != "-" => {
                 return is_golangci_subcommand(token.text).then_some(token.source_index);
             }
             _ => {}
@@ -533,6 +536,19 @@ mod tests {
         assert_eq!(
             classify_invocation(&["--".into(), "run".into()]),
             Invocation::Passthrough
+        );
+    }
+
+    #[test]
+    fn test_classify_invocation_bare_dash_before_subcommand_uses_filtered_path() {
+        // Regression: a bare "-" (e.g. a stdin placeholder) is unrecognized-flag-like, not a
+        // stopping condition -- must not be mistaken for "no subcommand found."
+        assert_eq!(
+            classify_invocation(&["-".into(), "run".into(), "./...".into()]),
+            Invocation::FilteredRun(RunInvocation {
+                global_args: vec!["-".into()],
+                run_args: vec!["./...".into()],
+            })
         );
     }
 
