@@ -259,14 +259,32 @@ pub fn tokenize_dialect<'a, T: AsRef<str>>(
         }
 
         if let Some(rest) = arg.strip_prefix("--") {
-            push_atomic_flag(&mut tokens, args, &mut i, rest, true, dialect, takes_value);
+            push_atomic_flag(
+                &mut tokens,
+                args,
+                &mut i,
+                rest,
+                true,
+                emitted_dash_dash,
+                dialect,
+                takes_value,
+            );
             continue;
         }
 
         if dialect == Dialect::Msbuild {
             if let Some(rest) = arg.strip_prefix('/') {
                 if !rest.is_empty() {
-                    push_atomic_flag(&mut tokens, args, &mut i, rest, false, dialect, takes_value);
+                    push_atomic_flag(
+                        &mut tokens,
+                        args,
+                        &mut i,
+                        rest,
+                        false,
+                        emitted_dash_dash,
+                        dialect,
+                        takes_value,
+                    );
                     continue;
                 }
             }
@@ -277,6 +295,7 @@ pub fn tokenize_dialect<'a, T: AsRef<str>>(
                     &mut i,
                     &arg[1..],
                     false,
+                    emitted_dash_dash,
                     dialect,
                     takes_value,
                 );
@@ -317,14 +336,14 @@ pub fn tokenize_dialect<'a, T: AsRef<str>>(
                     let remainder = &cluster[offset + char_len..];
                     if !remainder.is_empty() {
                         tokens[flag_index].attached = Some(remainder);
-                    } else if let Some(next) = args.get(i + 1) {
-                        let value_index = tokens.len();
-                        tokens.push(Token {
-                            linked: Some(flag_index),
-                            ..positional(next.as_ref(), i + 1)
-                        });
-                        tokens[flag_index].linked = Some(value_index);
-                        consumed_next = true;
+                    } else {
+                        consumed_next = link_next_value(
+                            &mut tokens,
+                            args,
+                            flag_index,
+                            i + 1,
+                            emitted_dash_dash,
+                        );
                     }
                     break;
                 }
@@ -345,13 +364,20 @@ pub fn tokenize_dialect<'a, T: AsRef<str>>(
 /// `-flag`/`/flag` in [`Dialect::Msbuild`] — splitting off an attached value per `dialect` and,
 /// absent one, consulting `takes_value` to maybe consume the next whole token as a separate
 /// value. `rest` is the flag text with its prefix (`--`, `-`, or `/`) already stripped;
-/// `double_dash` records which prefix that was (see `Token::double_dash`).
+/// `double_dash` records which prefix that was (see `Token::double_dash`). `emitted_dash_dash`
+/// is the caller's current boundary state: the still-unseen boundary `--` can never be
+/// swallowed as this flag's value (verified against real git: `git log --grep -- pattern` fails
+/// with "Option '--grep' requires a value" rather than treating `--` as the pattern); a `--`
+/// encountered after the boundary was already emitted is just ordinary text and fair game
+/// (`git log -- -- pattern` works).
+#[allow(clippy::too_many_arguments)]
 fn push_atomic_flag<'a, T: AsRef<str>>(
     tokens: &mut Vec<Token<'a>>,
     args: &'a [T],
     i: &mut usize,
     rest: &'a str,
     double_dash: bool,
+    emitted_dash_dash: bool,
     dialect: Dialect,
     takes_value: &dyn Fn(TokenKind, &str) -> bool,
 ) {
@@ -368,17 +394,43 @@ fn push_atomic_flag<'a, T: AsRef<str>>(
     });
     *i += 1;
 
-    if attached.is_none() && takes_value(TokenKind::Long, name) {
-        if let Some(next) = args.get(*i) {
-            let value_index = tokens.len();
-            tokens.push(Token {
-                linked: Some(flag_index),
-                ..positional(next.as_ref(), *i)
-            });
-            tokens[flag_index].linked = Some(value_index);
-            *i += 1;
-        }
+    if attached.is_none()
+        && takes_value(TokenKind::Long, name)
+        && link_next_value(tokens, args, flag_index, *i, emitted_dash_dash)
+    {
+        *i += 1;
     }
+}
+
+/// If `args[value_index]` exists and isn't the still-unseen boundary `--`, pushes it as a
+/// `Positional` token linked to `flag_index` (and links `flag_index` back to it). Returns
+/// whether a value was consumed. Shared by the `Long`/[`Dialect::Msbuild`]-atomic-flag path and
+/// the `Short`-cluster path so the boundary guard lives in exactly one place.
+///
+/// The still-unseen boundary `--` can never be swallowed as a value (verified against real
+/// git: `git log --grep -- pattern` fails with "Option '--grep' requires a value" rather than
+/// treating `--` as the pattern) -- once the boundary has already been emitted, a later `--` is
+/// just ordinary text and fair game (`git log -- -- pattern` works).
+fn link_next_value<'a, T: AsRef<str>>(
+    tokens: &mut Vec<Token<'a>>,
+    args: &'a [T],
+    flag_index: usize,
+    value_index: usize,
+    emitted_dash_dash: bool,
+) -> bool {
+    let Some(next) = args.get(value_index) else {
+        return false;
+    };
+    if next.as_ref() == "--" && !emitted_dash_dash {
+        return false;
+    }
+    let token_index = tokens.len();
+    tokens.push(Token {
+        linked: Some(flag_index),
+        ..positional(next.as_ref(), value_index)
+    });
+    tokens[flag_index].linked = Some(token_index);
+    true
 }
 
 /// Splits `s` into `(name, attached_value)` on the first dialect-appropriate separator:
@@ -464,6 +516,62 @@ mod tests {
         assert_eq!(tokens[1].kind, TokenKind::Positional);
         assert_eq!(tokens[1].text, "-p");
         assert_eq!(tokens[1].linked, Some(0));
+    }
+
+    #[test]
+    fn value_taking_long_flag_never_swallows_the_unseen_boundary_dashdash() {
+        // Regression: verified against real git that a value-taking flag can never claim the
+        // still-unseen boundary "--" as its value -- `git log --grep -- pattern` fails with
+        // "Option '--grep' requires a value" rather than treating "--" as the search pattern.
+        let args = owned(&["--grep", "--", "pattern"]);
+        let tokens = tokenize(&args, &|kind, name| {
+            kind == TokenKind::Long && name == "grep"
+        });
+
+        assert_eq!(tokens[0].kind, TokenKind::Long);
+        assert_eq!(tokens[0].text, "grep");
+        assert_eq!(
+            tokens[0].linked, None,
+            "--grep must not claim -- as its value"
+        );
+        assert_eq!(tokens[1].kind, TokenKind::DashDash);
+        assert_eq!(tokens[2].kind, TokenKind::Positional);
+        assert_eq!(tokens[2].text, "pattern");
+    }
+
+    #[test]
+    fn value_taking_short_flag_never_swallows_the_unseen_boundary_dashdash() {
+        let args = owned(&["-A", "--", "pattern"]);
+        let takes = |kind: TokenKind, name: &str| kind == TokenKind::Short && name == "A";
+        let tokens = tokenize(&args, &takes);
+
+        assert_eq!(tokens[0].kind, TokenKind::Short);
+        assert_eq!(tokens[0].text, "A");
+        assert_eq!(tokens[0].linked, None, "-A must not claim -- as its value");
+        assert_eq!(tokens[1].kind, TokenKind::DashDash);
+        assert_eq!(tokens[2].text, "pattern");
+    }
+
+    #[test]
+    fn value_taking_flag_may_consume_a_dashdash_after_the_boundary_was_already_emitted() {
+        // Once past the boundary, a further "--" is ordinary text and fair game as a value --
+        // verified against real git: `git log -- -- pattern` succeeds (both are pathspecs).
+        // Msbuild is the dialect that keeps classifying flags after the boundary, so it's the
+        // one where a flag could even encounter a second "--" as its candidate value.
+        let args = owned(&["--", "--logger", "--"]);
+        let takes = |kind: TokenKind, name: &str| kind == TokenKind::Long && name == "logger";
+        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &takes);
+
+        assert_eq!(tokens[0].kind, TokenKind::DashDash);
+        assert_eq!(tokens[1].kind, TokenKind::Long);
+        assert_eq!(tokens[1].text, "logger");
+        assert_eq!(
+            tokens[1].linked,
+            Some(2),
+            "-- after the boundary was already emitted is just text, and --logger may claim it"
+        );
+        assert_eq!(tokens[2].kind, TokenKind::Positional);
+        assert_eq!(tokens[2].text, "--");
     }
 
     #[test]
