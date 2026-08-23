@@ -116,6 +116,18 @@ fn flag_name_matches(text: &str, name: &str, dialect: Dialect) -> bool {
     }
 }
 
+/// Index into `tokens` of the `--` boundary, if one was emitted (see [`TokenKind::DashDash`]).
+/// `tokens[i].source_index` recovers its position in the original args slice, for a caller that
+/// needs to insert/compare against raw arg indices rather than the token vec's own index.
+pub fn dashdash_index(tokens: &[Token<'_>]) -> Option<usize> {
+    tokens.iter().position(|t| t.kind == TokenKind::DashDash)
+}
+
+/// True if `tokens` has a `--` boundary at all.
+pub fn has_dashdash(tokens: &[Token<'_>]) -> bool {
+    dashdash_index(tokens).is_some()
+}
+
 /// True if `name` (matched per `dialect`) appears as a `Long` token anywhere in `tokens`.
 ///
 /// Under `Dialect::Msbuild`, this deliberately matches `-flag`/`--flag`/`/flag` uniformly —

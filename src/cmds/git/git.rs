@@ -1721,7 +1721,7 @@ fn checkout_takes_value(kind: TokenKind, name: &str) -> bool {
 }
 
 fn checkout_restored_count(tokens: &[Token<'_>]) -> Option<usize> {
-    let separator = tokens.iter().position(|t| t.kind == TokenKind::DashDash)?;
+    let separator = arg_tokenizer::dashdash_index(tokens)?;
     let count = tokens[separator + 1..]
         .iter()
         .filter(|t| !t.text.is_empty())
@@ -1745,7 +1745,7 @@ fn checkout_reset_branch_arg<'a>(tokens: &[Token<'a>]) -> Option<&'a str> {
 }
 
 fn checkout_branch_arg<'a>(tokens: &[Token<'a>]) -> Option<&'a str> {
-    if tokens.iter().any(|t| t.kind == TokenKind::DashDash) {
+    if arg_tokenizer::has_dashdash(tokens) {
         return None;
     }
     tokens

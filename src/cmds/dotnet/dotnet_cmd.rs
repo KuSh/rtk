@@ -710,10 +710,7 @@ fn detect_test_runner_mode_in_dir(tokens: &[Token<'_>], scan_dir: &Path) -> Test
     // a forwarding boundary, not an end-of-options marker -- see TokenKind::DashDash's docs), so
     // they're never candidate project paths even if one coincidentally ends in a project
     // extension (e.g. `dotnet test -- FullyQualifiedName~Foo.csproj`).
-    let boundary = tokens
-        .iter()
-        .find(|t| t.kind == TokenKind::DashDash)
-        .map(|t| t.source_index);
+    let boundary = arg_tokenizer::dashdash_index(tokens).map(|i| tokens[i].source_index);
 
     // Only unconsumed Positional tokens before that boundary are candidate project paths --
     // scanning raw args (or token text generally) would also match a value-taking flag's own
@@ -891,10 +888,7 @@ fn has_report_trx_arg(tokens: &[Token<'_>]) -> bool {
 /// Injects `--report-trx` after the `--` separator in `args`.
 /// If no `--` separator exists, appends `-- --report-trx` at the end.
 fn inject_report_trx_into_args(args: &[String], tokens: &[Token<'_>]) -> Vec<String> {
-    let sep = tokens
-        .iter()
-        .find(|t| t.kind == TokenKind::DashDash)
-        .map(|t| t.source_index);
+    let sep = arg_tokenizer::dashdash_index(tokens).map(|i| tokens[i].source_index);
     if let Some(sep) = sep {
         let mut result = args.to_vec();
         result.insert(sep + 1, "--report-trx".to_string());
