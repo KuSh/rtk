@@ -126,7 +126,7 @@ fn run_diff(
     // Check if user wants a raw-shaped diff output. Shares git log's value-taking-flag predicate
     // (log_takes_value) and shape-flag predicate (requests_raw_diff_shape): `diff` uses the same
     // diff option grammar.
-    let tokens = arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value);
+    let tokens = git_log_tokens(args);
     let wants_stat = tokens.iter().any(requests_raw_diff_shape);
 
     // Check if user wants compact diff (default RTK behavior). --no-compact is RTK's own
@@ -235,7 +235,7 @@ fn run_show(
     // If user wants a raw-shaped diff or --format only, pass through. Shares git log's
     // value-taking-flag predicate (log_takes_value) and shape-flag predicate
     // (requests_raw_diff_shape): `show` uses the same diff/log option grammar.
-    let tokens = arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value);
+    let tokens = git_log_tokens(args);
     let wants_stat_only = tokens.iter().any(requests_raw_diff_shape);
 
     let wants_format = tokens
@@ -840,7 +840,7 @@ fn run_log(
     // check, the flag-presence checks, and the limit parsing, and a value belonging to
     // --grep/--author/etc. (e.g. `--grep --pretty`) must not be misread as one of the flags
     // below.
-    let tokens = arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value);
+    let tokens = git_log_tokens(args);
 
     if tokens.iter().any(requests_raw_diff_shape) {
         let passthrough_args: Vec<OsString> = std::iter::once(OsString::from("log"))
@@ -1007,13 +1007,20 @@ fn log_takes_value(kind: TokenKind, name: &str) -> bool {
     }
 }
 
+/// Tokenizes `args` with git log/diff/show's shared value-taking-flag predicates
+/// (log_takes_value/log_takes_separate_value), reused by run_log/run_diff/run_show/run_stash
+/// and their test helpers instead of each repeating the same `tokenize_git(...)` call.
+fn git_log_tokens(args: &[String]) -> Vec<Token<'_>> {
+    arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value)
+}
+
 /// Filters `args` down to the tokens that are actual flags (dash-free flag
 /// name, e.g. "grep" not "--grep"), dropping every token consumed as a value
 /// by the preceding option. Test-only convenience wrapper; `run_log` shares
 /// a single [`arg_tokenizer::tokenize`] call directly instead.
 #[cfg(test)]
 fn real_flag_args(args: &[String]) -> Vec<&str> {
-    arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value)
+    git_log_tokens(args)
         .iter()
         .filter(|t| matches!(t.kind, TokenKind::Long | TokenKind::Short))
         .map(|t| t.text)
@@ -1050,7 +1057,7 @@ fn requests_raw_diff_shape(token: &Token<'_>) -> bool {
 /// [`requests_raw_diff_shape`] directly instead, to avoid tokenizing `args` twice.
 #[cfg(test)]
 fn requests_raw_log_output(args: &[String]) -> bool {
-    arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value)
+    git_log_tokens(args)
         .iter()
         .any(requests_raw_diff_shape)
 }
@@ -1061,7 +1068,7 @@ fn requests_raw_log_output(args: &[String]) -> bool {
 /// instead; this convenience wrapper exists for tests.
 #[cfg(test)]
 fn parse_user_limit(args: &[String]) -> Option<usize> {
-    parse_limit_from_tokens(&arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value))
+    parse_limit_from_tokens(&git_log_tokens(args))
 }
 
 /// True if the user explicitly requested a commit-count limit (-N, -n N, --max-count=N,
@@ -2278,7 +2285,7 @@ fn format_stash_message(subcommand: Option<&str>, result: &CaptureResult) -> Str
 /// patch-mode flags matter here, not the full requests_raw_diff_shape list: --stat et al.
 /// correctly stay on the compact_stash_stat branch, not compact_diff.
 fn stash_show_wants_patch(args: &[String]) -> bool {
-    let tokens = arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value);
+    let tokens = git_log_tokens(args);
     tokens.iter().any(|t| match t.kind {
         TokenKind::Long => t.text == "patch",
         TokenKind::Short => matches!(t.text, "p" | "u"),
@@ -4124,12 +4131,12 @@ A  added.rs
         // would then believe the user explicitly set a commit-count limit (skipping its own
         // --no-merges default) even though no value was ever actually captured.
         let args = vec!["-cn".to_string(), "2".to_string()];
-        let tokens = arg_tokenizer::tokenize_git(&args, &log_takes_value, &log_takes_separate_value);
+        let tokens = git_log_tokens(&args);
         assert!(!has_limit_flag(&tokens));
 
         // The bare, standalone form still counts.
         let args = vec!["-n".to_string(), "2".to_string()];
-        let tokens = arg_tokenizer::tokenize_git(&args, &log_takes_value, &log_takes_separate_value);
+        let tokens = git_log_tokens(&args);
         assert!(has_limit_flag(&tokens));
     }
 
