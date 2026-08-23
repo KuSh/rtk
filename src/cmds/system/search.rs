@@ -179,7 +179,7 @@ fn extract_pattern_path<T: AsRef<str>>(
                 }
             }
             // A value consumed by a preceding flag is handled there instead.
-            TokenKind::Positional if t.linked.is_none() => {
+            TokenKind::Positional if t.is_free_positional() => {
                 positionals.push(t.text.to_string());
             }
             TokenKind::Short => {

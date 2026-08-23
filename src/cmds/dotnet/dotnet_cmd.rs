@@ -721,11 +721,7 @@ fn detect_test_runner_mode_in_dir(tokens: &[Token<'_>], scan_dir: &Path) -> Test
     // /tmp/MyResults.csproj`).
     let explicit_projects: Vec<&str> = tokens
         .iter()
-        .filter(|t| {
-            t.kind == TokenKind::Positional
-                && t.linked.is_none()
-                && boundary.is_none_or(|b| t.source_index < b)
-        })
+        .filter(|t| t.is_free_positional() && boundary.is_none_or(|b| t.source_index < b))
         .map(|t| t.text)
         .filter(|a| {
             let lower = a.to_ascii_lowercase();

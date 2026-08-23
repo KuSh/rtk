@@ -1750,7 +1750,7 @@ fn checkout_branch_arg<'a>(tokens: &[Token<'a>]) -> Option<&'a str> {
     }
     tokens
         .iter()
-        .find(|t| t.kind == TokenKind::Positional && t.linked.is_none())
+        .find(|t| t.is_free_positional())
         .map(|t| t.text)
 }
 
@@ -2041,7 +2041,7 @@ fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
     // independent positional branch name, so linked tokens are excluded.
     let has_positional_arg = tokens
         .iter()
-        .any(|t| t.kind == TokenKind::Positional && t.linked.is_none());
+        .any(|t| t.is_free_positional());
 
     // --show-current: passthrough with raw stdout (not "ok")
     if has_show_flag {

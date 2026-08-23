@@ -262,7 +262,7 @@ fn find_subcommand_index(args: &[String]) -> Option<usize> {
             // A bare "-" (e.g. a stdin placeholder) is unrecognized-flag-like, not a stopping
             // condition -- keep scanning past it, same as any other unrecognized `-`-prefixed
             // token, instead of treating it as "no subcommand found."
-            TokenKind::Positional if token.linked.is_none() && token.text != "-" => {
+            TokenKind::Positional if token.is_free_positional() && token.text != "-" => {
                 return is_golangci_subcommand(token.text).then_some(token.source_index);
             }
             _ => {}

@@ -81,6 +81,16 @@ impl<'a> Token<'a> {
         self.attached
             .or_else(|| self.linked.map(|idx| tokens[idx].text))
     }
+
+    /// True for a genuine free-standing positional: `Positional` kind, and not itself consumed
+    /// as some preceding flag's separate-token value (`Token::linked`). A value consumed that
+    /// way belongs to its owning flag, not to whatever question the caller is asking about
+    /// positionals (e.g. "is there a branch name to create", "is there an explicit project
+    /// path") -- callers across `git.rs`/`golangci_cmd.rs`/`search.rs` each answered this
+    /// identically by hand before this method existed.
+    pub fn is_free_positional(&self) -> bool {
+        self.kind == TokenKind::Positional && self.linked.is_none()
+    }
 }
 
 /// True if `text` is a non-empty run of ASCII digits, e.g. a `Short` token's text for `-20`
