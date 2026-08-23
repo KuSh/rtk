@@ -1,6 +1,6 @@
 //! Filters git output — log, status, diff, and more — keeping just the essential info.
 
-use crate::core::arg_tokenizer::{self, Token, TokenKind};
+use crate::core::arg_tokenizer::{self, is_digit_run, Token, TokenKind};
 use crate::core::args_utils;
 use crate::core::guard::never_worse;
 use crate::core::runner::{self, RunOptions};
@@ -993,10 +993,6 @@ fn real_flag_args(args: &[String]) -> Vec<&str> {
         .filter(|t| matches!(t.kind, TokenKind::Long | TokenKind::Short))
         .map(|t| t.text)
         .collect()
-}
-
-fn is_digit_run(text: &str) -> bool {
-    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// True for git log/diff flags that change the *shape* of git's raw output

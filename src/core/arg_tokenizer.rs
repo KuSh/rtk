@@ -90,6 +90,15 @@ impl<'a> Token<'a> {
 /// `/NoLogo` are equally valid). `text` can't be case-folded once at tokenize time without
 /// giving up `Token`'s zero-copy `&'a str` (there's no borrowed "lowercased" view), so instead
 /// every dialect-aware lookup goes through this and [`has_flag`]/[`double_dash_flag_value`].
+/// True if `text` is a non-empty run of ASCII digits, e.g. a `Short` token's text for `-20`
+/// (git/head/tail's `-N` count shorthand — see [`TokenKind::Short`]). Exposed so callers that
+/// need to tell "this Short token is a digit-run flag" from "this Short token is a single
+/// boolean-flag letter" don't re-derive the same predicate the tokenizer itself already used to
+/// decide clustering.
+pub fn is_digit_run(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn flag_name_matches(text: &str, name: &str, dialect: Dialect) -> bool {
     match dialect {
         Dialect::Msbuild => text.eq_ignore_ascii_case(name),
@@ -310,7 +319,7 @@ pub fn tokenize_dialect<'a, T: AsRef<str>>(
         } else if arg.len() > 1 && arg.starts_with('-') {
             let cluster = &arg[1..];
 
-            if cluster.bytes().all(|b| b.is_ascii_digit()) {
+            if is_digit_run(cluster) {
                 tokens.push(Token {
                     kind: TokenKind::Short,
                     text: cluster,
