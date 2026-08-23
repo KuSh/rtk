@@ -125,7 +125,7 @@ fn run_diff(
 
     // Check if user wants stat output. Shares git log's value-taking-flag predicate
     // (log_takes_value): `diff` uses the same diff option grammar.
-    let tokens = arg_tokenizer::tokenize(args, &log_takes_value);
+    let tokens = arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value);
     let wants_stat = tokens.iter().any(|t| {
         t.kind == TokenKind::Long && matches!(t.text, "numstat" | "shortstat" | "stat")
     });
@@ -235,7 +235,7 @@ fn run_show(
 
     // If user wants --stat or --format only, pass through. Shares git log's value-taking-flag
     // predicate (log_takes_value): `show` uses the same diff/log option grammar.
-    let tokens = arg_tokenizer::tokenize(args, &log_takes_value);
+    let tokens = arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value);
     let wants_stat_only = tokens.iter().any(|t| {
         t.kind == TokenKind::Long && matches!(t.text, "numstat" | "shortstat" | "stat")
     });
@@ -842,7 +842,7 @@ fn run_log(
     // check, the flag-presence checks, and the limit parsing, and a value belonging to
     // --grep/--author/etc. (e.g. `--grep --pretty`) must not be misread as one of the flags
     // below.
-    let tokens = arg_tokenizer::tokenize(args, &log_takes_value);
+    let tokens = arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value);
 
     if tokens.iter().any(requests_raw_diff_shape) {
         let passthrough_args: Vec<OsString> = std::iter::once(OsString::from("log"))
@@ -940,6 +940,23 @@ fn run_log(
 /// the corresponding boolean flag. Passed to [`arg_tokenizer::tokenize`]
 /// as its value predicate; `--max-count` lives here too rather than as a
 /// bolted-on special case, since it's the same question for every caller.
+/// Which of `log_takes_value`'s `Short` flags may consume a separate next-token value, passed to
+/// [`arg_tokenizer::tokenize_git`]. `is_solo` is true only when the flag is the entire arg on its
+/// own (`-n`), false when clustered with anything else (`-cn`'s `n`). Confirmed against real git:
+/// `-n`/`-l` accept a separate-token value only when solo (`-n 2` works, `-cn 2` fails with
+/// "ambiguous argument"); `-M`/`-U`/`-C`/`-B` never do, solo or clustered (`git log -U 3` fails
+/// the same way). `-G`/`-I`/`-O`/`-S` are left at their pre-existing "always eligible" behavior
+/// (unconditionally `true`, matching how this predicate worked before `-n`/`-l`/`-M`/`-U`/`-C`/`-B`
+/// needed the distinction) since no bug was found in their handling and re-deriving their exact
+/// clustering behavior wasn't part of this fix.
+fn log_takes_separate_value(name: &str, is_solo: bool) -> bool {
+    match name {
+        "B" | "C" | "M" | "U" => false,
+        "l" | "n" => is_solo,
+        _ => true,
+    }
+}
+
 fn log_takes_value(kind: TokenKind, name: &str) -> bool {
     match kind {
         TokenKind::Long => matches!(
@@ -984,7 +1001,14 @@ fn log_takes_value(kind: TokenKind, name: &str) -> bool {
                 | "word-diff-regex"
                 | "ws-error-highlight"
         ),
-        TokenKind::Short => matches!(name, "G" | "I" | "L" | "O" | "S" | "l" | "n"),
+        // -M/-U/-C/-B take an OPTIONAL attached numeric value ("-M50", never a separate token --
+        // confirmed against real git that even `git log -M 50` fails, treating "50" as an
+        // unrelated revision). Marking them here fixes a real bug: without it, a glued form like
+        // "-M50" had no recognized value-taking char in its cluster, so it decomposed into
+        // per-char Short tokens "M"/"5"/"0" instead of one "M" token with attached "50" -- and
+        // those stray digit tokens were then misread by has_limit_flag/parse_limit_from_tokens as
+        // if a bare "-5" limit flag had been passed.
+        TokenKind::Short => matches!(name, "B" | "C" | "G" | "I" | "L" | "M" | "O" | "S" | "U" | "l" | "n"),
         _ => false,
     }
 }
@@ -995,7 +1019,7 @@ fn log_takes_value(kind: TokenKind, name: &str) -> bool {
 /// a single [`arg_tokenizer::tokenize`] call directly instead.
 #[cfg(test)]
 fn real_flag_args(args: &[String]) -> Vec<&str> {
-    arg_tokenizer::tokenize(args, &log_takes_value)
+    arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value)
         .iter()
         .filter(|t| matches!(t.kind, TokenKind::Long | TokenKind::Short))
         .map(|t| t.text)
@@ -1032,7 +1056,7 @@ fn requests_raw_diff_shape(token: &Token<'_>) -> bool {
 /// [`requests_raw_diff_shape`] directly instead, to avoid tokenizing `args` twice.
 #[cfg(test)]
 fn requests_raw_log_output(args: &[String]) -> bool {
-    arg_tokenizer::tokenize(args, &log_takes_value)
+    arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value)
         .iter()
         .any(requests_raw_diff_shape)
 }
@@ -1043,7 +1067,7 @@ fn requests_raw_log_output(args: &[String]) -> bool {
 /// instead; this convenience wrapper exists for tests.
 #[cfg(test)]
 fn parse_user_limit(args: &[String]) -> Option<usize> {
-    parse_limit_from_tokens(&arg_tokenizer::tokenize(args, &log_takes_value))
+    parse_limit_from_tokens(&arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value))
 }
 
 fn parse_limit_from_tokens(tokens: &[Token<'_>]) -> Option<usize> {
@@ -4013,6 +4037,45 @@ A  added.rs
                 "a real -p after {opt} should still request raw output"
             );
         }
+    }
+
+    #[test]
+    fn test_glued_diff_shape_short_flag_is_not_misread_as_a_limit() {
+        // Regression: -M/-C/-B/-U take only an attached optional numeric value ("-M50"), never a
+        // separate token (confirmed above and via Docker-free real-git checks in this fix's
+        // commit message). Before -M/-U/-C/-B were added to log_takes_value, none of their
+        // letters were recognized as taking a value at all, so a glued form like "-M50" had no
+        // value-taking char in its cluster and decomposed into per-char Short tokens
+        // "M"/"5"/"0" -- the stray "5" token then passed is_digit_run and was misread by
+        // parse_limit_from_tokens as if a bare "-5" limit flag had been passed.
+        for glued in ["-M50", "-C5", "-B10", "-U3"] {
+            let args = vec![glued.to_string()];
+            assert_eq!(
+                parse_user_limit(&args),
+                None,
+                "{glued} must not be misread as a commit-count limit"
+            );
+        }
+    }
+
+    #[test]
+    fn test_clustered_short_flag_does_not_consume_separate_value() {
+        // Regression: confirmed against real git 2.51 that `git log -n 2` succeeds (bare -n
+        // consumes the separate "2"), but `git log -cn 2` fails with "ambiguous argument '2'" --
+        // clustered with another short flag, -n's value is only the (empty) remainder of the
+        // same arg, never the next token. Before log_takes_separate_value's is_solo gating, the
+        // tokenizer consumed "2" as -n's linked value regardless of clustering, so RTK's own
+        // parse_limit_from_tokens would wrongly believe the user set an explicit limit of 2.
+        let args = vec!["-cn".to_string(), "2".to_string()];
+        assert_eq!(
+            parse_user_limit(&args),
+            None,
+            "-n clustered with -c must not consume \"2\" as its value"
+        );
+
+        // The bare, standalone form must still work as documented.
+        let args = vec!["-n".to_string(), "2".to_string()];
+        assert_eq!(parse_user_limit(&args), Some(2));
     }
 
     #[test]

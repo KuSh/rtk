@@ -206,6 +206,32 @@ pub fn tokenize<'a, T: AsRef<str>>(
     tokenize_dialect(args, Dialect::Posix, takes_value)
 }
 
+/// Like [`tokenize`], but for tools (git specifically) whose value-taking `Short` flags don't
+/// uniformly support a separate-token value the way [`tokenize`]'s default assumes. Real git has
+/// two different behaviors that don't fit a single boolean:
+///
+/// - `-n`/`-l` (`--max-count`/rename-detection-cost shorthand) accept a separate-token value, but
+///   *only* when written as their own standalone arg -- confirmed against real git 2.51: `git log
+///   -n 2` succeeds, but `git log -cn 2` (clustered with `-c`) fails with "ambiguous argument
+///   '2'": clustered, `-n`'s value is the (empty) remainder of the same arg, never the next token.
+///   Grep doesn't share this restriction (`grep -im 2 pattern file` works clustered), so it isn't
+///   folded into [`tokenize`]'s default.
+/// - `-M`/`-U`/`-C`/`-B` (rename/copy/context-detection shorthand) accept *only* an attached value
+///   (`-M50`) and never a separate token at all, standalone or clustered -- confirmed against real
+///   git that even the standalone form `git log -U 3` fails ("ambiguous argument '3'").
+///
+/// `takes_separate_value(name, is_solo)` answers "may this `Short` flag consume a separate
+/// next-token value here" for a flag `takes_value` already said takes *some* value with an empty
+/// same-arg remainder; `is_solo` is true only when the flag is the entire arg on its own (e.g.
+/// `-n`), false when clustered with anything else (e.g. the `n` in `-cn`).
+pub fn tokenize_git<'a, T: AsRef<str>>(
+    args: &'a [T],
+    takes_value: &dyn Fn(TokenKind, &str) -> bool,
+    takes_separate_value: &dyn Fn(&str, bool) -> bool,
+) -> Vec<Token<'a>> {
+    tokenize_dialect_ex(args, Dialect::Posix, takes_value, takes_separate_value)
+}
+
 /// Like [`tokenize`], but lets the caller pick a [`Dialect`] instead of assuming POSIX
 /// conventions.
 ///
@@ -221,6 +247,18 @@ pub fn tokenize_dialect<'a, T: AsRef<str>>(
     args: &'a [T],
     dialect: Dialect,
     takes_value: &dyn Fn(TokenKind, &str) -> bool,
+) -> Vec<Token<'a>> {
+    tokenize_dialect_ex(args, dialect, takes_value, &|_name, _is_solo| true)
+}
+
+/// Core implementation shared by [`tokenize_dialect`] and [`tokenize_git`]. See [`tokenize_git`]
+/// for `takes_separate_value`'s contract; [`tokenize_dialect`] passes `|_, _| true`, preserving
+/// its original "always eligible" behavior for every existing caller.
+fn tokenize_dialect_ex<'a, T: AsRef<str>>(
+    args: &'a [T],
+    dialect: Dialect,
+    takes_value: &dyn Fn(TokenKind, &str) -> bool,
+    takes_separate_value: &dyn Fn(&str, bool) -> bool,
 ) -> Vec<Token<'a>> {
     let mut tokens: Vec<Token<'a>> = Vec::with_capacity(args.len());
     let mut i = 0;
@@ -365,13 +403,19 @@ pub fn tokenize_dialect<'a, T: AsRef<str>>(
                     if !remainder.is_empty() {
                         tokens[flag_index].attached = Some(remainder);
                     } else {
-                        consumed_next = link_next_value(
-                            &mut tokens,
-                            args,
-                            flag_index,
-                            i + 1,
-                            emitted_dash_dash,
-                        );
+                        // is_solo: offset == 0 with an empty remainder means this char is the
+                        // *entire* cluster (the arg was e.g. just "-n"); a later offset, or any
+                        // remainder, means it's genuinely clustered with something else.
+                        let is_solo = offset == 0;
+                        if takes_separate_value(char_text, is_solo) {
+                            consumed_next = link_next_value(
+                                &mut tokens,
+                                args,
+                                flag_index,
+                                i + 1,
+                                emitted_dash_dash,
+                            );
+                        }
                     }
                     break;
                 }
