@@ -10,6 +10,14 @@
 //! `tokenize` centralizes the classification; callers keep their own list of which flags take a
 //! value (that part is inherently per-tool) but pass it in as a predicate instead of
 //! reimplementing the token-walking around it.
+//!
+//! Deliberately *not* merged with `restore_double_dash`, even though every caller has to do
+//! both in sequence: `restore_double_dash` needs both the clap-parsed args and the raw process
+//! argv to detect what clap's `trailing_var_arg` stripped, and its restored result has to be an
+//! owned `Vec<String>` the caller holds in its own `let` binding — `Token<'a>` borrows straight
+//! from `args`, so tokenizing a `Vec<String>` built *inside* this module (from a hypothetical
+//! internal `restore_double_dash` call) would tie every `Token` to a value that's dropped when
+//! the function returns. Same root cause as why this module doesn't build on `clap_lex`.
 
 /// What kind of unit a [`Token`] represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,8 +146,8 @@ pub enum Dialect {
 /// Never panics and never fails to classify: a value-taking flag with nothing left to consume
 /// simply gets `attached: None, linked: None`, matching RTK's fallback/never-block-the-user
 /// convention.
-pub fn tokenize<'a>(
-    args: &'a [String],
+pub fn tokenize<'a, T: AsRef<str>>(
+    args: &'a [T],
     takes_value: &dyn Fn(TokenKind, &str) -> bool,
 ) -> Vec<Token<'a>> {
     tokenize_dialect(args, Dialect::Posix, takes_value)
@@ -147,8 +155,17 @@ pub fn tokenize<'a>(
 
 /// Like [`tokenize`], but lets the caller pick a [`Dialect`] instead of assuming POSIX
 /// conventions.
-pub fn tokenize_dialect<'a>(
-    args: &'a [String],
+///
+/// Generic over `T: AsRef<str>` so a caller can pass either `&[String]` (the common case,
+/// e.g. already-owned args from [`crate::core::args_utils::restore_double_dash`]) or `&[&str]`
+/// (handy for tests) without cloning either way — `Token` still borrows straight from `args`,
+/// zero-copy. Not generic over `OsStr`/`OsString`: unlike `str`, `OsStr` exposes almost no
+/// string-manipulation API by design (no `strip_prefix`, `split_once`, char-boundary slicing),
+/// so tokenizing it would mean re-deriving that machinery byte-by-byte the way `clap_lex` does
+/// internally — a much bigger change for a case rtk doesn't hit today (its own CLI parsing
+/// already assumes UTF-8 args for every subcommand this module serves).
+pub fn tokenize_dialect<'a, T: AsRef<str>>(
+    args: &'a [T],
     dialect: Dialect,
     takes_value: &dyn Fn(TokenKind, &str) -> bool,
 ) -> Vec<Token<'a>> {
@@ -158,7 +175,7 @@ pub fn tokenize_dialect<'a>(
     let mut emitted_dash_dash = false;
 
     while i < args.len() {
-        let arg = args[i].as_str();
+        let arg = args[i].as_ref();
 
         if seen_dash_dash {
             tokens.push(positional(arg, i));
@@ -249,7 +266,7 @@ pub fn tokenize_dialect<'a>(
                         let value_index = tokens.len();
                         tokens.push(Token {
                             linked: Some(flag_index),
-                            ..positional(next.as_str(), i + 1)
+                            ..positional(next.as_ref(), i + 1)
                         });
                         tokens[flag_index].linked = Some(value_index);
                         consumed_next = true;
@@ -273,9 +290,9 @@ pub fn tokenize_dialect<'a>(
 /// `-flag`/`/flag` in [`Dialect::Msbuild`] — splitting off an attached value per `dialect` and,
 /// absent one, consulting `takes_value` to maybe consume the next whole token as a separate
 /// value. `rest` is the flag text with its prefix (`--`, `-`, or `/`) already stripped.
-fn push_atomic_flag<'a>(
+fn push_atomic_flag<'a, T: AsRef<str>>(
     tokens: &mut Vec<Token<'a>>,
-    args: &'a [String],
+    args: &'a [T],
     i: &mut usize,
     rest: &'a str,
     dialect: Dialect,
@@ -298,7 +315,7 @@ fn push_atomic_flag<'a>(
             let value_index = tokens.len();
             tokens.push(Token {
                 linked: Some(flag_index),
-                ..positional(next.as_str(), *i)
+                ..positional(next.as_ref(), *i)
             });
             tokens[flag_index].linked = Some(value_index);
             *i += 1;

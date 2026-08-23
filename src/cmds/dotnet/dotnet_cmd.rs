@@ -782,11 +782,10 @@ fn has_trx_logger_arg(args: &[String]) -> bool {
     // --logger can legitimately repeat (e.g. `--logger "console;verbosity=normal" --logger
     // trx`), so every occurrence must be checked, not just the first.
     let tokens = dotnet_tokens(args);
-    let has_trx = arg_tokenizer::flag_values(&tokens, Dialect::Msbuild, "logger").any(|value| {
+    return arg_tokenizer::flag_values(&tokens, Dialect::Msbuild, "logger").any(|value| {
         let lower = value.to_ascii_lowercase();
         lower == "trx" || lower.starts_with("trx;")
     });
-    has_trx
 }
 
 fn has_results_directory_arg(args: &[String]) -> bool {

@@ -3820,6 +3820,21 @@ A  added.rs
     }
 
     #[test]
+    fn test_parse_user_limit_malformed_combined_digit_run() {
+        // "-5x" isn't a valid git log limit (git itself rejects it: `git log -5x` fails with
+        // "fatal: '5x': not an integer", verified against real git 2.51). The tokenizer's
+        // digit-run rule only looks at the leading digit run ("5"), so this now parses as 5
+        // rather than failing outright the way the pre-arg_tokenizer whole-string parse did
+        // (which required all of "5x" to parse as a number and returned None on failure).
+        // This is intentionally left as-is, not "fixed": run_log bails out on
+        // `!result.success()` before ever using `limit`/`user_set_limit` for formatting, since
+        // real git rejects "-5x" outright -- so this value is computed but never observably
+        // used either way.
+        let args: Vec<String> = vec!["-5x".into()];
+        assert_eq!(parse_user_limit(&args), Some(5));
+    }
+
+    #[test]
     fn test_patch_log_flags_request_raw_output() {
         for flag in [
             "-p",

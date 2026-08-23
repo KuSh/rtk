@@ -213,6 +213,31 @@ fn git_log_dash_p_pathspec_after_double_dash_is_not_patch_flag() {
 }
 
 #[test]
+fn git_log_malformed_digit_run_propagates_real_git_error() {
+    // "-5x" isn't a valid git log limit; real git rejects it outright ("fatal: '5x': not an
+    // integer", verified against git 2.51). run_log's internal limit-parsing for this
+    // malformed input differs before/after arg_tokenizer (5 vs the old fallback of 10), but
+    // that's never observable here: run_log bails out on the real git failure before ever
+    // reaching the formatting code that would use it.
+    let dir = init_git_repo();
+
+    let raw = Command::new("git")
+        .args(["log", "-5x"])
+        .current_dir(dir.path())
+        .output()
+        .expect("spawn raw git log");
+    assert!(!raw.status.success(), "expected real git to reject -5x");
+
+    let (_, rtk_stderr, rtk_code) = rtk_output_in_dir(dir.path(), &["git", "log", "-5x"]);
+
+    assert_eq!(rtk_code, raw.status.code());
+    assert!(
+        rtk_stderr.contains("not an integer"),
+        "rtk should surface git's own error verbatim: {rtk_stderr:?}"
+    );
+}
+
+#[test]
 fn git_stash_show_no_stash_emits_empty_and_propagates_failure() {
     // Regression: previously printed "Empty stash" and returned Ok(0), masking
     // the underlying `git stash show` failure.
