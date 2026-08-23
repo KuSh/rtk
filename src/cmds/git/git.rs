@@ -1954,9 +1954,16 @@ fn run_pull(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32>
 }
 
 fn branch_takes_value(kind: TokenKind, name: &str) -> bool {
-    // -c/-C/-m/-M/-d/-D/-u are followed by positional branch names, not a "flag value" in the
-    // attached/separate-value sense, so only these Long options consume a value here.
-    kind == TokenKind::Long && matches!(name, "set-upstream-to" | "points-at" | "sort" | "format")
+    // -c/-C/-m/-M/-d/-D are followed by positional branch names, not a "flag value" in the
+    // attached/separate-value sense, so they're excluded here. -u IS a genuine value-taking flag
+    // (its short form takes the same single upstream-ref value as --set-upstream-to) and must be
+    // included alongside its long form, or `git branch -u origin/main` leaves "origin/main" as
+    // an unlinked Positional token instead of -u's linked value.
+    match kind {
+        TokenKind::Long => matches!(name, "format" | "points-at" | "set-upstream-to" | "sort"),
+        TokenKind::Short => name == "u",
+        _ => false,
+    }
 }
 
 fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32> {
@@ -1998,8 +2005,12 @@ fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
         _ => false,
     });
 
-    // Detect positional arguments (not flags) — indicates branch creation
-    let has_positional_arg = tokens.iter().any(|t| t.kind == TokenKind::Positional);
+    // Detect positional arguments (not flags) — indicates branch creation. A value consumed by
+    // a preceding flag (e.g. -u/--set-upstream-to's upstream ref) is that flag's value, not an
+    // independent positional branch name, so linked tokens are excluded.
+    let has_positional_arg = tokens
+        .iter()
+        .any(|t| t.kind == TokenKind::Positional && t.linked.is_none());
 
     // --show-current: passthrough with raw stdout (not "ok")
     if has_show_flag {
@@ -2600,6 +2611,26 @@ pub fn run_passthrough(args: &[OsString], global_args: &[String], verbose: u8) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_branch_dash_u_links_its_upstream_value_not_a_free_positional() {
+        // Regression: -u's short form was missing from branch_takes_value (only its long form
+        // --set-upstream-to was included), so `git branch -u origin/main` left "origin/main" as
+        // an unlinked Positional token instead of -u's linked value. Currently masked in
+        // run_branch's own has_action_flag/has_positional_arg decision (short "u" is already
+        // matched independently by has_action_flag), but the token classification itself was
+        // still wrong and would misfire for any future code consuming these tokens directly.
+        let args = vec!["-u".to_string(), "origin/main".to_string()];
+        let tokens = arg_tokenizer::tokenize(&args, &branch_takes_value);
+        assert_eq!(tokens[0].kind, TokenKind::Short);
+        assert_eq!(tokens[0].text, "u");
+        assert_eq!(tokens[0].value(&tokens), Some("origin/main"));
+        assert_eq!(tokens[1].kind, TokenKind::Positional);
+        assert!(
+            tokens[1].linked.is_some(),
+            "origin/main must be linked as -u's value, not a free-standing positional"
+        );
+    }
 
     #[test]
     fn test_checkout_new_branch_arg_accepts_glued_short_flag() {
