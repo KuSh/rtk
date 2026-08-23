@@ -797,7 +797,14 @@ fn dotnet_has_double_dash_flag(tokens: &[Token<'_>], name: &str) -> bool {
 }
 
 fn has_nologo_arg(tokens: &[Token<'_>]) -> bool {
-    dotnet_has_flag(tokens, "nologo")
+    // Unlike -v/-verbosity, -nologo is a pure boolean switch (confirmed via a real dotnet 9 SDK,
+    // Docker: `-nologo:true` fails with "MSB1002: This switch does not take any parameters").
+    // dotnet_has_flag alone ignores `attached`, so it would treat the broken "-nologo:true"
+    // spelling as "user already passed -nologo" and skip RTK's own injection while still
+    // forwarding the invalid flag through untouched.
+    tokens.iter().any(|t| {
+        t.kind == TokenKind::Long && t.attached.is_none() && t.text.eq_ignore_ascii_case("nologo")
+    })
 }
 
 fn has_trx_logger_arg(tokens: &[Token<'_>]) -> bool {
@@ -2786,6 +2793,27 @@ mod tests {
         let effective = build_effective_dotnet_format_args(&args, &tokens, None);
         assert!(!effective.iter().any(|a| a == "--write"));
         assert!(!effective.iter().any(|a| a == "--verify-no-changes"));
+    }
+
+    #[test]
+    fn test_has_nologo_arg_rejects_attached_value() {
+        // Regression: -nologo is a pure boolean MSBuild.exe switch (confirmed via Docker: a real
+        // dotnet 9 SDK rejects "-nologo:true" with "MSB1002: This switch does not take any
+        // parameters"). has_nologo_arg used to match via the loose dotnet_has_flag lookup, which
+        // ignores `attached` entirely -- so it treated the broken "-nologo:true" spelling as
+        // "user already passed -nologo" and skipped RTK's own -nologo injection while still
+        // forwarding the invalid flag straight through to real dotnet.
+        let args = vec!["-nologo:true".to_string()];
+        let tokens = dotnet_tokens(&args);
+        assert!(!has_nologo_arg(&tokens));
+
+        // The bare boolean form (in any of its interchangeable legacy MSBuild spellings) still
+        // matches as documented.
+        for spelling in ["-nologo", "--nologo", "/nologo"] {
+            let args = vec![spelling.to_string()];
+            let tokens = dotnet_tokens(&args);
+            assert!(has_nologo_arg(&tokens), "{spelling} should be recognized");
+        }
     }
 
     #[test]
