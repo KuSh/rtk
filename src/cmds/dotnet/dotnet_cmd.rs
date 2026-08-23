@@ -41,13 +41,17 @@ pub fn run_format(args: &[String], verbose: u8) -> Result<i32> {
     // --report-trx: has_write_mode_override/build_effective_dotnet_format_args still need to
     // see the user's actual `--` if they passed one.
     let args = &args_utils::restore_double_dash(args);
+    // Tokenize once and share it: every has_*/extract_* check below (resolve_format_report_path,
+    // build_effective_dotnet_format_args, check_mode) reuses the same tokens instead of each
+    // re-tokenizing `args` from scratch.
+    let tokens = dotnet_tokens(args);
     let timer = tracking::TimedExecution::start();
-    let (report_path, cleanup_report_path) = resolve_format_report_path(args);
+    let (report_path, cleanup_report_path) = resolve_format_report_path(&tokens);
     let mut cmd = resolved_command("dotnet");
     cmd.env(DOTNET_CLI_UI_LANGUAGE, DOTNET_CLI_UI_LANGUAGE_VALUE);
     cmd.arg("format");
 
-    for arg in build_effective_dotnet_format_args(args, report_path.as_deref()) {
+    for arg in build_effective_dotnet_format_args(args, &tokens, report_path.as_deref()) {
         cmd.arg(arg);
     }
 
@@ -59,7 +63,7 @@ pub fn run_format(args: &[String], verbose: u8) -> Result<i32> {
     let result = exec_capture(&mut cmd).context("Failed to run dotnet format")?;
     let raw = format!("{}\n{}", result.stdout, result.stderr);
 
-    let check_mode = !has_write_mode_override(args);
+    let check_mode = !has_write_mode_override(&tokens);
     let filtered =
         format_report_summary_or_raw(report_path.as_deref(), check_mode, &raw, command_started_at);
     let shown = never_worse(&raw, &filtered);
@@ -124,20 +128,28 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
     // "the user passed -- but clap stripped it", and would append a spurious second `--
     // --report-trx` after the user's own `-- <filter expression>` instead of reusing it.
     let args = &args_utils::restore_double_dash(args);
+    // Tokenize once and share it: should_expect_binlog, resolve_trx_results_dir, and
+    // build_effective_dotnet_args's own several has_*_arg checks all reuse the same tokens
+    // instead of each re-tokenizing `args` from scratch.
+    let tokens = dotnet_tokens(args);
     let timer = tracking::TimedExecution::start();
     let binlog_path = build_binlog_path(subcommand);
-    let should_expect_binlog = subcommand != "test" || has_binlog_arg(args);
+    let should_expect_binlog = subcommand != "test" || has_binlog_arg(&tokens);
 
     // For test commands, prefer user-provided results directory; otherwise create isolated one.
-    let (trx_results_dir, cleanup_trx_results_dir) = resolve_trx_results_dir(subcommand, args);
+    let (trx_results_dir, cleanup_trx_results_dir) = resolve_trx_results_dir(subcommand, &tokens);
 
     let mut cmd = resolved_command("dotnet");
     cmd.env(DOTNET_CLI_UI_LANGUAGE, DOTNET_CLI_UI_LANGUAGE_VALUE);
     cmd.arg(subcommand);
 
-    for arg in
-        build_effective_dotnet_args(subcommand, args, &binlog_path, trx_results_dir.as_deref())
-    {
+    for arg in build_effective_dotnet_args(
+        subcommand,
+        args,
+        &tokens,
+        &binlog_path,
+        trx_results_dir.as_deref(),
+    ) {
         cmd.arg(arg);
     }
 
@@ -288,12 +300,12 @@ fn unique_temp_suffix() -> String {
     format!("{:x}{:x}{:x}", ts, pid, seq)
 }
 
-fn resolve_trx_results_dir(subcommand: &str, args: &[String]) -> (Option<PathBuf>, bool) {
+fn resolve_trx_results_dir(subcommand: &str, tokens: &[Token<'_>]) -> (Option<PathBuf>, bool) {
     if subcommand != "test" {
         return (None, false);
     }
 
-    if let Some(user_dir) = extract_results_directory_arg(args) {
+    if let Some(user_dir) = extract_results_directory_arg(tokens) {
         return (Some(user_dir), false);
     }
 
@@ -304,27 +316,31 @@ fn build_format_report_path() -> PathBuf {
     std::env::temp_dir().join(format!("rtk_dotnet_format_{}.json", unique_temp_suffix()))
 }
 
-fn resolve_format_report_path(args: &[String]) -> (Option<PathBuf>, bool) {
-    if let Some(user_report_path) = extract_report_arg(args) {
+fn resolve_format_report_path(tokens: &[Token<'_>]) -> (Option<PathBuf>, bool) {
+    if let Some(user_report_path) = extract_report_arg(tokens) {
         return (Some(user_report_path), false);
     }
 
     (Some(build_format_report_path()), true)
 }
 
-fn build_effective_dotnet_format_args(args: &[String], report_path: Option<&Path>) -> Vec<String> {
+fn build_effective_dotnet_format_args(
+    args: &[String],
+    tokens: &[Token<'_>],
+    report_path: Option<&Path>,
+) -> Vec<String> {
     let mut effective: Vec<String> = args
         .iter()
         .filter(|arg| !arg.eq_ignore_ascii_case("--write"))
         .cloned()
         .collect();
-    let force_write_mode = has_write_mode_override(args);
+    let force_write_mode = has_write_mode_override(tokens);
 
-    if !force_write_mode && !has_verify_no_changes_arg(args) {
+    if !force_write_mode && !has_verify_no_changes_arg(tokens) {
         effective.push("--verify-no-changes".to_string());
     }
 
-    if !has_report_arg(args) {
+    if !has_report_arg(tokens) {
         if let Some(path) = report_path {
             effective.push("--report".to_string());
             effective.push(path.display().to_string());
@@ -498,16 +514,17 @@ fn merge_test_summary_from_trx(
 fn build_effective_dotnet_args(
     subcommand: &str,
     args: &[String],
+    tokens: &[Token<'_>],
     binlog_path: &Path,
     trx_results_dir: Option<&Path>,
 ) -> Vec<String> {
     let mut effective = Vec::new();
 
-    if subcommand != "test" && !has_binlog_arg(args) {
+    if subcommand != "test" && !has_binlog_arg(tokens) {
         effective.push(format!("-bl:{}", binlog_path.display()));
     }
 
-    if subcommand != "test" && !has_verbosity_arg(args) {
+    if subcommand != "test" && !has_verbosity_arg(tokens) {
         effective.push("-v:minimal".to_string());
     }
 
@@ -519,18 +536,18 @@ fn build_effective_dotnet_args(
 
     // --nologo: skip for MtpNative — args pass directly to the MTP runtime which
     // does not understand MSBuild/VSTest flags.
-    if runner_mode != TestRunnerMode::MtpNative && !has_nologo_arg(args) {
+    if runner_mode != TestRunnerMode::MtpNative && !has_nologo_arg(tokens) {
         effective.push("-nologo".to_string());
     }
 
     if subcommand == "test" {
         match runner_mode {
             TestRunnerMode::Classic => {
-                if !has_trx_logger_arg(args) {
+                if !has_trx_logger_arg(tokens) {
                     effective.push("--logger".to_string());
                     effective.push("trx".to_string());
                 }
-                if !has_results_directory_arg(args) {
+                if !has_results_directory_arg(tokens) {
                     if let Some(results_dir) = trx_results_dir {
                         effective.push("--results-directory".to_string());
                         effective.push(results_dir.display().to_string());
@@ -542,7 +559,7 @@ fn build_effective_dotnet_args(
                 // In .NET 10 native MTP mode, --report-trx is a direct dotnet test flag.
                 // Modern MTP frameworks (TUnit 1.19.74+, MSTest, xUnit with MTP runner)
                 // include Microsoft.Testing.Extensions.TrxReport natively.
-                if !has_report_trx_arg(args) {
+                if !has_report_trx_arg(tokens) {
                     effective.push("--report-trx".to_string());
                 }
                 effective.extend(args.iter().cloned());
@@ -550,7 +567,7 @@ fn build_effective_dotnet_args(
             TestRunnerMode::MtpVsTestBridge => {
                 // In VsTestBridge mode (supported on .NET 9 SDK and earlier), --report-trx
                 // goes after the -- separator so it reaches the MTP runtime.
-                if !has_report_trx_arg(args) {
+                if !has_report_trx_arg(tokens) {
                     effective.extend(inject_report_trx_into_args(args));
                 } else {
                     effective.extend(args.iter().cloned());
@@ -564,23 +581,12 @@ fn build_effective_dotnet_args(
     effective
 }
 
-fn has_binlog_arg(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        let lower = arg.to_ascii_lowercase();
-        lower.starts_with("-bl") || lower.starts_with("/bl")
-    })
+fn has_binlog_arg(tokens: &[Token<'_>]) -> bool {
+    dotnet_has_flag(tokens, "bl")
 }
 
-fn has_verbosity_arg(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        let lower = arg.to_ascii_lowercase();
-        lower.starts_with("-v:")
-            || lower.starts_with("/v:")
-            || lower == "-v"
-            || lower == "/v"
-            || lower == "--verbosity"
-            || lower.starts_with("--verbosity=")
-    })
+fn has_verbosity_arg(tokens: &[Token<'_>]) -> bool {
+    dotnet_has_flag(tokens, "v") || dotnet_has_flag(tokens, "verbosity")
 }
 
 /// How the targeted test project(s) run tests — determines which TRX injection strategy to use.
@@ -774,30 +780,29 @@ fn dotnet_has_flag(tokens: &[Token<'_>], name: &str) -> bool {
     arg_tokenizer::has_flag(tokens, Dialect::Msbuild, name)
 }
 
-fn has_nologo_arg(args: &[String]) -> bool {
-    dotnet_has_flag(&dotnet_tokens(args), "nologo")
+fn has_nologo_arg(tokens: &[Token<'_>]) -> bool {
+    dotnet_has_flag(tokens, "nologo")
 }
 
-fn has_trx_logger_arg(args: &[String]) -> bool {
+fn has_trx_logger_arg(tokens: &[Token<'_>]) -> bool {
     // --logger can legitimately repeat (e.g. `--logger "console;verbosity=normal" --logger
     // trx`), so every occurrence must be checked, not just the first.
-    let tokens = dotnet_tokens(args);
-    return arg_tokenizer::flag_values(&tokens, Dialect::Msbuild, "logger").any(|value| {
+    arg_tokenizer::flag_values(tokens, Dialect::Msbuild, "logger").any(|value| {
         let lower = value.to_ascii_lowercase();
         lower == "trx" || lower.starts_with("trx;")
-    });
+    })
 }
 
-fn has_results_directory_arg(args: &[String]) -> bool {
-    dotnet_has_flag(&dotnet_tokens(args), "results-directory")
+fn has_results_directory_arg(tokens: &[Token<'_>]) -> bool {
+    dotnet_has_flag(tokens, "results-directory")
 }
 
-fn has_report_arg(args: &[String]) -> bool {
-    dotnet_has_flag(&dotnet_tokens(args), "report")
+fn has_report_arg(tokens: &[Token<'_>]) -> bool {
+    dotnet_has_flag(tokens, "report")
 }
 
-fn has_report_trx_arg(args: &[String]) -> bool {
-    dotnet_has_flag(&dotnet_tokens(args), "report-trx")
+fn has_report_trx_arg(tokens: &[Token<'_>]) -> bool {
+    dotnet_has_flag(tokens, "report-trx")
 }
 
 /// Injects `--report-trx` after the `--` separator in `args`.
@@ -815,20 +820,20 @@ fn inject_report_trx_into_args(args: &[String]) -> Vec<String> {
     }
 }
 
-fn extract_report_arg(args: &[String]) -> Option<PathBuf> {
-    dotnet_flag_value(&dotnet_tokens(args), "report").map(PathBuf::from)
+fn extract_report_arg(tokens: &[Token<'_>]) -> Option<PathBuf> {
+    dotnet_flag_value(tokens, "report").map(PathBuf::from)
 }
 
-fn has_verify_no_changes_arg(args: &[String]) -> bool {
-    dotnet_has_flag(&dotnet_tokens(args), "verify-no-changes")
+fn has_verify_no_changes_arg(tokens: &[Token<'_>]) -> bool {
+    dotnet_has_flag(tokens, "verify-no-changes")
 }
 
-fn has_write_mode_override(args: &[String]) -> bool {
-    dotnet_has_flag(&dotnet_tokens(args), "write")
+fn has_write_mode_override(tokens: &[Token<'_>]) -> bool {
+    dotnet_has_flag(tokens, "write")
 }
 
-fn extract_results_directory_arg(args: &[String]) -> Option<PathBuf> {
-    dotnet_flag_value(&dotnet_tokens(args), "results-directory").map(PathBuf::from)
+fn extract_results_directory_arg(tokens: &[Token<'_>]) -> Option<PathBuf> {
+    dotnet_flag_value(tokens, "results-directory").map(PathBuf::from)
 }
 
 fn normalize_build_summary(
@@ -1345,7 +1350,8 @@ mod tests {
             None
         };
 
-        build_effective_dotnet_args(subcommand, args, binlog_path, trx_results_dir)
+        let tokens = dotnet_tokens(args);
+        build_effective_dotnet_args(subcommand, args, &tokens, binlog_path, trx_results_dir)
     }
 
     fn trx_with_counts(total: usize, passed: usize, failed: usize) -> String {
@@ -1371,13 +1377,13 @@ mod tests {
     #[test]
     fn test_has_binlog_arg_detects_variants() {
         let args = vec!["-bl:my.binlog".to_string()];
-        assert!(has_binlog_arg(&args));
+        assert!(has_binlog_arg(&dotnet_tokens(&args)));
 
         let args = vec!["/bl".to_string()];
-        assert!(has_binlog_arg(&args));
+        assert!(has_binlog_arg(&dotnet_tokens(&args)));
 
         let args = vec!["--configuration".to_string(), "Release".to_string()];
-        assert!(!has_binlog_arg(&args));
+        assert!(!has_binlog_arg(&dotnet_tokens(&args)));
     }
 
     #[test]
@@ -2222,7 +2228,8 @@ mod tests {
         );
 
         let binlog_path = Path::new("/tmp/test.binlog");
-        let injected = build_effective_dotnet_args("test", &args, binlog_path, None);
+        let tokens = dotnet_tokens(&args);
+        let injected = build_effective_dotnet_args("test", &args, &tokens, binlog_path, None);
 
         // MTP VsTestBridge → --report-trx injected after --, no VSTest --logger trx
         assert!(!injected.contains(&"--logger".to_string()));
@@ -2251,7 +2258,8 @@ mod tests {
         );
 
         let binlog_path = Path::new("/tmp/test.binlog");
-        let injected = build_effective_dotnet_args("test", &args, binlog_path, None);
+        let tokens = dotnet_tokens(&args);
+        let injected = build_effective_dotnet_args("test", &args, &tokens, binlog_path, None);
 
         // --report-trx injected after --, --nologo supported in bridge mode
         assert!(!injected.contains(&"--logger".to_string()));
@@ -2294,7 +2302,8 @@ mod tests {
         );
 
         let binlog_path = Path::new("/tmp/test.binlog");
-        let injected = build_effective_dotnet_args("test", &args, binlog_path, None);
+        let tokens = dotnet_tokens(&args);
+        let injected = build_effective_dotnet_args("test", &args, &tokens, binlog_path, None);
 
         // VsTestBridge → inject -- --report-trx after user args
         assert!(injected.contains(&"--".to_string()));
@@ -2326,7 +2335,8 @@ mod tests {
             "--parallel".to_string(),
         ];
         let binlog_path = Path::new("/tmp/test.binlog");
-        let injected = build_effective_dotnet_args("test", &args, binlog_path, None);
+        let tokens = dotnet_tokens(&args);
+        let injected = build_effective_dotnet_args("test", &args, &tokens, binlog_path, None);
 
         // --report-trx inserted right after existing --
         let sep_pos = injected.iter().position(|a| a == "--").unwrap();
@@ -2354,7 +2364,8 @@ mod tests {
             "--report-trx".to_string(),
         ];
         let binlog_path = Path::new("/tmp/test.binlog");
-        let injected = build_effective_dotnet_args("test", &args, binlog_path, None);
+        let tokens = dotnet_tokens(&args);
+        let injected = build_effective_dotnet_args("test", &args, &tokens, binlog_path, None);
 
         // Should not double-inject
         assert_eq!(injected.iter().filter(|a| *a == "--report-trx").count(), 1);
@@ -2379,7 +2390,9 @@ mod tests {
 
         let binlog_path = Path::new("/tmp/test.binlog");
         let trx_dir = Path::new("/tmp/test_results");
-        let injected = build_effective_dotnet_args("test", &args, binlog_path, Some(trx_dir));
+        let tokens = dotnet_tokens(&args);
+        let injected =
+            build_effective_dotnet_args("test", &args, &tokens, binlog_path, Some(trx_dir));
         assert!(injected.contains(&"--logger".to_string()));
         assert!(injected.contains(&"trx".to_string()));
     }
@@ -2567,26 +2580,26 @@ mod tests {
     #[test]
     fn test_has_results_directory_arg_detects_variants() {
         let args = vec!["--results-directory".to_string(), "/tmp/trx".to_string()];
-        assert!(has_results_directory_arg(&args));
+        assert!(has_results_directory_arg(&dotnet_tokens(&args)));
 
         let args = vec!["--results-directory=/tmp/trx".to_string()];
-        assert!(has_results_directory_arg(&args));
+        assert!(has_results_directory_arg(&dotnet_tokens(&args)));
 
         let args = vec!["--logger".to_string(), "trx".to_string()];
-        assert!(!has_results_directory_arg(&args));
+        assert!(!has_results_directory_arg(&dotnet_tokens(&args)));
     }
 
     #[test]
     fn test_extract_results_directory_arg_detects_variants() {
         let args = vec!["--results-directory".to_string(), "/tmp/r1".to_string()];
         assert_eq!(
-            extract_results_directory_arg(&args),
+            extract_results_directory_arg(&dotnet_tokens(&args)),
             Some(PathBuf::from("/tmp/r1"))
         );
 
         let args = vec!["--results-directory=/tmp/r2".to_string()];
         assert_eq!(
-            extract_results_directory_arg(&args),
+            extract_results_directory_arg(&dotnet_tokens(&args)),
             Some(PathBuf::from("/tmp/r2"))
         );
     }
@@ -2598,7 +2611,7 @@ mod tests {
             "/custom/results".to_string(),
         ];
 
-        let (dir, cleanup) = resolve_trx_results_dir("test", &args);
+        let (dir, cleanup) = resolve_trx_results_dir("test", &dotnet_tokens(&args));
         assert_eq!(dir, Some(PathBuf::from("/custom/results")));
         assert!(!cleanup);
     }
@@ -2607,7 +2620,7 @@ mod tests {
     fn test_resolve_trx_results_dir_generated_directory_is_marked_for_cleanup() {
         let args = Vec::<String>::new();
 
-        let (dir, cleanup) = resolve_trx_results_dir("test", &args);
+        let (dir, cleanup) = resolve_trx_results_dir("test", &dotnet_tokens(&args));
         assert!(dir.is_some());
         assert!(cleanup);
     }
@@ -2637,7 +2650,7 @@ mod tests {
     #[test]
     fn test_format_temp_file_cleanup() {
         let args = Vec::<String>::new();
-        let (report_path, cleanup) = resolve_format_report_path(&args);
+        let (report_path, cleanup) = resolve_format_report_path(&dotnet_tokens(&args));
         let report_path = report_path.expect("report path");
 
         assert!(cleanup);
@@ -2653,7 +2666,7 @@ mod tests {
             "/tmp/user-format-report.json".to_string(),
         ];
 
-        let (report_path, cleanup) = resolve_format_report_path(&args);
+        let (report_path, cleanup) = resolve_format_report_path(&dotnet_tokens(&args));
         assert_eq!(
             report_path,
             Some(PathBuf::from("/tmp/user-format-report.json"))
@@ -2665,8 +2678,12 @@ mod tests {
     fn test_format_preserves_positional_project_argument_order() {
         let args = vec!["src/App/App.csproj".to_string()];
 
-        let effective =
-            build_effective_dotnet_format_args(&args, Some(Path::new("/tmp/report.json")));
+        let tokens = dotnet_tokens(&args);
+        let effective = build_effective_dotnet_format_args(
+            &args,
+            &tokens,
+            Some(Path::new("/tmp/report.json")),
+        );
         assert_eq!(
             effective.first().map(String::as_str),
             Some("src/App/App.csproj")
