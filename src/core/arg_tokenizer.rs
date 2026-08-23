@@ -304,12 +304,8 @@ impl<'a, 'p, T: AsRef<str>> Scanner<'a, 'p, T> {
         let flag_index = self.tokens.len();
         let source_index = self.i;
         self.tokens.push(Token {
-            kind: TokenKind::Long,
-            text: name,
             attached,
-            linked: None,
-            source_index,
-            double_dash,
+            ..token(TokenKind::Long, name, source_index, double_dash)
         });
         self.i += 1;
 
@@ -392,14 +388,9 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
                 // ordinary text at this point, in both dialects.
                 scanner.tokens.push(positional(arg, scanner.i));
             } else {
-                scanner.tokens.push(Token {
-                    kind: TokenKind::DashDash,
-                    text: "",
-                    attached: None,
-                    linked: None,
-                    source_index: scanner.i,
-                    double_dash: false,
-                });
+                scanner
+                    .tokens
+                    .push(token(TokenKind::DashDash, "", scanner.i, false));
                 scanner.emitted_dash_dash = true;
             }
             scanner.i += 1;
@@ -445,14 +436,9 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
             let cluster = &arg[1..];
 
             if is_digit_run(cluster) {
-                scanner.tokens.push(Token {
-                    kind: TokenKind::Short,
-                    text: cluster,
-                    attached: None,
-                    linked: None,
-                    source_index: scanner.i,
-                    double_dash: false,
-                });
+                scanner
+                    .tokens
+                    .push(token(TokenKind::Short, cluster, scanner.i, false));
                 scanner.i += 1;
                 continue;
             }
@@ -464,14 +450,9 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
                 let char_len = ch.len_utf8();
                 let char_text = &cluster[offset..offset + char_len];
                 let flag_index = scanner.tokens.len();
-                scanner.tokens.push(Token {
-                    kind: TokenKind::Short,
-                    text: char_text,
-                    attached: None,
-                    linked: None,
-                    source_index,
-                    double_dash: false,
-                });
+                scanner
+                    .tokens
+                    .push(token(TokenKind::Short, char_text, source_index, false));
 
                 if (scanner.takes_value)(TokenKind::Short, char_text) {
                     let remainder = &cluster[offset + char_len..];
@@ -515,15 +496,25 @@ fn split_attached(s: &str, dialect: Dialect) -> (&str, Option<&str>) {
     }
 }
 
-fn positional(text: &str, source_index: usize) -> Token<'_> {
+/// Base constructor for a freshly-scanned token that hasn't been linked to anything yet:
+/// `attached`/`linked` default to `None`. Every token-construction site in this module builds on
+/// top of this via struct-update syntax rather than writing out a full `Token { ... }` literal,
+/// so `Token` gaining a field later means updating one constructor instead of updating every
+/// call site (and a call site accidentally missing the new field would fail to compile instead
+/// of silently defaulting it wrong).
+fn token(kind: TokenKind, text: &str, source_index: usize, double_dash: bool) -> Token<'_> {
     Token {
-        kind: TokenKind::Positional,
+        kind,
         text,
         attached: None,
         linked: None,
         source_index,
-        double_dash: false,
+        double_dash,
     }
+}
+
+fn positional(text: &str, source_index: usize) -> Token<'_> {
+    token(TokenKind::Positional, text, source_index, false)
 }
 
 #[cfg(test)]
