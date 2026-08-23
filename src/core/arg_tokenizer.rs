@@ -274,7 +274,13 @@ pub fn tokenize_dialect<'a, T: AsRef<str>>(
 
         if dialect == Dialect::Msbuild {
             if let Some(rest) = arg.strip_prefix('/') {
-                if !rest.is_empty() {
+                // A real MSBuild switch name never contains another '/' (confirmed via a real
+                // dotnet 9 SDK, Docker: `dotnet build /abs/path/Project.csproj` builds the
+                // absolute Unix path as the project positional, not a switch attempt). Without
+                // this guard, an absolute path -- the common case on Linux/macOS -- would be
+                // misclassified as a Long flag named e.g. "tmp/results".
+                let name_part = rest.split(['=', ':']).next().unwrap_or(rest);
+                if !rest.is_empty() && !name_part.contains('/') {
                     push_atomic_flag(
                         &mut tokens,
                         args,
@@ -764,18 +770,33 @@ mod tests {
     }
 
     #[test]
-    fn msbuild_absolute_path_positional_is_not_mistaken_for_a_flag_with_predicate_false() {
-        // "/tmp/results" has no recognized flag name, so it's still a positional even though
-        // it starts with '/' — the predicate, not the tokenizer, is what would gate this.
+    fn msbuild_absolute_path_is_positional_not_a_flag() {
+        // Regression: confirmed via a real dotnet 9 SDK (Docker) that `dotnet build
+        // /abs/path/Project.csproj` builds the absolute Unix path as the project positional --
+        // real MSBuild never treats a multi-segment "/a/b" as a switch attempt. Before this fix,
+        // any '/'-prefixed token was classified as a Long flag regardless of internal '/'s, so
+        // an absolute path (the common case on Linux/macOS) was misread as a flag named e.g.
+        // "tmp/results".
         let takes = |kind: TokenKind, name: &str| kind == TokenKind::Long && name == "nologo";
         let args = owned(&["/tmp/results"]);
         let tokens = tokenize_dialect(&args, Dialect::Msbuild, &takes);
 
-        // It's still classified as a Long flag named "tmp/results" (no recognized value-taking
-        // predicate matches it) — proving the *caller* must know not to treat arbitrary
-        // '/'-prefixed tokens as flags on Unix; the tokenizer only reports structure.
+        assert_eq!(tokens[0].kind, TokenKind::Positional);
+        assert_eq!(tokens[0].text, "/tmp/results");
+    }
+
+    #[test]
+    fn msbuild_single_segment_slash_flag_is_still_a_flag() {
+        // A genuine single-segment MSBuild switch (no internal '/') must still classify as Long,
+        // including when it carries an attached value whose own text contains '/'.
+        let args = owned(&["/nologo", "/p:OutDir=/tmp/out"]);
+        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+
         assert_eq!(tokens[0].kind, TokenKind::Long);
-        assert_eq!(tokens[0].text, "tmp/results");
+        assert_eq!(tokens[0].text, "nologo");
+        assert_eq!(tokens[1].kind, TokenKind::Long);
+        assert_eq!(tokens[1].text, "p");
+        assert_eq!(tokens[1].attached, Some("OutDir=/tmp/out"));
     }
 
     #[test]
