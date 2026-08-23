@@ -786,11 +786,36 @@ fn detect_test_runner_mode_in_dir(tokens: &[Token<'_>], scan_dir: &Path) -> Test
 /// dotnet's CLI grammar isn't POSIX/GNU: `-flag`, `--flag`, and `/flag` are all one atomic
 /// name (no short-flag clustering) and a value may attach via `:` or `=`
 /// ([`Dialect::Msbuild`]); flag names are matched case-insensitively, same as the CLI itself.
+/// Confirmed via a real dotnet 9 SDK (Docker, `dotnet test --help`/`dotnet build --help`) that
+/// each of these takes a separate-token value: `--filter`, `-c`/`--configuration`,
+/// `-f`/`--framework`, `-r`/`--runtime`, `-a`/`--arch`, `--os`, plus the pre-existing
+/// `--logger`/`--report`/`--results-directory`. Not exhaustive -- dotnet has more value-taking
+/// options than this covers -- but each addition here directly closes a case where the value
+/// would otherwise tokenize as an unlinked Positional and could be misread as an explicit project
+/// path by detect_test_runner_mode_in_dir's explicit_projects filter if it happened to end in
+/// `.csproj`/`.fsproj`/`.vbproj`. The short forms (`-c`/`-f`/`-r`/`-a`) are matched under
+/// `TokenKind::Long`, not `Short`: under `Dialect::Msbuild`, tokenize_dialect routes every
+/// single-dash arg through `push_atomic_flag`, which always produces a `Long` token (Msbuild has
+/// no character-clustering concept the way `Dialect::Posix` does) -- confirmed that dotnet
+/// doesn't support a glued short form like `-cRelease` either way (`MSB1001: Unknown switch`;
+/// only `-c Release` or `-c=Release` work).
 fn dotnet_takes_value(kind: TokenKind, name: &str) -> bool {
     kind == TokenKind::Long
         && matches!(
             name.to_ascii_lowercase().as_str(),
-            "logger" | "report" | "results-directory"
+            "a" | "arch"
+                | "c"
+                | "configuration"
+                | "f"
+                | "filter"
+                | "framework"
+                | "l"
+                | "logger"
+                | "os"
+                | "r"
+                | "report"
+                | "results-directory"
+                | "runtime"
         )
 }
 
@@ -839,11 +864,20 @@ fn has_nologo_arg(tokens: &[Token<'_>]) -> bool {
 
 fn has_trx_logger_arg(tokens: &[Token<'_>]) -> bool {
     // --logger can legitimately repeat (e.g. `--logger "console;verbosity=normal" --logger
-    // trx`), so every occurrence must be checked, not just the first.
-    arg_tokenizer::double_dash_flag_values(tokens, Dialect::Msbuild, "logger").any(|value| {
-        let lower = value.to_ascii_lowercase();
-        lower == "trx" || lower.starts_with("trx;")
-    })
+    // trx`), so every occurrence must be checked, not just the first. `-l` is dotnet's own
+    // alias for it -- MSBuild's unrelated `/l` tokenizes the same but never takes a separate
+    // value, so only its attached form could collide, and only with an assembly named "trx".
+    arg_tokenizer::double_dash_flag_values(tokens, Dialect::Msbuild, "logger")
+        .chain(
+            tokens
+                .iter()
+                .filter(|t| t.kind == TokenKind::Long && t.text.eq_ignore_ascii_case("l"))
+                .filter_map(|t| t.value(tokens)),
+        )
+        .any(|value| {
+            let lower = value.to_ascii_lowercase();
+            lower == "trx" || lower.starts_with("trx;")
+        })
 }
 
 fn has_results_directory_arg(tokens: &[Token<'_>]) -> bool {
@@ -1455,6 +1489,11 @@ mod tests {
 
         let args = vec!["--configuration".to_string(), "Release".to_string()];
         assert!(!has_binlog_arg(&dotnet_tokens(&args)));
+
+        // `/r` is MSBuild's boolean restore, not dotnet's `-r <rid>`: if it swallowed the next
+        // arg, RTK would inject a second -bl on top of the user's own.
+        let args = vec!["/r".to_string(), "-bl:my.binlog".to_string()];
+        assert!(has_binlog_arg(&dotnet_tokens(&args)));
     }
 
     #[test]
@@ -2174,6 +2213,20 @@ mod tests {
     }
 
     #[test]
+    fn test_short_logger_alias_does_not_duplicate() {
+        // `-l trx` is dotnet's documented short form of `--logger trx`; missing it injected a
+        // second trx logger on top of the user's own.
+        let args = vec!["-l".to_string(), "trx".to_string()];
+
+        let injected = build_dotnet_args_for_test("test", &args, true);
+        let trx_logger_count = injected.iter().filter(|a| *a == "trx").count();
+        assert_eq!(
+            trx_logger_count, 1,
+            "must not inject a duplicate trx logger: {injected:?}"
+        );
+    }
+
+    #[test]
     fn test_second_of_multiple_loggers_being_trx_does_not_duplicate() {
         // Regression: --logger can legitimately repeat (a documented VSTest pattern); a trx
         // logger that isn't the FIRST --logger occurrence must still be detected.
@@ -2524,6 +2577,47 @@ mod tests {
             detect_test_runner_mode_in_dir(&tokens, temp_dir.path()),
             TestRunnerMode::MtpVsTestBridge,
             "the flag value's fake .csproj suffix must not stop scan_dir from being scanned"
+        );
+    }
+
+    #[test]
+    fn test_detect_mode_ignores_filter_and_configuration_flag_values() {
+        // Regression: dotnet_takes_value's allowlist was narrower than dotnet's real
+        // value-taking flags (confirmed via a real dotnet 9 SDK, Docker: dotnet test --help/
+        // dotnet build --help). --filter and -c/--configuration weren't in the list, so a value
+        // like "FullyQualifiedName~Foo.csproj" or a hypothetical config name ending in a project
+        // extension tokenized as an unlinked Positional and was misread by
+        // detect_test_runner_mode_in_dir's explicit_projects filter as an explicit project
+        // reference, skipping the working-directory scan.
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let csproj = temp_dir.path().join("Real.Tests.csproj");
+        fs::write(
+            &csproj,
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
+  </PropertyGroup>
+</Project>"#,
+        )
+        .expect("write csproj");
+
+        let args = vec![
+            "--filter".to_string(),
+            "FullyQualifiedName~Foo.csproj".to_string(),
+        ];
+        let tokens = dotnet_tokens(&args);
+        assert_eq!(
+            detect_test_runner_mode_in_dir(&tokens, temp_dir.path()),
+            TestRunnerMode::MtpVsTestBridge,
+            "--filter's value must not stop scan_dir from being scanned"
+        );
+
+        let args = vec!["-c".to_string(), "Debug.csproj".to_string()];
+        let tokens = dotnet_tokens(&args);
+        assert_eq!(
+            detect_test_runner_mode_in_dir(&tokens, temp_dir.path()),
+            TestRunnerMode::MtpVsTestBridge,
+            "-c's value must not stop scan_dir from being scanned"
         );
     }
 

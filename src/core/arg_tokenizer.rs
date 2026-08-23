@@ -312,6 +312,7 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
                 &mut i,
                 rest,
                 true,
+                true,
                 emitted_dash_dash,
                 dialect,
                 takes_value,
@@ -347,6 +348,7 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
                         &mut i,
                         rest,
                         false,
+                        false,
                         emitted_dash_dash,
                         dialect,
                         takes_value,
@@ -361,6 +363,7 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
                     &mut i,
                     &arg[1..],
                     false,
+                    true,
                     emitted_dash_dash,
                     dialect,
                     takes_value,
@@ -449,6 +452,7 @@ fn push_atomic_flag<'a, T: AsRef<str>>(
     i: &mut usize,
     rest: &'a str,
     double_dash: bool,
+    separate_value: bool,
     emitted_dash_dash: bool,
     dialect: Dialect,
     takes_value: &dyn Fn(TokenKind, &str) -> bool,
@@ -467,6 +471,7 @@ fn push_atomic_flag<'a, T: AsRef<str>>(
     *i += 1;
 
     if attached.is_none()
+        && separate_value
         && takes_value(TokenKind::Long, name)
         && link_next_value(tokens, args, flag_index, *i, emitted_dash_dash)
     {
@@ -813,6 +818,26 @@ mod tests {
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].kind, TokenKind::Long);
         assert_eq!(tokens[0].text, "nologo");
+    }
+
+    #[test]
+    fn msbuild_slash_flag_never_consumes_a_separate_value() {
+        // `/r` is MSBuild's boolean `restore`, not dotnet's `-r <rid>`: an MSBuild switch takes
+        // its value attached with `:`, so `/r` must leave the next arg alone. Reading it as a
+        // value hid a following `-bl:<file>` from dotnet's own binlog detection.
+        let takes_value = |kind: TokenKind, name: &str| kind == TokenKind::Long && name == "r";
+        let slash = owned(&["/r", "-bl:my.binlog"]);
+        let tokens = tokenize_dialect(&slash, Dialect::Msbuild, &takes_value);
+        assert_eq!(tokens[0].text, "r");
+        assert_eq!(tokens[0].linked, None);
+        assert_eq!(tokens[1].kind, TokenKind::Long);
+        assert_eq!(tokens[1].text, "bl");
+        assert_eq!(tokens[1].attached, Some("my.binlog"));
+
+        // The dash spelling is dotnet's own `-r <rid>`, which does consume the next token.
+        let dash = owned(&["-r", "linux-x64"]);
+        let tokens = tokenize_dialect(&dash, Dialect::Msbuild, &takes_value);
+        assert_eq!(tokens[0].value(&tokens), Some("linux-x64"));
     }
 
     #[test]
