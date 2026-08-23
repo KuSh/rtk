@@ -705,12 +705,27 @@ fn detect_test_runner_mode_in_dir(tokens: &[Token<'_>], scan_dir: &Path) -> Test
 
     let project_extensions = ["csproj", "fsproj", "vbproj"];
 
-    // Only unconsumed Positional tokens are candidate project paths -- scanning raw args (or
-    // token text generally) would also match a value-taking flag's own value that happens to
-    // end in one of these extensions (e.g. `--results-directory /tmp/MyResults.csproj`).
+    // Tokens at or past the user's own `--` belong to the forwarded test-runner/filter
+    // expression, not to dotnet itself (Dialect::Msbuild keeps classifying past `--` since it's
+    // a forwarding boundary, not an end-of-options marker -- see TokenKind::DashDash's docs), so
+    // they're never candidate project paths even if one coincidentally ends in a project
+    // extension (e.g. `dotnet test -- FullyQualifiedName~Foo.csproj`).
+    let boundary = tokens
+        .iter()
+        .find(|t| t.kind == TokenKind::DashDash)
+        .map(|t| t.source_index);
+
+    // Only unconsumed Positional tokens before that boundary are candidate project paths --
+    // scanning raw args (or token text generally) would also match a value-taking flag's own
+    // value that happens to end in one of these extensions (e.g. `--results-directory
+    // /tmp/MyResults.csproj`).
     let explicit_projects: Vec<&str> = tokens
         .iter()
-        .filter(|t| t.kind == TokenKind::Positional && t.linked.is_none())
+        .filter(|t| {
+            t.kind == TokenKind::Positional
+                && t.linked.is_none()
+                && boundary.is_none_or(|b| t.source_index < b)
+        })
         .map(|t| t.text)
         .filter(|a| {
             let lower = a.to_ascii_lowercase();
@@ -2509,6 +2524,38 @@ mod tests {
             detect_test_runner_mode_in_dir(&tokens, temp_dir.path()),
             TestRunnerMode::MtpVsTestBridge,
             "the flag value's fake .csproj suffix must not stop scan_dir from being scanned"
+        );
+    }
+
+    #[test]
+    fn test_detect_mode_ignores_positional_after_double_dash() {
+        // Regression: Dialect::Msbuild keeps classifying tokens past the user's own `--` (it's a
+        // forwarding boundary, not an end-of-options marker), so a VSTest/MTP filter expression
+        // there that coincidentally ends in a project extension (e.g. a fully-qualified test
+        // name filter) must not be treated as an explicit project reference -- confirmed against
+        // a real dotnet 9 SDK that `dotnet test -- FullyQualifiedName~Foo.csproj` runs the real
+        // project in cwd, not a nonexistent "FullyQualifiedName~Foo.csproj" project.
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let csproj = temp_dir.path().join("Real.Tests.csproj");
+        fs::write(
+            &csproj,
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
+  </PropertyGroup>
+</Project>"#,
+        )
+        .expect("write csproj");
+
+        let args = vec![
+            "--".to_string(),
+            "FullyQualifiedName~Foo.csproj".to_string(),
+        ];
+        let tokens = dotnet_tokens(&args);
+        assert_eq!(
+            detect_test_runner_mode_in_dir(&tokens, temp_dir.path()),
+            TestRunnerMode::MtpVsTestBridge,
+            "a post-- filter expression must not stop scan_dir from being scanned"
         );
     }
 
