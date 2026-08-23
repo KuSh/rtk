@@ -2271,6 +2271,21 @@ fn format_stash_message(subcommand: Option<&str>, result: &CaptureResult) -> Str
     }
 }
 
+/// True if the user explicitly requested patch-style output for `git stash show`. Shares git
+/// log's diff-option grammar (log_takes_value/log_takes_separate_value) and `--`-boundary
+/// awareness, so a pathspec literally named "-p"/"--patch" after `--` isn't mistaken for the
+/// flag -- the same bug class already fixed for sibling run_log/run_diff/run_show. Only the
+/// patch-mode flags matter here, not the full requests_raw_diff_shape list: --stat et al.
+/// correctly stay on the compact_stash_stat branch, not compact_diff.
+fn stash_show_wants_patch(args: &[String]) -> bool {
+    let tokens = arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value);
+    tokens.iter().any(|t| match t.kind {
+        TokenKind::Long => t.text == "patch",
+        TokenKind::Short => matches!(t.text, "p" | "u"),
+        _ => false,
+    })
+}
+
 fn run_stash(
     subcommand: Option<&str>,
     args: &[String],
@@ -2308,7 +2323,7 @@ fn run_stash(
             );
         }
         Some("show") => {
-            let patch_mode = args.iter().any(|a| a == "-p" || a == "--patch");
+            let patch_mode = stash_show_wants_patch(args);
 
             let mut cmd = git_cmd(global_args);
             cmd.args(["stash", "show"]);
@@ -4083,6 +4098,22 @@ A  added.rs
         // The bare, standalone form must still work as documented.
         let args = vec!["-n".to_string(), "2".to_string()];
         assert_eq!(parse_user_limit(&args), Some(2));
+    }
+
+    #[test]
+    fn test_stash_show_wants_patch_ignores_dash_p_pathspec_after_double_dash() {
+        // Regression: stash_show_wants_patch's predecessor was a raw `arg == "-p"` scan with no
+        // `--`-boundary awareness -- the same bug class already fixed for run_log/run_diff/
+        // run_show -- so a pathspec literally named "-p" after `--` was wrongly treated as the
+        // real patch flag.
+        let args = vec!["--".to_string(), "-p".to_string()];
+        assert!(!stash_show_wants_patch(&args));
+
+        // The real flag, unaffected by the boundary, still works.
+        let args = vec!["-p".to_string()];
+        assert!(stash_show_wants_patch(&args));
+        let args = vec!["--patch".to_string()];
+        assert!(stash_show_wants_patch(&args));
     }
 
     #[test]
