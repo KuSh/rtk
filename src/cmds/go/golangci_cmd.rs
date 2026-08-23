@@ -1,6 +1,7 @@
 //! Filters golangci-lint output, grouping issues by rule.
 
 use crate::core::arg_tokenizer::{self, Dialect, TokenKind};
+use crate::core::args_utils;
 use crate::core::config;
 use crate::core::runner;
 use crate::core::stream::exec_capture;
@@ -131,6 +132,10 @@ pub(crate) fn detect_major_version() -> u32 {
 }
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
+    // Re-insert `--` when clap's trailing_var_arg consumed it (issue #1215): without this,
+    // both classify_invocation's `--` detection and the raw args run_passthrough forwards to
+    // the real binary would be missing the user's own `--`.
+    let args = &args_utils::restore_double_dash(args);
     match classify_invocation(args) {
         Invocation::FilteredRun(invocation) => run_filtered(args, &invocation, verbose),
         Invocation::Passthrough => run_passthrough(args, verbose),
