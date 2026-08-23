@@ -65,6 +65,12 @@ pub struct Token<'a> {
     /// caller that needs to rebuild exact per-arg boundaries (e.g. whether `-r`/`-n` were typed
     /// as one cluster or two separate flags) do so without re-scanning `args` itself.
     pub source_index: usize,
+    /// True if a `Long` token was written with a literal `--` prefix, as opposed to `-flag` or
+    /// `/flag` under [`Dialect::Msbuild`] (all three tokenize uniformly as `Long` there, but
+    /// they are *not* uniformly valid dotnet CLI syntax — see [`has_flag`] vs
+    /// [`has_double_dash_flag`]). Always `true` for `Long` under [`Dialect::Posix`] (its `Long`
+    /// is always `--`); always `false` for `Short`/`Positional`/`DashDash`.
+    pub double_dash: bool,
 }
 
 impl<'a> Token<'a> {
@@ -83,7 +89,7 @@ impl<'a> Token<'a> {
 /// broadly — this isn't a dotnet-CLI particularity, e.g. classic MSBuild.exe's `/nologo` and
 /// `/NoLogo` are equally valid). `text` can't be case-folded once at tokenize time without
 /// giving up `Token`'s zero-copy `&'a str` (there's no borrowed "lowercased" view), so instead
-/// every dialect-aware lookup goes through this and [`flag_value`]/[`has_flag`].
+/// every dialect-aware lookup goes through this and [`has_flag`]/[`double_dash_flag_value`].
 fn flag_name_matches(text: &str, name: &str, dialect: Dialect) -> bool {
     match dialect {
         Dialect::Msbuild => text.eq_ignore_ascii_case(name),
@@ -91,36 +97,74 @@ fn flag_name_matches(text: &str, name: &str, dialect: Dialect) -> bool {
     }
 }
 
-/// This flag's value, if `name` (matched per `dialect`, see [`flag_name_matches`]) appears as
-/// a `Long` token anywhere in `tokens`. `tokens` must have come from `tokenize_dialect(_, dialect,
-/// _)` — mixing dialects between tokenizing and looking up gives nonsensical results.
-pub fn flag_value<'a>(tokens: &[Token<'a>], dialect: Dialect, name: &str) -> Option<&'a str> {
-    tokens
-        .iter()
-        .find(|t| t.kind == TokenKind::Long && flag_name_matches(t.text, name, dialect))
-        .and_then(|t| t.value(tokens))
-}
-
 /// True if `name` (matched per `dialect`) appears as a `Long` token anywhere in `tokens`.
+///
+/// Under `Dialect::Msbuild`, this deliberately matches `-flag`/`--flag`/`/flag` uniformly —
+/// correct for genuine legacy MSBuild.exe passthrough switches (`nologo`, `bl`, `v`), but
+/// *not* correct in general for dotnet's own System.CommandLine-parsed options or VSTest
+/// options forwarded through `dotnet test`. See [`has_double_dash_flag`] before using this for
+/// any Msbuild-dialect flag that isn't one of those legacy switches.
 pub fn has_flag(tokens: &[Token<'_>], dialect: Dialect, name: &str) -> bool {
     tokens
         .iter()
         .any(|t| t.kind == TokenKind::Long && flag_name_matches(t.text, name, dialect))
 }
 
-/// Every value for `name` (matched per `dialect`), in order, for a flag that can legitimately
-/// be repeated (e.g. dotnet test's `--logger console;verbosity=normal --logger trx`, where each
-/// occurrence must be checked, not just the first — [`flag_value`] only reports the first
-/// match). Occurrences with no value (bare flag, or a value-taking flag with nothing left to
-/// consume) are skipped rather than yielding `None`.
-pub fn flag_values<'a, 't>(
+/// Like [`double_dash_flag_value`], but only reports presence, not the value; only matches a
+/// token written with a literal `--` prefix (`Token::double_dash`), not `-flag`/`/flag` under
+/// [`Dialect::Msbuild`].
+///
+/// Under `Dialect::Msbuild`, [`has_flag`] treats `-flag`, `--flag`, and `/flag` as
+/// interchangeable — correct for the handful of options MSBuild.exe itself has
+/// always accepted in all three forms (`-nologo`, `-bl`, `-v`/`-verbosity`) and forwards
+/// straight through to. It is *not* correct for dotnet's own System.CommandLine-parsed options
+/// (`dotnet format`'s `--verify-no-changes`/`--report`, `dotnet test`'s `--logger`/
+/// `--results-directory`) or VSTest-console options forwarded through `dotnet test`: verified
+/// against a real dotnet 9 SDK that these are double-dash-only, and a single-dash or slash
+/// spelling doesn't just get rejected -- it gets *misparsed* as an unrelated MSBuild switch
+/// (`-results-directory` is read as MSBuild's own unrecognized switch "results-directory";
+/// `-logger` collides with MSBuild's own `-logger` switch, which expects a logger assembly
+/// spec, not "trx"). Use this (or [`double_dash_flag_value`]/[`double_dash_flag_values`]) for
+/// any option that isn't a genuine legacy MSBuild.exe passthrough switch.
+pub fn has_double_dash_flag(tokens: &[Token<'_>], dialect: Dialect, name: &str) -> bool {
+    tokens.iter().any(|t| {
+        t.kind == TokenKind::Long && t.double_dash && flag_name_matches(t.text, name, dialect)
+    })
+}
+
+/// This flag's value, if `name` (matched per `dialect`) appears as a `Long` token written with
+/// a literal `--` prefix (`Token::double_dash`) anywhere in `tokens`. See
+/// [`has_double_dash_flag`] for why this distinction is load-bearing under `Dialect::Msbuild`.
+pub fn double_dash_flag_value<'a>(
+    tokens: &[Token<'a>],
+    dialect: Dialect,
+    name: &str,
+) -> Option<&'a str> {
+    tokens
+        .iter()
+        .find(|t| {
+            t.kind == TokenKind::Long && t.double_dash && flag_name_matches(t.text, name, dialect)
+        })
+        .and_then(|t| t.value(tokens))
+}
+
+/// Every value for `name` (matched per `dialect`), in order, for a `--`-prefixed flag that can
+/// legitimately be repeated (e.g. dotnet test's `--logger console;verbosity=normal --logger
+/// trx`, where each occurrence must be checked, not just the first —
+/// [`double_dash_flag_value`] only reports the first match). Occurrences with no value (bare
+/// flag, or a value-taking flag with nothing left to consume) are skipped rather than yielding
+/// `None`. See [`has_double_dash_flag`] for why the `--`-only restriction is load-bearing under
+/// `Dialect::Msbuild`.
+pub fn double_dash_flag_values<'a, 't>(
     tokens: &'t [Token<'a>],
     dialect: Dialect,
     name: &'t str,
 ) -> impl Iterator<Item = &'a str> + 't {
     tokens
         .iter()
-        .filter(move |t| t.kind == TokenKind::Long && flag_name_matches(t.text, name, dialect))
+        .filter(move |t| {
+            t.kind == TokenKind::Long && t.double_dash && flag_name_matches(t.text, name, dialect)
+        })
         .filter_map(|t| t.value(tokens))
 }
 
@@ -195,6 +239,7 @@ pub fn tokenize_dialect<'a, T: AsRef<str>>(
                     attached: None,
                     linked: None,
                     source_index: i,
+                    double_dash: false,
                 });
                 emitted_dash_dash = true;
                 // In Posix conventions `--` ends option parsing: everything after is a literal
@@ -214,19 +259,27 @@ pub fn tokenize_dialect<'a, T: AsRef<str>>(
         }
 
         if let Some(rest) = arg.strip_prefix("--") {
-            push_atomic_flag(&mut tokens, args, &mut i, rest, dialect, takes_value);
+            push_atomic_flag(&mut tokens, args, &mut i, rest, true, dialect, takes_value);
             continue;
         }
 
         if dialect == Dialect::Msbuild {
             if let Some(rest) = arg.strip_prefix('/') {
                 if !rest.is_empty() {
-                    push_atomic_flag(&mut tokens, args, &mut i, rest, dialect, takes_value);
+                    push_atomic_flag(&mut tokens, args, &mut i, rest, false, dialect, takes_value);
                     continue;
                 }
             }
             if arg.len() > 1 && arg.starts_with('-') {
-                push_atomic_flag(&mut tokens, args, &mut i, &arg[1..], dialect, takes_value);
+                push_atomic_flag(
+                    &mut tokens,
+                    args,
+                    &mut i,
+                    &arg[1..],
+                    false,
+                    dialect,
+                    takes_value,
+                );
                 continue;
             }
         } else if arg.len() > 1 && arg.starts_with('-') {
@@ -239,6 +292,7 @@ pub fn tokenize_dialect<'a, T: AsRef<str>>(
                     attached: None,
                     linked: None,
                     source_index: i,
+                    double_dash: false,
                 });
                 i += 1;
                 continue;
@@ -256,6 +310,7 @@ pub fn tokenize_dialect<'a, T: AsRef<str>>(
                     attached: None,
                     linked: None,
                     source_index: i,
+                    double_dash: false,
                 });
 
                 if takes_value(TokenKind::Short, char_text) {
@@ -289,12 +344,14 @@ pub fn tokenize_dialect<'a, T: AsRef<str>>(
 /// Pushes one atomic (non-clustering) flag token — used for `--flag` in both dialects, and for
 /// `-flag`/`/flag` in [`Dialect::Msbuild`] — splitting off an attached value per `dialect` and,
 /// absent one, consulting `takes_value` to maybe consume the next whole token as a separate
-/// value. `rest` is the flag text with its prefix (`--`, `-`, or `/`) already stripped.
+/// value. `rest` is the flag text with its prefix (`--`, `-`, or `/`) already stripped;
+/// `double_dash` records which prefix that was (see `Token::double_dash`).
 fn push_atomic_flag<'a, T: AsRef<str>>(
     tokens: &mut Vec<Token<'a>>,
     args: &'a [T],
     i: &mut usize,
     rest: &'a str,
+    double_dash: bool,
     dialect: Dialect,
     takes_value: &dyn Fn(TokenKind, &str) -> bool,
 ) {
@@ -307,6 +364,7 @@ fn push_atomic_flag<'a, T: AsRef<str>>(
         attached,
         linked: None,
         source_index,
+        double_dash,
     });
     *i += 1;
 
@@ -344,6 +402,7 @@ fn positional(text: &str, source_index: usize) -> Token<'_> {
         attached: None,
         linked: None,
         source_index,
+        double_dash: false,
     }
 }
 
@@ -708,17 +767,15 @@ mod tests {
         assert_eq!(tokens[1].attached, None);
     }
 
-    // --- has_flag / flag_value ---
+    // --- has_flag / has_double_dash_flag / double_dash_flag_value(s) ---
 
     #[test]
-    fn msbuild_has_flag_and_flag_value_are_case_insensitive() {
-        let args = owned(&["-NoLogo", "--Logger:trx"]);
+    fn msbuild_has_flag_is_case_insensitive() {
+        let args = owned(&["-NoLogo"]);
         let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
 
         assert!(has_flag(&tokens, Dialect::Msbuild, "nologo"));
         assert!(has_flag(&tokens, Dialect::Msbuild, "NOLOGO"));
-        assert_eq!(flag_value(&tokens, Dialect::Msbuild, "logger"), Some("trx"));
-        assert_eq!(flag_value(&tokens, Dialect::Msbuild, "LOGGER"), Some("trx"));
     }
 
     #[test]
@@ -743,15 +800,61 @@ mod tests {
     }
 
     #[test]
-    fn flag_values_reports_every_occurrence_not_just_the_first() {
+    fn double_dash_flag_value_is_case_insensitive_but_prefix_strict() {
+        let args = owned(&["--Logger:trx"]);
+        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+
+        assert_eq!(
+            double_dash_flag_value(&tokens, Dialect::Msbuild, "logger"),
+            Some("trx")
+        );
+        assert_eq!(
+            double_dash_flag_value(&tokens, Dialect::Msbuild, "LOGGER"),
+            Some("trx")
+        );
+    }
+
+    #[test]
+    fn double_dash_flag_rejects_single_dash_and_slash_spellings() {
+        // Regression: verified against a real dotnet 9 SDK that dotnet's own
+        // System.CommandLine-parsed options (unlike legacy MSBuild.exe passthrough switches
+        // like -nologo) are double-dash-only -- "-results-directory"/"/results-directory" get
+        // misparsed as unrelated MSBuild switches, not treated as this flag at all.
+        let args = owned(&["-results-directory", "/tmp/out"]);
+        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+
+        assert!(has_flag(&tokens, Dialect::Msbuild, "results-directory"));
+        assert!(!has_double_dash_flag(
+            &tokens,
+            Dialect::Msbuild,
+            "results-directory"
+        ));
+        assert_eq!(
+            double_dash_flag_value(&tokens, Dialect::Msbuild, "results-directory"),
+            None
+        );
+
+        let args = owned(&["/results-directory", "/tmp/out"]);
+        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+        assert!(!has_double_dash_flag(
+            &tokens,
+            Dialect::Msbuild,
+            "results-directory"
+        ));
+    }
+
+    #[test]
+    fn double_dash_flag_values_reports_every_occurrence_not_just_the_first() {
         // Regression: dotnet test's --logger can legitimately repeat
-        // (`--logger "console;verbosity=normal" --logger trx`) -- unlike flag_value, which
-        // only reports the first match, every occurrence must be checkable.
+        // (`--logger "console;verbosity=normal" --logger trx`) -- unlike
+        // double_dash_flag_value, which only reports the first match, every occurrence must be
+        // checkable.
         let args = owned(&["--logger:console;verbosity=normal", "--logger", "trx"]);
         let takes = |kind: TokenKind, name: &str| kind == TokenKind::Long && name == "logger";
         let tokens = tokenize_dialect(&args, Dialect::Msbuild, &takes);
 
-        let values: Vec<&str> = flag_values(&tokens, Dialect::Msbuild, "logger").collect();
+        let values: Vec<&str> =
+            double_dash_flag_values(&tokens, Dialect::Msbuild, "logger").collect();
         assert_eq!(values, vec!["console;verbosity=normal", "trx"]);
     }
 }

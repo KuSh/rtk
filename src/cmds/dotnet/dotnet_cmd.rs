@@ -772,12 +772,28 @@ fn dotnet_tokens(args: &[String]) -> Vec<Token<'_>> {
     arg_tokenizer::tokenize_dialect(args, Dialect::Msbuild, &dotnet_takes_value)
 }
 
-fn dotnet_flag_value<'a>(tokens: &[Token<'a>], name: &str) -> Option<&'a str> {
-    arg_tokenizer::flag_value(tokens, Dialect::Msbuild, name)
-}
-
+/// Loose lookup: `-flag`/`--flag`/`/flag` all match. Only correct for the handful of options
+/// that are genuine legacy MSBuild.exe passthrough switches (`nologo`, `bl`, `v`/`verbosity`)
+/// -- see [`arg_tokenizer::has_double_dash_flag`] for why every other dotnet_cmd.rs flag must
+/// use [`dotnet_has_double_dash_flag`]/[`dotnet_double_dash_flag_value`] instead.
 fn dotnet_has_flag(tokens: &[Token<'_>], name: &str) -> bool {
     arg_tokenizer::has_flag(tokens, Dialect::Msbuild, name)
+}
+
+/// Strict lookup: only a literal `--flag` matches, never `-flag`/`/flag`. Required for every
+/// dotnet_cmd.rs flag that isn't a legacy MSBuild.exe passthrough switch -- confirmed against a
+/// real dotnet 9 SDK (Docker) that `dotnet format`'s `--verify-no-changes`/`--report` and
+/// `dotnet test`'s `--logger`/`--results-directory` are double-dash-only, and a single-dash or
+/// slash spelling doesn't just get rejected, it gets *misparsed* as an unrelated MSBuild switch
+/// (`-results-directory` reads as MSBuild's own unrecognized switch "results-directory";
+/// `-logger` collides with MSBuild's own `-logger` switch, which wants a logger assembly spec,
+/// not "trx" -- both silently produce `MSB100x` errors instead of doing what the user meant).
+fn dotnet_double_dash_flag_value<'a>(tokens: &[Token<'a>], name: &str) -> Option<&'a str> {
+    arg_tokenizer::double_dash_flag_value(tokens, Dialect::Msbuild, name)
+}
+
+fn dotnet_has_double_dash_flag(tokens: &[Token<'_>], name: &str) -> bool {
+    arg_tokenizer::has_double_dash_flag(tokens, Dialect::Msbuild, name)
 }
 
 fn has_nologo_arg(tokens: &[Token<'_>]) -> bool {
@@ -787,22 +803,22 @@ fn has_nologo_arg(tokens: &[Token<'_>]) -> bool {
 fn has_trx_logger_arg(tokens: &[Token<'_>]) -> bool {
     // --logger can legitimately repeat (e.g. `--logger "console;verbosity=normal" --logger
     // trx`), so every occurrence must be checked, not just the first.
-    arg_tokenizer::flag_values(tokens, Dialect::Msbuild, "logger").any(|value| {
+    arg_tokenizer::double_dash_flag_values(tokens, Dialect::Msbuild, "logger").any(|value| {
         let lower = value.to_ascii_lowercase();
         lower == "trx" || lower.starts_with("trx;")
     })
 }
 
 fn has_results_directory_arg(tokens: &[Token<'_>]) -> bool {
-    dotnet_has_flag(tokens, "results-directory")
+    dotnet_has_double_dash_flag(tokens, "results-directory")
 }
 
 fn has_report_arg(tokens: &[Token<'_>]) -> bool {
-    dotnet_has_flag(tokens, "report")
+    dotnet_has_double_dash_flag(tokens, "report")
 }
 
 fn has_report_trx_arg(tokens: &[Token<'_>]) -> bool {
-    dotnet_has_flag(tokens, "report-trx")
+    dotnet_has_double_dash_flag(tokens, "report-trx")
 }
 
 /// Injects `--report-trx` after the `--` separator in `args`.
@@ -821,19 +837,23 @@ fn inject_report_trx_into_args(args: &[String]) -> Vec<String> {
 }
 
 fn extract_report_arg(tokens: &[Token<'_>]) -> Option<PathBuf> {
-    dotnet_flag_value(tokens, "report").map(PathBuf::from)
+    dotnet_double_dash_flag_value(tokens, "report").map(PathBuf::from)
 }
 
 fn has_verify_no_changes_arg(tokens: &[Token<'_>]) -> bool {
-    dotnet_has_flag(tokens, "verify-no-changes")
+    dotnet_has_double_dash_flag(tokens, "verify-no-changes")
 }
 
 fn has_write_mode_override(tokens: &[Token<'_>]) -> bool {
-    dotnet_has_flag(tokens, "write")
+    // --write is RTK's own pseudo-flag (stripped in build_effective_dotnet_format_args, never
+    // forwarded to real dotnet), not a real dotnet-format option -- but it's grouped with the
+    // other dotnet-format-level flags here, so it's kept double-dash-only too for consistency
+    // and predictability rather than inventing its own laxer convention.
+    dotnet_has_double_dash_flag(tokens, "write")
 }
 
 fn extract_results_directory_arg(tokens: &[Token<'_>]) -> Option<PathBuf> {
-    dotnet_flag_value(tokens, "results-directory").map(PathBuf::from)
+    dotnet_double_dash_flag_value(tokens, "results-directory").map(PathBuf::from)
 }
 
 fn normalize_build_summary(
@@ -1384,6 +1404,40 @@ mod tests {
 
         let args = vec!["--configuration".to_string(), "Release".to_string()];
         assert!(!has_binlog_arg(&dotnet_tokens(&args)));
+    }
+
+    #[test]
+    fn test_double_dash_only_flags_reject_single_dash_and_slash_spellings() {
+        // Regression: verified against a real dotnet 9 SDK (Docker) that unlike -nologo/-bl/-v
+        // (genuine legacy MSBuild.exe passthrough switches, valid via -/--// alike),
+        // --results-directory/--report/--report-trx/--verify-no-changes/--write are
+        // double-dash-only. A single-dash or slash spelling doesn't get cleanly rejected --
+        // it gets misparsed as an unrelated MSBuild switch (e.g. "-results-directory" reads as
+        // MSBuild's own unrecognized switch "results-directory"; "-logger" collides with
+        // MSBuild's own -logger switch, which wants a logger assembly spec, not "trx").
+        let args = vec!["-results-directory".to_string(), "/tmp/out".to_string()];
+        assert!(!has_results_directory_arg(&dotnet_tokens(&args)));
+        assert_eq!(extract_results_directory_arg(&dotnet_tokens(&args)), None);
+
+        let args = vec!["/results-directory".to_string(), "/tmp/out".to_string()];
+        assert!(!has_results_directory_arg(&dotnet_tokens(&args)));
+
+        let args = vec!["-report".to_string(), "/tmp/r.json".to_string()];
+        assert!(!has_report_arg(&dotnet_tokens(&args)));
+        assert_eq!(extract_report_arg(&dotnet_tokens(&args)), None);
+
+        let args = vec!["-report-trx".to_string()];
+        assert!(!has_report_trx_arg(&dotnet_tokens(&args)));
+
+        let args = vec!["-verify-no-changes".to_string()];
+        assert!(!has_verify_no_changes_arg(&dotnet_tokens(&args)));
+
+        let args = vec!["-write".to_string()];
+        assert!(!has_write_mode_override(&dotnet_tokens(&args)));
+
+        // The canonical "--" forms still work.
+        let args = vec!["--results-directory".to_string(), "/tmp/out".to_string()];
+        assert!(has_results_directory_arg(&dotnet_tokens(&args)));
     }
 
     #[test]
