@@ -56,44 +56,45 @@ fn golangci_takes_value(kind: TokenKind, name: &str) -> bool {
 /// --out-format`), it would tokenize as its own genuine Long token and be misdetected by
 /// has_output_flag's presence check.
 fn golangci_run_takes_value(kind: TokenKind, name: &str) -> bool {
+    // The one exception to one-grammar-per-command (`src/core/README.md`), earned by a strict
+    // subset: every flag valid before `run` stays valid after it. Grammars that merely
+    // intersect get a table each instead.
+    if golangci_takes_value(kind, name) {
+        return true;
+    }
     match kind {
         TokenKind::Long => matches!(
             name,
-            "config"
+            "build-tags"
                 | "default"
                 | "disable"
                 | "enable"
                 | "enable-only"
-                | "modules-download-mode"
                 | "issues-exit-code"
-                | "build-tags"
-                | "timeout"
-                | "path-prefix"
-                | "path-mode"
+                | "max-issues-per-linter"
+                | "max-same-issues"
+                | "modules-download-mode"
+                | "new-from-merge-base"
+                | "new-from-patch"
+                | "new-from-rev"
                 // v1-only legacy flag (golangci-lint 2.x's --help no longer lists it, replaced
                 // by output.json.path/etc.), kept for v1 installs since has_output_flag checks
                 // for it explicitly.
                 | "out-format"
-                | "output.text.path"
-                | "output.json.path"
-                | "output.tab.path"
-                | "output.html.path"
                 | "output.checkstyle.path"
                 | "output.code-climate.path"
+                | "output.html.path"
+                | "output.json.path"
                 | "output.junit-xml.path"
-                | "output.teamcity.path"
                 | "output.sarif.path"
-                | "max-issues-per-linter"
-                | "max-same-issues"
-                | "new-from-rev"
-                | "new-from-patch"
-                | "new-from-merge-base"
-                | "cpu-profile-path"
-                | "mem-profile-path"
-                | "trace-path"
-                | "color"
+                | "output.tab.path"
+                | "output.teamcity.path"
+                | "output.text.path"
+                | "path-mode"
+                | "path-prefix"
+                | "timeout"
         ),
-        TokenKind::Short => matches!(name, "c" | "D" | "E" | "j"),
+        TokenKind::Short => matches!(name, "D" | "E" | "j"),
         _ => false,
     }
 }
