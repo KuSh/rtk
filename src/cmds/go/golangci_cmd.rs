@@ -233,6 +233,16 @@ fn build_filtered_args(invocation: &RunInvocation, version: u32) -> Vec<String> 
     args
 }
 
+/// KNOWN LIMITATION, not fixed here: golangci_takes_value's doc scopes it to golangci-lint's
+/// *global* (pre-`run`) flags, but this tokenizes `invocation.run_args` (post-`run`) with the
+/// same predicate. `has_flag`'s own presence check only matches genuine `Long` tokens (never a
+/// misclassified value), so this is safe as long as no run-level value-taking flag is missing
+/// from golangci_takes_value's list -- but if one is (e.g. a hypothetical `--path-prefix`) and
+/// its separate-token value is itself spelled like a recognized flag (e.g. `--path-prefix
+/// --out-format`), that value would tokenize as its own genuine Long token and be misdetected.
+/// Not fixed here since it would require golangci-lint's actual complete run-level flag
+/// inventory to expand golangci_takes_value correctly, and no local golangci-lint binary was
+/// available to verify it against (the established verification bar for this file's flag lists).
 fn has_output_flag(args: &[String]) -> bool {
     let tokens = arg_tokenizer::tokenize(args, &golangci_takes_value);
     arg_tokenizer::has_flag(&tokens, Dialect::Posix, "out-format")
