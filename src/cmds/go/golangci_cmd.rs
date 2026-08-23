@@ -140,15 +140,16 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 fn run_filtered(original_args: &[String], invocation: &RunInvocation, verbose: u8) -> Result<i32> {
     let version = detect_major_version();
 
+    let filtered_args = build_filtered_args(invocation, version);
     let mut cmd = resolved_command("golangci-lint");
-    for arg in build_filtered_args(invocation, version) {
+    for arg in &filtered_args {
         cmd.arg(arg);
     }
 
     if verbose > 0 {
         eprintln!(
             "Running: {}",
-            format_command("golangci-lint", &build_filtered_args(invocation, version))
+            format_command("golangci-lint", &filtered_args)
         );
     }
 

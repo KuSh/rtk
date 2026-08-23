@@ -848,8 +848,18 @@ fn has_write_mode_override(tokens: &[Token<'_>]) -> bool {
     // --write is RTK's own pseudo-flag (stripped in build_effective_dotnet_format_args, never
     // forwarded to real dotnet), not a real dotnet-format option -- but it's grouped with the
     // other dotnet-format-level flags here, so it's kept double-dash-only too for consistency
-    // and predictability rather than inventing its own laxer convention.
-    dotnet_has_double_dash_flag(tokens, "write")
+    // and predictability rather than inventing its own laxer convention. It's a pure boolean
+    // switch (never meant to take a value), so an attached-value spelling like "--write=true"
+    // must not match here either: build_effective_dotnet_format_args's strip filter only
+    // removes the exact bare "--write" token, and detecting-but-not-stripping an attached form
+    // would leave it forwarded verbatim to real dotnet, which has no --write option at all and
+    // would reject it.
+    tokens.iter().any(|t| {
+        t.kind == TokenKind::Long
+            && t.double_dash
+            && t.attached.is_none()
+            && t.text.eq_ignore_ascii_case("write")
+    })
 }
 
 fn extract_results_directory_arg(tokens: &[Token<'_>]) -> Option<PathBuf> {
@@ -2742,6 +2752,40 @@ mod tests {
             effective.first().map(String::as_str),
             Some("src/App/App.csproj")
         );
+    }
+
+    #[test]
+    fn test_write_override_detection_and_stripping_agree_on_attached_values() {
+        // Regression: --write is a pure boolean pseudo-flag with no real dotnet equivalent
+        // (confirmed via Docker: dotnet format has no --write option at all), so it was never
+        // meant to take a value. Before this fix, has_write_mode_override matched an
+        // attached-value spelling ("--write=true") as an override, but
+        // build_effective_dotnet_format_args's strip filter only ever removed the exact bare
+        // "--write" token -- so RTK would skip its own --verify-no-changes injection *and*
+        // still forward the unrecognized "--write=true" to real dotnet, which rejects it.
+        // Detection must agree with stripping: an attached-value spelling is simply not
+        // recognized as the --write pseudo-flag at all (matching how any other unrecognized
+        // argument passes through untouched), not silently swallowed.
+        let args = vec!["--write=true".to_string()];
+        let tokens = dotnet_tokens(&args);
+        assert!(!has_write_mode_override(&tokens));
+
+        let effective = build_effective_dotnet_format_args(&args, &tokens, None);
+        assert!(
+            effective.contains(&"--write=true".to_string()),
+            "an unrecognized flag must pass through untouched, not be silently dropped: {effective:?}"
+        );
+        // Since it wasn't recognized as an override, RTK still defaults to its own safe
+        // check-only mode.
+        assert!(effective.contains(&"--verify-no-changes".to_string()));
+
+        // The bare boolean form still works as documented.
+        let args = vec!["--write".to_string()];
+        let tokens = dotnet_tokens(&args);
+        assert!(has_write_mode_override(&tokens));
+        let effective = build_effective_dotnet_format_args(&args, &tokens, None);
+        assert!(!effective.iter().any(|a| a == "--write"));
+        assert!(!effective.iter().any(|a| a == "--verify-no-changes"));
     }
 
     #[test]
