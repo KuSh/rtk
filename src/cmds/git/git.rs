@@ -2618,6 +2618,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_checkout_new_branch_arg_accepts_glued_short_flag() {
+        // Confirmed against real git 2.51: `git checkout -bmy-branch` (glued, no space) creates
+        // "my-branch", same as the separate-token form `-b my-branch`. Token::value's
+        // attached-or-linked lookup recognizes both automatically; this pins that real behavior
+        // now that it's tokenizer-driven rather than a hand-rolled `arg == "-b"` string match.
+        let args = vec!["-bmy-branch".to_string()];
+        let tokens = arg_tokenizer::tokenize(&args, &checkout_takes_value);
+        assert_eq!(checkout_new_branch_arg(&tokens), Some("my-branch"));
+
+        let args = vec!["-b".to_string(), "my-branch".to_string()];
+        let tokens = arg_tokenizer::tokenize(&args, &checkout_takes_value);
+        assert_eq!(checkout_new_branch_arg(&tokens), Some("my-branch"));
+    }
+
+    #[test]
+    fn test_checkout_reset_branch_arg_accepts_glued_short_flag() {
+        // Same glued-form guarantee as -b, for -B (force-create/reset).
+        let args = vec!["-Bmy-branch".to_string()];
+        let tokens = arg_tokenizer::tokenize(&args, &checkout_takes_value);
+        assert_eq!(checkout_reset_branch_arg(&tokens), Some("my-branch"));
+    }
+
+    #[test]
     fn test_git_cmd_no_global_args() {
         let cmd = git_cmd(&[]);
         let program = cmd.get_program().to_string_lossy().to_string();
