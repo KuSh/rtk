@@ -70,6 +70,10 @@ fn golangci_run_takes_value(kind: TokenKind, name: &str) -> bool {
                 | "timeout"
                 | "path-prefix"
                 | "path-mode"
+                // v1-only legacy flag (golangci-lint 2.x's --help no longer lists it, replaced
+                // by output.json.path/etc.), kept for v1 installs since has_output_flag checks
+                // for it explicitly.
+                | "out-format"
                 | "output.text.path"
                 | "output.json.path"
                 | "output.tab.path"
@@ -696,6 +700,18 @@ mod tests {
             "errcheck".to_string(),
         ]));
         assert!(!has_output_flag(&["--timeout".to_string(), "30s".to_string()]));
+
+    }
+
+    #[test]
+    fn test_golangci_run_takes_value_links_out_format_separate_token_value() {
+        // Regression: --out-format (v1-only legacy flag) was missing from
+        // golangci_run_takes_value's list, so its separate-token value ("json") tokenized
+        // independently as an unlinked Positional instead of being linked as --out-format's own
+        // value -- the same bug class already fixed for --path-prefix in this diff.
+        let args = vec!["--out-format".to_string(), "json".to_string()];
+        let tokens = arg_tokenizer::tokenize(&args, &golangci_run_takes_value);
+        assert!(tokens[0].linked.is_some(), "\"json\" must link to --out-format");
     }
 
     #[test]
