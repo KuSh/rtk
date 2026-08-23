@@ -119,6 +119,7 @@ fn match_block(path: &str, entries: &[(usize, bool, String)]) -> String {
 ///
 fn extract_pattern_path<T: AsRef<str>>(
     args: &[T],
+    engine: Engine,
 ) -> (Vec<String>, Vec<String>, Vec<String>, bool) {
     let tokens = arg_tokenizer::tokenize(args, &search_takes_value);
 
@@ -137,7 +138,7 @@ fn extract_pattern_path<T: AsRef<str>>(
                 }
             }
             TokenKind::Long => {
-                if is_format_flag_token(t.kind, t.text) {
+                if is_format_flag_token(engine, t.kind, t.text) {
                     has_format_flag = true;
                 }
                 match t.attached {
@@ -169,7 +170,7 @@ fn extract_pattern_path<T: AsRef<str>>(
                 let cluster = &tokens[start..=i];
                 if cluster
                     .iter()
-                    .any(|c| is_format_flag_token(c.kind, c.text))
+                    .any(|c| is_format_flag_token(engine, c.kind, c.text))
                 {
                     has_format_flag = true;
                 }
@@ -232,7 +233,7 @@ fn unparsed_signal(stdout: &str) -> usize {
 /// rg is the fallback when grep is absent, rejects a flag, or `--type` is used.
 /// The search engine the agent actually invoked. RTK runs this binary verbatim
 /// and never substitutes one for the other.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Engine {
     Grep,
     Rg,
@@ -490,7 +491,8 @@ pub fn run(
     let real_cmd = format!("{} {}", engine.label(), args.join(" "));
     let rtk_label = format!("rtk {}", engine.label());
 
-    let (patterns, paths, extra_args, extra_args_has_format_flag) = extract_pattern_path(&args);
+    let (patterns, paths, extra_args, extra_args_has_format_flag) =
+        extract_pattern_path(&args, engine);
 
     if patterns.is_empty() {
         return passthrough(&timer, engine, &args, &real_cmd, false);
@@ -716,7 +718,13 @@ fn parse_match_line(line: &str) -> Option<(String, usize, bool, &str)> {
 
 /// Minimal/shape forms the agent already chose; short flags matched per-letter so clusters
 /// like -rl/-rq route through, plus their long forms.
-fn is_format_flag_token(kind: TokenKind, text: &str) -> bool {
+///
+/// `engine`-aware because two short letters mean unrelated things for grep vs rg: `-L` is
+/// GNU grep's `--files-without-match` (a real shape flag) but ripgrep's `--follow` (symlinks,
+/// not a format flag); `-z` is grep's `--null-data` (input line terminator) but ripgrep's
+/// `--search-zip` (search compressed files, not a format flag either). Confirmed against real
+/// `grep --help`/`rg --help`.
+fn is_format_flag_token(engine: Engine, kind: TokenKind, text: &str) -> bool {
     const LONG: &[&str] = &[
         "byte-offset",
         "column",
@@ -736,8 +744,13 @@ fn is_format_flag_token(kind: TokenKind, text: &str) -> bool {
     ];
     match kind {
         TokenKind::Long => LONG.contains(&text),
-        // -c count, -l/-L lists, -o only-matching, -q quiet, -b byte-offset, -Z/-z NUL
-        TokenKind::Short => matches!(text, "c" | "l" | "L" | "o" | "q" | "b" | "Z" | "z"),
+        // -c count, -l/-L lists, -o only-matching, -q quiet, -b byte-offset, -Z NUL are shared;
+        // -L/-z mean something unrelated to output shape for rg specifically (see above).
+        TokenKind::Short => match text {
+            "L" | "z" => engine == Engine::Grep,
+            "Z" | "b" | "c" | "l" | "o" | "q" => true,
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -746,14 +759,14 @@ fn is_format_flag_token(kind: TokenKind, text: &str) -> bool {
 /// `has_format_flag` extract_pattern_path already returns, computed in the same token pass
 /// instead of tokenizing the reconstructed `flags` strings a second time.
 #[cfg(test)]
-fn has_format_flag<T: AsRef<str>>(extra_args: &[T]) -> bool {
+fn has_format_flag<T: AsRef<str>>(engine: Engine, extra_args: &[T]) -> bool {
     // Shares search_takes_value with extract_pattern_path so a value-taking flag's value (e.g.
     // `-e --json`, where "--json" is -e's pattern, not the real --json flag) is never misread as
     // one of these.
     let tokens = arg_tokenizer::tokenize(extra_args, &search_takes_value);
     tokens
         .iter()
-        .any(|t| is_format_flag_token(t.kind, t.text))
+        .any(|t| is_format_flag_token(engine, t.kind, t.text))
 }
 
 fn clean_line(line: &str, max_len: usize, context_re: Option<&Regex>, pattern: &str) -> String {
@@ -908,7 +921,7 @@ mod tests {
 
     #[test]
     fn test_extract_simple() {
-        let (patterns, paths, flags, _) = extract_pattern_path(&["foo", "src/"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["foo", "src/"], Engine::Grep);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src/"]);
         assert!(flags.is_empty());
@@ -916,7 +929,7 @@ mod tests {
 
     #[test]
     fn test_extract_with_bool_flag() {
-        let (patterns, paths, flags, _) = extract_pattern_path(&["-i", "foo", "src/"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-i", "foo", "src/"], Engine::Grep);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src/"]);
         assert_eq!(flags, vec!["-i"]);
@@ -925,7 +938,7 @@ mod tests {
     #[test]
     fn test_extract_value_taking_flag() {
         // -A 2 must not steal "error" as its value
-        let (patterns, paths, flags, _) = extract_pattern_path(&["-A", "2", "error", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-A", "2", "error", "src"], Engine::Grep);
         assert_eq!(patterns, vec!["error"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-A", "2"]);
@@ -934,7 +947,7 @@ mod tests {
     #[test]
     fn test_extract_cluster_keeps_r() {
         // -rn: r kept, passed straight to grep
-        let (patterns, paths, flags, _) = extract_pattern_path(&["-rn", "foo", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-rn", "foo", "src"], Engine::Grep);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-rn"]);
@@ -943,7 +956,7 @@ mod tests {
     #[test]
     fn test_extract_cluster_ending_in_e() {
         // -rne PATTERN: rn kept, e consumes PATTERN as the pattern
-        let (patterns, paths, flags, _) = extract_pattern_path(&["-rne", "PATTERN", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-rne", "PATTERN", "src"], Engine::Grep);
         assert_eq!(patterns, vec!["PATTERN"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-rn"]);
@@ -952,7 +965,7 @@ mod tests {
     #[test]
     fn test_extract_cluster_ending_in_value_flag() {
         // -rA 2: r kept as its own flag, A consumes 2 as context value
-        let (patterns, paths, flags, _) = extract_pattern_path(&["-rA", "2", "foo", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-rA", "2", "foo", "src"], Engine::Grep);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-r", "-A", "2"]);
@@ -960,7 +973,7 @@ mod tests {
 
     #[test]
     fn test_extract_multi_path() {
-        let (patterns, paths, flags, _) = extract_pattern_path(&["TODO", "src", "tests"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["TODO", "src", "tests"], Engine::Grep);
         assert_eq!(patterns, vec!["TODO"]);
         assert_eq!(paths, vec!["src", "tests"]);
         assert!(flags.is_empty());
@@ -969,7 +982,7 @@ mod tests {
     #[test]
     fn test_extract_glob_value() {
         // -g '*.md' must not steal "agent" as its value
-        let (patterns, paths, flags, _) = extract_pattern_path(&["-i", "x", "agent", "-g", "*.md"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-i", "x", "agent", "-g", "*.md"], Engine::Grep);
         assert_eq!(patterns, vec!["x"]);
         assert_eq!(paths, vec!["agent"]);
         assert_eq!(flags, vec!["-i", "-g", "*.md"]);
@@ -977,7 +990,7 @@ mod tests {
 
     #[test]
     fn test_extract_e_flag() {
-        let (patterns, paths, flags, _) = extract_pattern_path(&["-e", "fn run", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-e", "fn run", "src"], Engine::Grep);
         assert_eq!(patterns, vec!["fn run"]);
         assert_eq!(paths, vec!["src"]);
         assert!(flags.is_empty());
@@ -985,7 +998,7 @@ mod tests {
 
     #[test]
     fn test_extract_multi_e() {
-        let (patterns, paths, flags, _) = extract_pattern_path(&["-e", "foo", "-e", "bar", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-e", "foo", "-e", "bar", "src"], Engine::Grep);
         assert_eq!(patterns, vec!["foo", "bar"]);
         assert_eq!(paths, vec!["src"]);
         assert!(flags.is_empty());
@@ -994,7 +1007,7 @@ mod tests {
     #[test]
     fn test_extract_dashdash_boundary() {
         // After --, args are positional even if they look like flags
-        let (patterns, paths, flags, _) = extract_pattern_path(&["--", "--version"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["--", "--version"], Engine::Grep);
         assert_eq!(patterns, vec!["--version"]);
         assert!(paths.is_empty());
         assert!(flags.is_empty());
@@ -1002,7 +1015,7 @@ mod tests {
 
     #[test]
     fn test_extract_no_args() {
-        let (patterns, paths, flags, _) = extract_pattern_path::<&str>(&[]);
+        let (patterns, paths, flags, _) = extract_pattern_path::<&str>(&[], Engine::Grep);
         assert!(patterns.is_empty());
         assert!(paths.is_empty());
         assert!(flags.is_empty());
@@ -1011,7 +1024,7 @@ mod tests {
     #[test]
     fn test_extract_default_path_empty() {
         // Caller is responsible for defaulting empty paths to ["."]
-        let (patterns, paths, _, _) = extract_pattern_path(&["foo"]);
+        let (patterns, paths, _, _) = extract_pattern_path(&["foo"], Engine::Grep);
         assert_eq!(patterns, vec!["foo"]);
         assert!(paths.is_empty());
     }
@@ -1019,7 +1032,7 @@ mod tests {
     #[test]
     fn test_extract_ending_e() {
         let (patterns, paths, flags, _) =
-            extract_pattern_path(&["-e", "foo", "-e", "bar", "src", "-e"]);
+            extract_pattern_path(&["-e", "foo", "-e", "bar", "src", "-e"], Engine::Grep);
         assert_eq!(patterns, vec!["foo", "bar"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-e"]);
@@ -1030,7 +1043,7 @@ mod tests {
     #[test]
     fn test_extract_inline_e_value() {
         // -ecarrot: e hits at j=0, inline="carrot", no r-stripping on value
-        let (patterns, paths, flags, _) = extract_pattern_path(&["-ecarrot", "file"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-ecarrot", "file"], Engine::Grep);
         assert_eq!(patterns, vec!["carrot"]);
         assert_eq!(paths, vec!["file"]);
         assert!(flags.is_empty());
@@ -1039,7 +1052,7 @@ mod tests {
     #[test]
     fn test_extract_inline_e_value_no_rstrip() {
         // -ecarrot: the 'r' in "carrot" must NOT be stripped (it's value, not a flag)
-        let (patterns, _, _, _) = extract_pattern_path(&["-ecarrot", "file"]);
+        let (patterns, _, _, _) = extract_pattern_path(&["-ecarrot", "file"], Engine::Grep);
         assert_eq!(
             patterns,
             vec!["carrot"],
@@ -1050,7 +1063,7 @@ mod tests {
     #[test]
     fn test_extract_inline_g_value() {
         // -g*.rs: g hits at j=0, inline="*.rs", no r-stripping on value
-        let (patterns, paths, flags, _) = extract_pattern_path(&["aaa", "sub", "-g*.rs"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["aaa", "sub", "-g*.rs"], Engine::Grep);
         assert_eq!(patterns, vec!["aaa"]);
         assert_eq!(paths, vec!["sub"]);
         assert_eq!(flags, vec!["-g", "*.rs"]);
@@ -1059,7 +1072,7 @@ mod tests {
     #[test]
     fn test_extract_inline_g_value_no_rstrip() {
         // -g*.rs: the 'r' in "*.rs" must NOT be stripped
-        let (_, _, flags, _) = extract_pattern_path(&["aaa", "sub", "-g*.rs"]);
+        let (_, _, flags, _) = extract_pattern_path(&["aaa", "sub", "-g*.rs"], Engine::Grep);
         assert!(
             flags.contains(&"*.rs".to_string()),
             "r in glob value must not be stripped"
@@ -1070,7 +1083,7 @@ mod tests {
 
     #[test]
     fn test_extract_long_glob_value() {
-        let (patterns, paths, flags, _) = extract_pattern_path(&["compact", "sub", "--glob", "*.md"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["compact", "sub", "--glob", "*.md"], Engine::Grep);
         assert_eq!(patterns, vec!["compact"]);
         assert_eq!(paths, vec!["sub"]);
         assert_eq!(flags, vec!["--glob", "*.md"]);
@@ -1078,7 +1091,7 @@ mod tests {
 
     #[test]
     fn test_extract_long_max_count() {
-        let (patterns, paths, flags, _) = extract_pattern_path(&["--max-count", "1", "fn", "file"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["--max-count", "1", "fn", "file"], Engine::Grep);
         assert_eq!(patterns, vec!["fn"]);
         assert_eq!(paths, vec!["file"]);
         assert_eq!(flags, vec!["--max-count", "1"]);
@@ -1087,7 +1100,7 @@ mod tests {
     #[test]
     fn test_extract_short_type() {
         // -t rust: type filter, value must not become pattern
-        let (patterns, paths, flags, _) = extract_pattern_path(&["-t", "rust", "fn", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-t", "rust", "fn", "src"], Engine::Grep);
         assert_eq!(patterns, vec!["fn"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-t", "rust"]);
@@ -1096,7 +1109,7 @@ mod tests {
     #[test]
     fn test_extract_short_max_depth() {
         // -d 3: max-depth, value must not become pattern
-        let (patterns, paths, flags, _) = extract_pattern_path(&["-d", "3", "foo", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-d", "3", "foo", "src"], Engine::Grep);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-d", "3"]);
@@ -1105,7 +1118,7 @@ mod tests {
     #[test]
     fn test_extract_short_max_columns() {
         // -M 120: max-columns, value must not become pattern
-        let (patterns, paths, flags, _) = extract_pattern_path(&["-M", "120", "foo", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["-M", "120", "foo", "src"], Engine::Grep);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-M", "120"]);
@@ -1114,7 +1127,7 @@ mod tests {
     #[test]
     fn test_extract_long_regexp() {
         // --regexp is the long form of -e; value goes to patterns
-        let (patterns, paths, flags, _) = extract_pattern_path(&["--regexp", "fn run", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["--regexp", "fn run", "src"], Engine::Grep);
         assert_eq!(patterns, vec!["fn run"]);
         assert_eq!(paths, vec!["src"]);
         assert!(flags.is_empty());
@@ -1123,7 +1136,7 @@ mod tests {
     #[test]
     fn test_extract_long_regexp_multi() {
         // --regexp can be combined with -e
-        let (patterns, paths, _, _) = extract_pattern_path(&["--regexp", "foo", "-e", "bar", "src"]);
+        let (patterns, paths, _, _) = extract_pattern_path(&["--regexp", "foo", "-e", "bar", "src"], Engine::Grep);
         assert_eq!(patterns, vec!["foo", "bar"]);
         assert_eq!(paths, vec!["src"]);
     }
@@ -1131,7 +1144,7 @@ mod tests {
     #[test]
     fn test_extract_long_ignore_file() {
         let (patterns, paths, flags, _) =
-            extract_pattern_path(&["--ignore-file", ".myignore", "foo", "src"]);
+            extract_pattern_path(&["--ignore-file", ".myignore", "foo", "src"], Engine::Grep);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["--ignore-file", ".myignore"]);
@@ -1139,7 +1152,7 @@ mod tests {
 
     #[test]
     fn test_extract_long_engine() {
-        let (patterns, paths, flags, _) = extract_pattern_path(&["--engine", "pcre2", "foo", "src"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["--engine", "pcre2", "foo", "src"], Engine::Grep);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["--engine", "pcre2"]);
@@ -1148,7 +1161,7 @@ mod tests {
     #[test]
     fn test_extract_long_type_clear() {
         let (patterns, paths, flags, _) =
-            extract_pattern_path(&["--type-clear", "rust", "foo", "src"]);
+            extract_pattern_path(&["--type-clear", "rust", "foo", "src"], Engine::Grep);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["--type-clear", "rust"]);
@@ -1157,7 +1170,7 @@ mod tests {
     #[test]
     fn test_extract_long_path_separator() {
         let (patterns, paths, flags, _) =
-            extract_pattern_path(&["--path-separator", "/", "foo", "src"]);
+            extract_pattern_path(&["--path-separator", "/", "foo", "src"], Engine::Grep);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["--path-separator", "/"]);
@@ -1166,7 +1179,7 @@ mod tests {
     #[test]
     fn test_extract_long_flag_inline_eq_passthrough() {
         // --glob=*.rs is one token (inline =): passes through as-is, not consumed as pair
-        let (patterns, paths, flags, _) = extract_pattern_path(&["foo", "src", "--glob=*.rs"]);
+        let (patterns, paths, flags, _) = extract_pattern_path(&["foo", "src", "--glob=*.rs"], Engine::Grep);
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["--glob=*.rs"]);
@@ -1176,22 +1189,22 @@ mod tests {
 
     #[test]
     fn test_format_flag_detects_count_matches() {
-        assert!(has_format_flag(&["--count-matches"]));
+        assert!(has_format_flag(Engine::Grep, &["--count-matches"]));
     }
 
     #[test]
     fn test_format_flag_detects_json() {
-        assert!(has_format_flag(&["--json"]));
+        assert!(has_format_flag(Engine::Grep, &["--json"]));
     }
 
     #[test]
     fn test_format_flag_detects_passthru() {
-        assert!(has_format_flag(&["--passthru"]));
+        assert!(has_format_flag(Engine::Grep, &["--passthru"]));
     }
 
     #[test]
     fn test_format_flag_detects_files() {
-        assert!(has_format_flag(&["--files"]));
+        assert!(has_format_flag(Engine::Grep, &["--files"]));
     }
 
     // --- truncation accuracy ---
@@ -1219,37 +1232,61 @@ mod tests {
 
     #[test]
     fn test_format_flag_detects_count() {
-        assert!(has_format_flag(&["-c"]));
-        assert!(has_format_flag(&["--count"]));
+        assert!(has_format_flag(Engine::Grep, &["-c"]));
+        assert!(has_format_flag(Engine::Grep, &["--count"]));
     }
 
     #[test]
     fn test_format_flag_detects_files_with_matches() {
-        assert!(has_format_flag(&["-l"]));
-        assert!(has_format_flag(&["--files-with-matches"]));
+        assert!(has_format_flag(Engine::Grep, &["-l"]));
+        assert!(has_format_flag(Engine::Grep, &["--files-with-matches"]));
     }
 
     #[test]
     fn test_format_flag_detects_files_without_match() {
-        assert!(has_format_flag(&["-L"]));
-        assert!(has_format_flag(&["--files-without-match"]));
+        assert!(has_format_flag(Engine::Grep, &["-L"]));
+        assert!(has_format_flag(Engine::Grep, &["--files-without-match"]));
+    }
+
+    #[test]
+    fn test_format_flag_is_engine_aware_for_ambiguous_short_letters() {
+        // Regression: -L and -z mean unrelated things for grep vs rg (confirmed against real
+        // `grep --help`/`rg --help`). Grep: -L is --files-without-match (a real shape flag), -z
+        // is --null-data (input line terminator). Rg: -L is --follow (symlinks, NOT a format
+        // flag) and -z is --search-zip (search compressed files, NOT a format flag either).
+        // Before this fix, is_format_flag_token was engine-unaware, so `rtk rg -L pattern src`
+        // was misdetected as already-minimal output and wrongly routed to raw passthrough,
+        // skipping RTK's match compression/grouping.
+        assert!(has_format_flag(Engine::Grep, &["-L"]));
+        assert!(!has_format_flag(Engine::Rg, &["-L"]));
+
+        assert!(has_format_flag(Engine::Grep, &["-z"]));
+        assert!(!has_format_flag(Engine::Rg, &["-z"]));
+
+        // Unambiguous shape letters still agree across engines.
+        assert!(has_format_flag(Engine::Rg, &["-c"]));
+        assert!(has_format_flag(Engine::Rg, &["-l"]));
+        assert!(has_format_flag(Engine::Rg, &["-o"]));
+        assert!(has_format_flag(Engine::Rg, &["-q"]));
+        assert!(has_format_flag(Engine::Rg, &["-b"]));
+        assert!(has_format_flag(Engine::Rg, &["-Z"]));
     }
 
     #[test]
     fn test_format_flag_detects_only_matching() {
-        assert!(has_format_flag(&["-o"]));
-        assert!(has_format_flag(&["--only-matching"]));
+        assert!(has_format_flag(Engine::Grep, &["-o"]));
+        assert!(has_format_flag(Engine::Grep, &["--only-matching"]));
     }
 
     #[test]
     fn test_format_flag_detects_null() {
-        assert!(has_format_flag(&["-Z"]));
-        assert!(has_format_flag(&["--null"]));
+        assert!(has_format_flag(Engine::Grep, &["-Z"]));
+        assert!(has_format_flag(Engine::Grep, &["--null"]));
     }
 
     #[test]
     fn test_format_flag_ignores_normal_flags() {
-        assert!(!has_format_flag(&["-i", "-w", "-A", "3"]));
+        assert!(!has_format_flag(Engine::Grep, &["-i", "-w", "-A", "3"]));
     }
 
     #[test]
@@ -1259,9 +1296,9 @@ mod tests {
         // `-e --json` means "--json" is -e's pattern argument (is_short_value_flag("e") is
         // true), not the real --json format flag -- but the old per-arg scan matched "--json"
         // regardless of position.
-        assert!(!has_format_flag(&["-e", "--json"]));
+        assert!(!has_format_flag(Engine::Grep, &["-e", "--json"]));
         // Same for the long-flag form of a value-taking option.
-        assert!(!has_format_flag(&["--regexp", "--quiet"]));
+        assert!(!has_format_flag(Engine::Grep, &["--regexp", "--quiet"]));
     }
 
     #[test]
@@ -1269,55 +1306,55 @@ mod tests {
         // extract_pattern_path computes has_format_flag from its own token pass instead of
         // tokenizing the reconstructed `flags` strings a second time; pin that it agrees with
         // has_format_flag's own (test-only) from-scratch computation on representative cases.
-        let (_, _, _, has_format) = extract_pattern_path(&["foo", "src", "-q"]);
+        let (_, _, _, has_format) = extract_pattern_path(&["foo", "src", "-q"], Engine::Grep);
         assert!(has_format, "-q (quiet) should be detected");
 
-        let (_, _, _, has_format) = extract_pattern_path(&["foo", "src", "-rl"]);
+        let (_, _, _, has_format) = extract_pattern_path(&["foo", "src", "-rl"], Engine::Grep);
         assert!(has_format, "-l inside the -rl cluster should be detected");
 
-        let (_, _, _, has_format) = extract_pattern_path(&["foo", "src", "--json"]);
+        let (_, _, _, has_format) = extract_pattern_path(&["foo", "src", "--json"], Engine::Grep);
         assert!(has_format, "--json should be detected");
 
-        let (_, _, _, has_format) = extract_pattern_path(&["-e", "--json", "src"]);
+        let (_, _, _, has_format) = extract_pattern_path(&["-e", "--json", "src"], Engine::Grep);
         assert!(
             !has_format,
             "-e's value must not be misread as the real --json flag"
         );
 
-        let (_, _, _, has_format) = extract_pattern_path(&["foo", "src", "-i", "-w"]);
+        let (_, _, _, has_format) = extract_pattern_path(&["foo", "src", "-i", "-w"], Engine::Grep);
         assert!(!has_format, "plain boolean flags aren't format flags");
     }
 
     #[test]
     fn test_format_flag_detects_clusters() {
         // clustered minimal forms must route to passthrough, not GROUP
-        assert!(has_format_flag(&["-rl"]));
-        assert!(has_format_flag(&["-rc"]));
-        assert!(has_format_flag(&["-rq"]));
-        assert!(has_format_flag(&["-rln"]));
-        assert!(has_format_flag(&["-cr"]));
+        assert!(has_format_flag(Engine::Grep, &["-rl"]));
+        assert!(has_format_flag(Engine::Grep, &["-rc"]));
+        assert!(has_format_flag(Engine::Grep, &["-rq"]));
+        assert!(has_format_flag(Engine::Grep, &["-rln"]));
+        assert!(has_format_flag(Engine::Grep, &["-cr"]));
     }
 
     #[test]
     fn test_format_flag_detects_quiet_and_shape() {
-        assert!(has_format_flag(&["-q"]));
-        assert!(has_format_flag(&["--quiet"]));
-        assert!(has_format_flag(&["--silent"]));
-        assert!(has_format_flag(&["-b"]));
-        assert!(has_format_flag(&["--byte-offset"]));
-        assert!(has_format_flag(&["--column"]));
-        assert!(has_format_flag(&["--vimgrep"]));
-        assert!(has_format_flag(&["-z"]));
-        assert!(has_format_flag(&["--null-data"]));
+        assert!(has_format_flag(Engine::Grep, &["-q"]));
+        assert!(has_format_flag(Engine::Grep, &["--quiet"]));
+        assert!(has_format_flag(Engine::Grep, &["--silent"]));
+        assert!(has_format_flag(Engine::Grep, &["-b"]));
+        assert!(has_format_flag(Engine::Grep, &["--byte-offset"]));
+        assert!(has_format_flag(Engine::Grep, &["--column"]));
+        assert!(has_format_flag(Engine::Grep, &["--vimgrep"]));
+        assert!(has_format_flag(Engine::Grep, &["-z"]));
+        assert!(has_format_flag(Engine::Grep, &["--null-data"]));
     }
 
     #[test]
     fn test_format_flag_compresses_default_and_context() {
         // compressible forms must NOT passthrough
-        assert!(!has_format_flag(&["-rn"]));
-        assert!(!has_format_flag(&["-A", "3"]));
-        assert!(!has_format_flag(&["-v"]));
-        assert!(!has_format_flag(&["-rin"]));
+        assert!(!has_format_flag(Engine::Grep, &["-rn"]));
+        assert!(!has_format_flag(Engine::Grep, &["-A", "3"]));
+        assert!(!has_format_flag(Engine::Grep, &["-v"]));
+        assert!(!has_format_flag(Engine::Grep, &["-rin"]));
     }
 
     fn flags(args: &[&str]) -> Vec<String> {
