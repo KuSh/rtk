@@ -529,7 +529,7 @@ fn build_effective_dotnet_args(
     }
 
     let runner_mode = if subcommand == "test" {
-        detect_test_runner_mode(args)
+        detect_test_runner_mode(tokens)
     } else {
         TestRunnerMode::Classic
     };
@@ -689,7 +689,14 @@ fn is_global_json_mtp_mode() -> bool {
 ///
 /// Priority order: global.json (MtpNative) > project-file/Directory.Build.props (MtpVsTestBridge) > Classic.
 /// `global.json` MTP mode is checked first because it overrides all project-level properties.
-fn detect_test_runner_mode(args: &[String]) -> TestRunnerMode {
+fn detect_test_runner_mode(tokens: &[Token<'_>]) -> TestRunnerMode {
+    detect_test_runner_mode_in_dir(tokens, Path::new("."))
+}
+
+/// `scan_dir` is the directory scanned for a project file when no explicit project is given --
+/// a parameter (rather than hardcoding ".") so tests can point it at an isolated tempdir instead
+/// of racing on the real process cwd.
+fn detect_test_runner_mode_in_dir(tokens: &[Token<'_>], scan_dir: &Path) -> TestRunnerMode {
     // global.json MTP mode takes overall precedence — when set, dotnet test runs MTP
     // natively regardless of project file properties.
     if is_global_json_mtp_mode() {
@@ -698,9 +705,13 @@ fn detect_test_runner_mode(args: &[String]) -> TestRunnerMode {
 
     let project_extensions = ["csproj", "fsproj", "vbproj"];
 
-    let explicit_projects: Vec<&str> = args
+    // Only unconsumed Positional tokens are candidate project paths -- scanning raw args (or
+    // token text generally) would also match a value-taking flag's own value that happens to
+    // end in one of these extensions (e.g. `--results-directory /tmp/MyResults.csproj`).
+    let explicit_projects: Vec<&str> = tokens
         .iter()
-        .map(String::as_str)
+        .filter(|t| t.kind == TokenKind::Positional && t.linked.is_none())
+        .map(|t| t.text)
         .filter(|a| {
             let lower = a.to_ascii_lowercase();
             project_extensions
@@ -718,8 +729,8 @@ fn detect_test_runner_mode(args: &[String]) -> TestRunnerMode {
             }
         }
     } else {
-        // No explicit project — scan current directory.
-        if let Ok(entries) = std::fs::read_dir(".") {
+        // No explicit project — scan scan_dir.
+        if let Ok(entries) = std::fs::read_dir(scan_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy().to_ascii_lowercase();
@@ -2301,13 +2312,10 @@ mod tests {
         .expect("write csproj");
 
         let args = vec![csproj.display().to_string()];
-        assert_eq!(
-            detect_test_runner_mode(&args),
-            TestRunnerMode::MtpVsTestBridge
-        );
+        let tokens = dotnet_tokens(&args);
+        assert_eq!(detect_test_runner_mode(&tokens), TestRunnerMode::MtpVsTestBridge);
 
         let binlog_path = Path::new("/tmp/test.binlog");
-        let tokens = dotnet_tokens(&args);
         let injected = build_effective_dotnet_args("test", &args, &tokens, binlog_path, None);
 
         // MTP VsTestBridge → --report-trx injected after --, no VSTest --logger trx
@@ -2331,13 +2339,10 @@ mod tests {
         .expect("write csproj");
 
         let args = vec![csproj.display().to_string()];
-        assert_eq!(
-            detect_test_runner_mode(&args),
-            TestRunnerMode::MtpVsTestBridge
-        );
+        let tokens = dotnet_tokens(&args);
+        assert_eq!(detect_test_runner_mode(&tokens), TestRunnerMode::MtpVsTestBridge);
 
         let binlog_path = Path::new("/tmp/test.binlog");
-        let tokens = dotnet_tokens(&args);
         let injected = build_effective_dotnet_args("test", &args, &tokens, binlog_path, None);
 
         // --report-trx injected after --, --nologo supported in bridge mode
@@ -2375,13 +2380,10 @@ mod tests {
         .expect("write csproj");
 
         let args = vec![csproj.display().to_string()];
-        assert_eq!(
-            detect_test_runner_mode(&args),
-            TestRunnerMode::MtpVsTestBridge
-        );
+        let tokens = dotnet_tokens(&args);
+        assert_eq!(detect_test_runner_mode(&tokens), TestRunnerMode::MtpVsTestBridge);
 
         let binlog_path = Path::new("/tmp/test.binlog");
-        let tokens = dotnet_tokens(&args);
         let injected = build_effective_dotnet_args("test", &args, &tokens, binlog_path, None);
 
         // VsTestBridge → inject -- --report-trx after user args
@@ -2465,15 +2467,49 @@ mod tests {
         .expect("write csproj");
 
         let args = vec![csproj.display().to_string()];
-        assert_eq!(detect_test_runner_mode(&args), TestRunnerMode::Classic);
+        let tokens = dotnet_tokens(&args);
+        assert_eq!(detect_test_runner_mode(&tokens), TestRunnerMode::Classic);
 
         let binlog_path = Path::new("/tmp/test.binlog");
         let trx_dir = Path::new("/tmp/test_results");
-        let tokens = dotnet_tokens(&args);
         let injected =
             build_effective_dotnet_args("test", &args, &tokens, binlog_path, Some(trx_dir));
         assert!(injected.contains(&"--logger".to_string()));
         assert!(injected.contains(&"trx".to_string()));
+    }
+
+    #[test]
+    fn test_detect_mode_ignores_flag_value_ending_in_project_extension() {
+        // Regression: explicit_projects used to scan every raw arg (or, after the tokenizer
+        // migration, every token's text) for a `.csproj`/`.fsproj`/`.vbproj` suffix, so a
+        // value-taking flag's own value happened to satisfy it too --
+        // `--results-directory /tmp/MyResults.csproj` made explicit_projects non-empty, which
+        // *skips* scanning the working directory entirely -- even though no real project was
+        // ever named. Set up a real VsTestBridge-marked project in an isolated scan_dir and
+        // confirm it's still found when the only args are a flag+value that merely looks like a
+        // project path.
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let csproj = temp_dir.path().join("Real.Tests.csproj");
+        fs::write(
+            &csproj,
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
+  </PropertyGroup>
+</Project>"#,
+        )
+        .expect("write csproj");
+
+        let args = vec![
+            "--results-directory".to_string(),
+            "/tmp/MyResults.csproj".to_string(),
+        ];
+        let tokens = dotnet_tokens(&args);
+        assert_eq!(
+            detect_test_runner_mode_in_dir(&tokens, temp_dir.path()),
+            TestRunnerMode::MtpVsTestBridge,
+            "the flag value's fake .csproj suffix must not stop scan_dir from being scanned"
+        );
     }
 
     #[test]
