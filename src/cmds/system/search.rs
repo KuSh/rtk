@@ -1372,6 +1372,29 @@ mod tests {
     }
 
     #[test]
+    fn test_dash_r_is_engine_aware() {
+        // Regression: confirmed via real rg (`rg -rn hello file` prints "n", `rg -rXXX hello
+        // file` prints "XXX" -- proof -r consumed the cluster remainder as its --replace value)
+        // that ripgrep's -r takes a value, unlike GNU grep's -r/-R (--recursive, boolean, no
+        // value; grep has no equivalent to rg's -r at all). Before is_short_value_flag treated
+        // -r as unconditionally boolean, `rtk rg -rREPLACEMENT pattern src` misread "REPLACEMENT"
+        // as a boolean cluster remainder rather than -r's attached replacement value, corrupting
+        // the actual command executed.
+        let (patterns, paths, flags, _) =
+            extract_pattern_path(&["-rREPLACEMENT", "pattern", "src"], Engine::Rg);
+        assert_eq!(patterns, vec!["pattern"]);
+        assert_eq!(paths, vec!["src"]);
+        assert_eq!(flags, vec!["-r".to_string(), "REPLACEMENT".to_string()]);
+
+        // Grep's -r/-R remain plain boolean flags, clustering as before.
+        let (patterns, paths, flags, _) =
+            extract_pattern_path(&["-rn", "foo", "src"], Engine::Grep);
+        assert_eq!(patterns, vec!["foo"]);
+        assert_eq!(paths, vec!["src"]);
+        assert_eq!(flags, vec!["-rn".to_string()]);
+    }
+
+    #[test]
     fn test_format_flag_detects_only_matching() {
         assert!(has_format_flag(Engine::Grep, &["-o"]));
         assert!(has_format_flag(Engine::Grep, &["--only-matching"]));
