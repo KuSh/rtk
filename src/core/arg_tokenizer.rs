@@ -136,9 +136,7 @@ pub fn has_flag(tokens: &[Token<'_>], dialect: Dialect, name: &str) -> bool {
 /// spec, not "trx"). Use this (or [`double_dash_flag_value`]/[`double_dash_flag_values`]) for
 /// any option that isn't a genuine legacy MSBuild.exe passthrough switch.
 pub fn has_double_dash_flag(tokens: &[Token<'_>], dialect: Dialect, name: &str) -> bool {
-    tokens.iter().any(|t| {
-        t.kind == TokenKind::Long && t.double_dash && flag_name_matches(t.text, name, dialect)
-    })
+    tokens.iter().any(|t| is_double_dash_flag(t, dialect, name))
 }
 
 /// This flag's value, if `name` (matched per `dialect`) appears as a `Long` token written with
@@ -151,9 +149,7 @@ pub fn double_dash_flag_value<'a>(
 ) -> Option<&'a str> {
     tokens
         .iter()
-        .find(|t| {
-            t.kind == TokenKind::Long && t.double_dash && flag_name_matches(t.text, name, dialect)
-        })
+        .find(|t| is_double_dash_flag(t, dialect, name))
         .and_then(|t| t.value(tokens))
 }
 
@@ -171,10 +167,15 @@ pub fn double_dash_flag_values<'a, 't>(
 ) -> impl Iterator<Item = &'a str> + 't {
     tokens
         .iter()
-        .filter(move |t| {
-            t.kind == TokenKind::Long && t.double_dash && flag_name_matches(t.text, name, dialect)
-        })
+        .filter(move |t| is_double_dash_flag(t, dialect, name))
         .filter_map(|t| t.value(tokens))
+}
+
+/// Shared match predicate behind [`has_double_dash_flag`]/[`double_dash_flag_value`]/
+/// [`double_dash_flag_values`]: a `Long` token written with a literal `--` prefix, matching
+/// `name` per `dialect`'s naming rules.
+fn is_double_dash_flag(t: &Token<'_>, dialect: Dialect, name: &str) -> bool {
+    t.kind == TokenKind::Long && t.double_dash && flag_name_matches(t.text, name, dialect)
 }
 
 /// Which CLI's flag grammar `tokenize_dialect` should apply. See [`tokenize_dialect`].
@@ -262,13 +263,20 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
 ) -> Vec<Token<'a>> {
     let mut tokens: Vec<Token<'a>> = Vec::with_capacity(args.len());
     let mut i = 0;
-    let mut seen_dash_dash = false;
     let mut emitted_dash_dash = false;
 
     while i < args.len() {
         let arg = args[i].as_ref();
 
-        if seen_dash_dash {
+        // In Posix conventions `--` ends option parsing: everything after is a literal
+        // positional/pathspec, never a flag. dotnet's `--` means something different -- an
+        // argument-*forwarding* boundary, not an end-of-options marker: what follows is still
+        // real flags, just meant for a different receiving parser (the VSTest/MTP test host)
+        // that can share flag names with dotnet's own (e.g. --logger, --results-directory are
+        // forwarded VSTest-console options). So only Posix stops classifying at the boundary;
+        // Msbuild keeps going, just with the separator's position on record via the DashDash
+        // token below.
+        if emitted_dash_dash && dialect == Dialect::Posix {
             tokens.push(positional(arg, i));
             i += 1;
             continue;
@@ -289,17 +297,6 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
                     double_dash: false,
                 });
                 emitted_dash_dash = true;
-                // In Posix conventions `--` ends option parsing: everything after is a literal
-                // positional/pathspec, never a flag. dotnet's `--` means something different —
-                // an argument-*forwarding* boundary, not an end-of-options marker: what follows
-                // is still real flags, just meant for a different receiving parser (the
-                // VSTest/MTP test host) that can share flag names with dotnet's own (e.g.
-                // --logger, --results-directory are forwarded VSTest-console options). So only
-                // Posix stops classifying here; Msbuild keeps going, just with the separator's
-                // position on record via this DashDash token.
-                if dialect == Dialect::Posix {
-                    seen_dash_dash = true;
-                }
             }
             i += 1;
             continue;
