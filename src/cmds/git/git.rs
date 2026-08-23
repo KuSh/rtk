@@ -1965,52 +1965,57 @@ fn run_pull(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32>
     Ok(0)
 }
 
+fn branch_takes_value(kind: TokenKind, name: &str) -> bool {
+    // -c/-C/-m/-M/-d/-D/-u are followed by positional branch names, not a "flag value" in the
+    // attached/separate-value sense, so only these Long options consume a value here.
+    kind == TokenKind::Long && matches!(name, "set-upstream-to" | "points-at" | "sort" | "format")
+}
+
 fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32> {
+    // Re-insert `--` when clap's trailing_var_arg consumed it (issue #1215): without this, a
+    // branch name literally starting with '-' after `--` (e.g. `git branch -- -weird`) is
+    // misclassified as a flag rather than the positional branch name to create.
+    let args = &args_utils::restore_double_dash(args);
     let timer = tracking::TimedExecution::start();
 
     if verbose > 0 {
         eprintln!("git branch");
     }
 
+    let tokens = arg_tokenizer::tokenize(args, &branch_takes_value);
+
     // Detect write operations: delete, rename, copy, upstream tracking
-    let has_action_flag = args.iter().any(|a| {
-        a == "-d"
-            || a == "-D"
-            || a == "-m"
-            || a == "-M"
-            || a == "-c"
-            || a == "-C"
-            || a == "--set-upstream-to"
-            || a.starts_with("--set-upstream-to=")
-            || a == "-u"
-            || a == "--unset-upstream"
-            || a == "--edit-description"
+    let has_action_flag = tokens.iter().any(|t| match t.kind {
+        TokenKind::Short => matches!(t.text, "d" | "D" | "m" | "M" | "c" | "C" | "u"),
+        TokenKind::Long => matches!(t.text, "set-upstream-to" | "unset-upstream" | "edit-description"),
+        _ => false,
     });
 
     // Detect flags that produce specific output (not a branch list)
-    let has_show_flag = args.iter().any(|a| a == "--show-current");
+    let has_show_flag = tokens
+        .iter()
+        .any(|t| t.kind == TokenKind::Long && t.text == "show-current");
 
     // Detect list-mode flags
-    let has_list_flag = args.iter().any(|a| {
-        a == "-a"
-            || a == "--all"
-            || a == "-r"
-            || a == "--remotes"
-            || a == "--list"
-            || a == "--merged"
-            || a == "--no-merged"
-            || a == "--contains"
-            || a == "--no-contains"
-            || a == "--format"
-            || a.starts_with("--format=")
-            || a == "--sort"
-            || a.starts_with("--sort=")
-            || a == "--points-at"
-            || a.starts_with("--points-at=")
+    let has_list_flag = tokens.iter().any(|t| match t.kind {
+        TokenKind::Short => matches!(t.text, "a" | "r"),
+        TokenKind::Long => matches!(
+            t.text,
+            "all" | "remotes"
+                | "list"
+                | "merged"
+                | "no-merged"
+                | "contains"
+                | "no-contains"
+                | "format"
+                | "sort"
+                | "points-at"
+        ),
+        _ => false,
     });
 
     // Detect positional arguments (not flags) — indicates branch creation
-    let has_positional_arg = args.iter().any(|a| !a.starts_with('-'));
+    let has_positional_arg = tokens.iter().any(|t| t.kind == TokenKind::Positional);
 
     // --show-current: passthrough with raw stdout (not "ok")
     if has_show_flag {

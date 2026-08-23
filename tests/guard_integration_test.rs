@@ -241,6 +241,36 @@ fn git_show_dash_dash_stat_pathspec_after_double_dash_is_not_stat_flag() {
 }
 
 #[test]
+fn git_branch_dash_prefixed_name_after_double_dash_attempts_creation_not_a_silent_list() {
+    // Regression: `rtk git branch -- -weird` must be classified as a branch-creation attempt
+    // (and let real git's own ref-name validation reject it), not silently fall through to list
+    // mode as if no branch name were given. Before restore_double_dash + arg_tokenizer,
+    // run_branch's has_positional_arg check was a raw `!a.starts_with('-')` scan with no
+    // `--`-boundary awareness, so a branch name starting with '-' after the separator was
+    // misclassified as a flag: has_positional_arg came back false, and (with no list flag
+    // either) rtk silently ran `git branch -a --no-color -- -weird-branch` -- a harmless, empty,
+    // exit-0 *list* filtered on a pattern that matches nothing, giving no indication the
+    // requested branch was never created. A real branch named "-weird-branch" is impossible
+    // (git's own check-ref-format forbids a leading '-'), so the observable signal here is that
+    // rtk actually attempts the creation and surfaces git's real rejection, instead of quietly
+    // doing nothing and exiting 0.
+    let dir = init_git_repo();
+
+    let (stdout, stderr, code) =
+        rtk_output_in_dir(dir.path(), &["git", "branch", "--", "-weird-branch"]);
+
+    assert_ne!(
+        code,
+        Some(0),
+        "a creation attempt for an invalid ref name must fail, not silently succeed as an empty list: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("-weird-branch"),
+        "expected git's own rejection to mention the attempted branch name: {stderr:?}"
+    );
+}
+
+#[test]
 fn git_log_malformed_digit_run_propagates_real_git_error() {
     // "-5x" isn't a valid git log limit; real git rejects it outright ("fatal: '5x': not an
     // integer", verified against git 2.51). run_log's internal limit-parsing for this
