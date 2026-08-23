@@ -29,8 +29,13 @@ fn is_golangci_subcommand(name: &str) -> bool {
     )
 }
 
-/// True for golangci-lint global flags that take a separate-token value, passed to
-/// [`arg_tokenizer::tokenize`] as its value predicate. `-c` is `--config`'s shorthand.
+/// True for golangci-lint flags that take a separate-token value when they appear *before* the
+/// `run` subcommand, passed to [`arg_tokenizer::tokenize`] as `find_subcommand_index`'s value
+/// predicate. `-c` is `--config`'s shorthand. Confirmed via a real golangci-lint 2.13.1 (Docker):
+/// `golangci-lint --help`'s own "Global Flags" section lists only `--color`/`-h`/`-v`/`--version`,
+/// but `--config`/`-c`, `--cpu-profile-path`, `--mem-profile-path`, and `--trace-path` are also
+/// accepted before `run` in practice (e.g. `golangci-lint --config foo.yml run` parses `--config`
+/// without an "unknown flag" error), so this list reflects verified behavior, not the --help text.
 fn golangci_takes_value(kind: TokenKind, name: &str) -> bool {
     match kind {
         TokenKind::Long => matches!(
@@ -38,6 +43,53 @@ fn golangci_takes_value(kind: TokenKind, name: &str) -> bool {
             "color" | "config" | "cpu-profile-path" | "mem-profile-path" | "trace-path"
         ),
         TokenKind::Short => name == "c",
+        _ => false,
+    }
+}
+
+/// True for `golangci-lint run`'s own value-taking flags, passed to [`arg_tokenizer::tokenize`]
+/// as `has_output_flag`'s value predicate over `run_args` -- a distinct, wider list from
+/// [`golangci_takes_value`] (scoped to flags valid *before* `run`), confirmed via a real
+/// golangci-lint 2.13.1 `run --help` (Docker). Without this, a run-level value-taking flag not in
+/// this list would leave its separate-token value as an unlinked, independently-classified token;
+/// if that value happened to be spelled like a recognized flag name (e.g. `--path-prefix
+/// --out-format`), it would tokenize as its own genuine Long token and be misdetected by
+/// has_output_flag's presence check.
+fn golangci_run_takes_value(kind: TokenKind, name: &str) -> bool {
+    match kind {
+        TokenKind::Long => matches!(
+            name,
+            "config"
+                | "default"
+                | "disable"
+                | "enable"
+                | "enable-only"
+                | "modules-download-mode"
+                | "issues-exit-code"
+                | "build-tags"
+                | "timeout"
+                | "path-prefix"
+                | "path-mode"
+                | "output.text.path"
+                | "output.json.path"
+                | "output.tab.path"
+                | "output.html.path"
+                | "output.checkstyle.path"
+                | "output.code-climate.path"
+                | "output.junit-xml.path"
+                | "output.teamcity.path"
+                | "output.sarif.path"
+                | "max-issues-per-linter"
+                | "max-same-issues"
+                | "new-from-rev"
+                | "new-from-patch"
+                | "new-from-merge-base"
+                | "cpu-profile-path"
+                | "mem-profile-path"
+                | "trace-path"
+                | "color"
+        ),
+        TokenKind::Short => matches!(name, "c" | "D" | "E" | "j"),
         _ => false,
     }
 }
@@ -233,18 +285,8 @@ fn build_filtered_args(invocation: &RunInvocation, version: u32) -> Vec<String> 
     args
 }
 
-/// KNOWN LIMITATION, not fixed here: golangci_takes_value's doc scopes it to golangci-lint's
-/// *global* (pre-`run`) flags, but this tokenizes `invocation.run_args` (post-`run`) with the
-/// same predicate. `has_flag`'s own presence check only matches genuine `Long` tokens (never a
-/// misclassified value), so this is safe as long as no run-level value-taking flag is missing
-/// from golangci_takes_value's list -- but if one is (e.g. a hypothetical `--path-prefix`) and
-/// its separate-token value is itself spelled like a recognized flag (e.g. `--path-prefix
-/// --out-format`), that value would tokenize as its own genuine Long token and be misdetected.
-/// Not fixed here since it would require golangci-lint's actual complete run-level flag
-/// inventory to expand golangci_takes_value correctly, and no local golangci-lint binary was
-/// available to verify it against (the established verification bar for this file's flag lists).
 fn has_output_flag(args: &[String]) -> bool {
-    let tokens = arg_tokenizer::tokenize(args, &golangci_takes_value);
+    let tokens = arg_tokenizer::tokenize(args, &golangci_run_takes_value);
     arg_tokenizer::has_flag(&tokens, Dialect::Posix, "out-format")
         || arg_tokenizer::has_flag(&tokens, Dialect::Posix, "output.json.path")
 }
@@ -632,6 +674,28 @@ mod tests {
         ]));
         assert!(has_output_flag(&["--out-format=json".to_string()]));
         assert!(has_output_flag(&["--output.json.path".to_string()]));
+    }
+
+    #[test]
+    fn test_has_output_flag_does_not_misread_a_run_level_flags_value() {
+        // Regression: has_output_flag used to tokenize run_args with golangci_takes_value, which
+        // is scoped to golangci-lint's pre-`run` flags and doesn't know about run-level
+        // value-taking flags like --path-prefix (confirmed via a real golangci-lint 2.13.1,
+        // Docker: `golangci-lint run --path-prefix foo` is accepted). Without --path-prefix in
+        // the predicate, its separate-token value tokenized independently -- if that value was
+        // itself spelled like "--output.json.path", it became its own genuine Long token and was
+        // misdetected as the real output flag.
+        assert!(!has_output_flag(&[
+            "--path-prefix".to_string(),
+            "--output.json.path".to_string(),
+        ]));
+        // Real run-level flags with separate-token values must still link correctly (not become
+        // stray unlinked Positionals that could themselves be misread elsewhere).
+        assert!(!has_output_flag(&[
+            "--disable".to_string(),
+            "errcheck".to_string(),
+        ]));
+        assert!(!has_output_flag(&["--timeout".to_string(), "30s".to_string()]));
     }
 
     #[test]
