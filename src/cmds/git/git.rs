@@ -860,11 +860,7 @@ fn run_log(
         .any(|t| t.kind == TokenKind::Long && matches!(t.text, "format" | "oneline" | "pretty"));
 
     // Check if user provided limit flag (-N, -n N, --max-count=N, --max-count N)
-    let has_limit_flag = tokens.iter().any(|t| match t.kind {
-        TokenKind::Long => t.text == "max-count",
-        TokenKind::Short => t.text == "n" || is_digit_run(t.text),
-        _ => false,
-    });
+    let has_limit_flag = has_limit_flag(&tokens);
 
     // Apply RTK defaults only if user didn't specify them
     // Use %b (body) to preserve first line of commit body for agent context
@@ -1066,6 +1062,19 @@ fn requests_raw_log_output(args: &[String]) -> bool {
 #[cfg(test)]
 fn parse_user_limit(args: &[String]) -> Option<usize> {
     parse_limit_from_tokens(&arg_tokenizer::tokenize_git(args, &log_takes_value, &log_takes_separate_value))
+}
+
+/// True if the user explicitly requested a commit-count limit (-N, -n N, --max-count=N,
+/// --max-count N).
+fn has_limit_flag(tokens: &[Token<'_>]) -> bool {
+    tokens.iter().any(|t| match t.kind {
+        TokenKind::Long => t.text == "max-count",
+        // "n" only counts if it actually captured a value -- e.g. clustered with another short
+        // flag (log_takes_separate_value's is_solo gate refuses to link a value there), it's
+        // just an inert letter, not a real limit request.
+        TokenKind::Short => (t.text == "n" && t.value(tokens).is_some()) || is_digit_run(t.text),
+        _ => false,
+    })
 }
 
 fn parse_limit_from_tokens(tokens: &[Token<'_>]) -> Option<usize> {
@@ -4074,6 +4083,23 @@ A  added.rs
         // The bare, standalone form must still work as documented.
         let args = vec!["-n".to_string(), "2".to_string()];
         assert_eq!(parse_user_limit(&args), Some(2));
+    }
+
+    #[test]
+    fn test_has_limit_flag_ignores_a_clustered_n_with_no_captured_value() {
+        // Regression: has_limit_flag used to match any Short "n" token by text alone, even one
+        // clustered with another short flag where log_takes_separate_value's is_solo gate
+        // refuses to link a value ("-cn" leaves "n" with no attached/linked value at all). RTK
+        // would then believe the user explicitly set a commit-count limit (skipping its own
+        // --no-merges default) even though no value was ever actually captured.
+        let args = vec!["-cn".to_string(), "2".to_string()];
+        let tokens = arg_tokenizer::tokenize_git(&args, &log_takes_value, &log_takes_separate_value);
+        assert!(!has_limit_flag(&tokens));
+
+        // The bare, standalone form still counts.
+        let args = vec!["-n".to_string(), "2".to_string()];
+        let tokens = arg_tokenizer::tokenize_git(&args, &log_takes_value, &log_takes_separate_value);
+        assert!(has_limit_flag(&tokens));
     }
 
     #[test]
