@@ -241,6 +241,35 @@ fn git_show_dash_dash_stat_pathspec_after_double_dash_is_not_stat_flag() {
 }
 
 #[test]
+fn git_diff_dash_dash_stat_pathspec_after_double_dash_is_not_stat_flag() {
+    // Regression: `rtk git diff -- --stat` must not be misread as a request for the real
+    // `--stat` diffstat-only flag. Before this fix, run_diff's wants_stat check was a raw
+    // `arg == "--stat"` scan with no `--`-boundary awareness, so a file literally named "--stat"
+    // after the boundary was wrongly treated as the flag and sent down the raw-passthrough path
+    // (plain diffstat output) instead of RTK's own stat+compacted-diff path.
+    let dir = init_git_repo();
+    std::fs::write(dir.path().join("--stat"), "line one\n").expect("write --stat file");
+    git_in_dir(dir.path(), &["add", "--", "--stat"]);
+    git_in_dir(
+        dir.path(),
+        &["commit", "-q", "-m", "add dash-dash-stat file"],
+    );
+    std::fs::write(dir.path().join("--stat"), "line one\nline two\n").expect("modify --stat file");
+
+    let (stdout, stderr, code) = rtk_output_in_dir(dir.path(), &["git", "diff", "--", "--stat"]);
+
+    assert_eq!(code, Some(0), "rtk stderr: {stderr}");
+    assert!(
+        !stdout.contains("diff --git"),
+        "-- --stat should stay on RTK's stat+compacted-diff path, not raw passthrough: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("--stat | 1 +") && stdout.contains("Changes:"),
+        "expected RTK's stat-summary-plus-compacted-diff output for the modified --stat file: {stdout:?}"
+    );
+}
+
+#[test]
 fn git_branch_dash_prefixed_name_after_double_dash_attempts_creation_not_a_silent_list() {
     // Regression: `rtk git branch -- -weird` must be classified as a branch-creation attempt
     // (and let real git's own ref-name validation reject it), not silently fall through to list

@@ -123,13 +123,20 @@ fn run_diff(
 ) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
-    // Check if user wants stat output
-    let wants_stat = args
-        .iter()
-        .any(|arg| arg == "--stat" || arg == "--numstat" || arg == "--shortstat");
+    // Check if user wants stat output. Shares git log's value-taking-flag predicate
+    // (log_takes_value): `diff` uses the same diff option grammar.
+    let tokens = arg_tokenizer::tokenize(args, &log_takes_value);
+    let wants_stat = tokens.iter().any(|t| {
+        t.kind == TokenKind::Long && matches!(t.text, "numstat" | "shortstat" | "stat")
+    });
 
-    // Check if user wants compact diff (default RTK behavior)
-    let wants_compact = !args.iter().any(|arg| arg == "--no-compact") && !emits_word_diff(args);
+    // Check if user wants compact diff (default RTK behavior). --no-compact is RTK's own
+    // pseudo-flag, always double-dash (never a real git diff option), so no loose matching
+    // concern here the way dotnet's Msbuild dialect has.
+    let wants_compact = !tokens
+        .iter()
+        .any(|t| t.kind == TokenKind::Long && t.attached.is_none() && t.text == "no-compact")
+        && !emits_word_diff(args);
 
     if wants_stat || !wants_compact {
         // User wants stat or explicitly no compacting - pass through directly

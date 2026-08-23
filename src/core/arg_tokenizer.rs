@@ -288,6 +288,19 @@ pub fn tokenize_dialect<'a, T: AsRef<str>>(
                 // absolute Unix path as the project positional, not a switch attempt). Without
                 // this guard, an absolute path -- the common case on Linux/macOS -- would be
                 // misclassified as a Long flag named e.g. "tmp/results".
+                //
+                // KNOWN LIMITATION, not fixed here: a single-segment absolute path (`/app`,
+                // `/tmp`) is indistinguishable from a genuine switch name by structure alone --
+                // confirmed via Docker that real dotnet/MSBuild itself only resolves this
+                // ambiguity with a filesystem check (`dotnet build /tmp`, which exists, is
+                // accepted as a path attempt; `dotnet build /nonexistentdir`, which doesn't
+                // exist, is rejected as "MSB1001: Unknown switch" -- byte-for-byte structural
+                // parsing alone can't tell them apart, real dotnet needs a stat() call to do
+                // it). This tokenizer is a pure function with no I/O by design, so replicating
+                // that exactly isn't possible here; the impact is narrow regardless, since it
+                // only matters for the loose flag lookup ([`has_flag`]) and only collides with
+                // an actual single-segment path that's spelled exactly like one of the few loose
+                // switch names ("nologo", "bl", "v", "verbosity").
                 let name_part = rest.split(['=', ':']).next().unwrap_or(rest);
                 if !rest.is_empty() && !name_part.contains('/') {
                     push_atomic_flag(
