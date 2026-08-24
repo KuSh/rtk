@@ -915,7 +915,11 @@ fn has_report_arg(tokens: &[Token<'_>]) -> bool {
 }
 
 fn has_report_trx_arg(tokens: &[Token<'_>]) -> bool {
-    dotnet_has_flag(tokens, "report-trx")
+    // --report-trx is a pure boolean switch, same class as --write/--nologo (see
+    // dotnet_has_bare_double_dash_flag) -- an attached-value spelling like "--report-trx:true"
+    // must not count as "already present", or RTK would skip its own injection while still
+    // forwarding the unrecognized flag straight through to real dotnet.
+    dotnet_has_bare_double_dash_flag(tokens, "report-trx")
 }
 
 /// Injects `--report-trx` after the `--` separator in `args`.
@@ -3017,6 +3021,28 @@ mod tests {
             let tokens = dotnet_tokens(&args);
             assert!(has_nologo_arg(&tokens), "{spelling} should be recognized");
         }
+    }
+
+    #[test]
+    fn test_has_report_trx_arg_rejects_attached_value() {
+        // Regression: --report-trx is a pure boolean flag (dotnet test's MTP-native report
+        // switch), same class as --write/--nologo above. has_report_trx_arg used to match via
+        // the non-bare dotnet_has_flag lookup, which ignores `attached` entirely -- so it treated
+        // a broken attached-value spelling like "--report-trx:true" as "user already passed
+        // --report-trx" and skipped RTK's own injection while still forwarding the unrecognized
+        // flag straight through to real dotnet.
+        let args = vec!["--report-trx:true".to_string()];
+        let tokens = dotnet_tokens(&args);
+        assert!(!has_report_trx_arg(&tokens));
+
+        let args = vec!["--report-trx=true".to_string()];
+        let tokens = dotnet_tokens(&args);
+        assert!(!has_report_trx_arg(&tokens));
+
+        // The bare boolean form still matches as documented.
+        let args = vec!["--report-trx".to_string()];
+        let tokens = dotnet_tokens(&args);
+        assert!(has_report_trx_arg(&tokens));
     }
 
     #[test]
