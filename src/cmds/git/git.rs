@@ -1066,24 +1066,16 @@ fn requests_raw_diff_shape(token: &Token<'_>) -> bool {
 /// default, not a request for a shape RTK's own stat + compacted-diff pipeline can't produce,
 /// and must not divert onto the raw passthrough path. `--patch-with-raw`/`--patch-with-stat`
 /// still do: they mix patch text with a raw/stat format RTK's own extra `--stat` step would
-/// double up against.
+/// double up against. Delegates to [`requests_raw_diff_shape`] and excludes the patch-only cases
+/// rather than repeating its Long-flag list verbatim -- an earlier commit on this branch had the
+/// two lists drift apart when this exclusion was still hand-copied, the exact class of bug this
+/// delegation now rules out.
 fn requests_diff_show_raw_shape(token: &Token<'_>) -> bool {
-    match token.kind {
-        TokenKind::Long => matches!(
-            token.text,
-            "dirstat"
-                | "name-only"
-                | "name-status"
-                | "numstat"
-                | "patch-with-raw"
-                | "patch-with-stat"
-                | "raw"
-                | "shortstat"
-                | "stat"
-                | "summary"
-        ),
-        _ => false,
+    if token.kind == TokenKind::Short || (token.kind == TokenKind::Long && token.text == "patch")
+    {
+        return false;
     }
+    requests_raw_diff_shape(token)
 }
 
 /// Test-only convenience wrapper; `run_log` shares a single tokenization with
