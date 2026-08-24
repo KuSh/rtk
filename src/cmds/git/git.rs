@@ -2303,14 +2303,22 @@ fn format_stash_message(subcommand: Option<&str>, result: &CaptureResult) -> Str
     }
 }
 
-/// True if the user explicitly requested patch-style output for `git stash show`. Shares git
-/// log's diff-option grammar (log_takes_value/log_takes_separate_value) and `--`-boundary
-/// awareness, so a pathspec literally named "-p"/"--patch" after `--` isn't mistaken for the
-/// flag -- the same bug class already fixed for sibling run_log/run_diff/run_show. Only the
-/// patch-mode flags matter here, not the full requests_raw_diff_shape list: --stat et al.
-/// correctly stay on the compact_stash_stat branch, not compact_diff.
+/// True if the user explicitly requested patch-style output for `git stash show`. Keeps
+/// `--`-boundary awareness (a pathspec literally named "-p"/"--patch" after `--` isn't mistaken
+/// for the flag -- the same bug class already fixed for sibling run_log/run_diff/run_show), but
+/// deliberately does *not* reuse git log's separate-value grammar (log_takes_value/
+/// log_takes_separate_value): `git stash show`'s real grammar is only `[-u] <diff-options>
+/// [<stash>]`, much narrower than log's, and log-only options like `--author` aren't recognized
+/// by stash show at all -- confirmed against real git 2.53.0 that `git stash show --author -p`
+/// produces full patch output (--author consumes no value there, attached or separate). Treating
+/// every flag here as never taking a separate value means this detector can only ever
+/// false-positive (misread some option's own value as -p/-u), never false-negative the way
+/// reusing log's grammar just did (silently swallowing a real following -p as --author's value,
+/// then rendering full patch content through the stat-only compact_stash_stat path instead of
+/// compact_diff). Only the patch-mode flags matter here, not the full requests_raw_diff_shape
+/// list: --stat et al. correctly stay on the compact_stash_stat branch, not compact_diff.
 fn stash_show_wants_patch(args: &[String]) -> bool {
-    let tokens = git_log_tokens(args);
+    let tokens = arg_tokenizer::tokenize(args, &|_kind, _name| false);
     tokens.iter().any(|t| match t.kind {
         TokenKind::Long => t.text == "patch",
         TokenKind::Short => matches!(t.text, "p" | "u"),
@@ -4185,6 +4193,22 @@ A  added.rs
         let args = vec!["-p".to_string()];
         assert!(stash_show_wants_patch(&args));
         let args = vec!["--patch".to_string()];
+        assert!(stash_show_wants_patch(&args));
+    }
+
+    #[test]
+    fn test_stash_show_wants_patch_does_not_swallow_dash_p_as_log_only_option_value() {
+        // Regression: stash_show_wants_patch used to reuse git log's grammar
+        // (log_takes_value/log_takes_separate_value), under which "--author" is a
+        // separate-value-taking Long flag -- so "-p" immediately after it got consumed as
+        // --author's value instead of being recognized as the real patch flag. Confirmed against
+        // real git 2.53.0 that `git stash show --author -p` produces full patch output:
+        // --author isn't a recognized git-stash-show option and doesn't consume a value there at
+        // all, so this must detect the real -p too.
+        let args = vec!["--author".to_string(), "-p".to_string()];
+        assert!(stash_show_wants_patch(&args));
+
+        let args = vec!["--grep".to_string(), "-p".to_string()];
         assert!(stash_show_wants_patch(&args));
     }
 
