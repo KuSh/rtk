@@ -150,7 +150,18 @@ fn extract_pattern_path<T: AsRef<str>>(
     args: &[T],
     engine: Engine,
 ) -> (Vec<String>, Vec<String>, Vec<String>, bool, DetectedFlags) {
-    let tokens = arg_tokenizer::tokenize(args, &|kind, name| search_takes_value(engine, kind, name));
+    // Every grep/rg value-taking flag claims even a literal "--" as its value (confirmed for
+    // both engines, short and long forms: -A/-m/-e/--context/--file all consume "--" rather than
+    // treating it as end-of-options) -- unlike git/cargo, where "--" always wins.
+    let takes_value = |kind: TokenKind, name: &str| search_takes_value(engine, kind, name);
+    let tokens = arg_tokenizer::tokenize_with_options(
+        args,
+        &takes_value,
+        arg_tokenizer::TokenizeOptions {
+            claims_literal_dash_dash: &takes_value,
+            ..Default::default()
+        },
+    );
 
     let mut e_patterns: Vec<String> = Vec::new();
     let mut positionals: Vec<String> = Vec::new();
@@ -1200,6 +1211,21 @@ mod tests {
         assert_eq!(patterns, vec!["--version"]);
         assert!(paths.is_empty());
         assert!(flags.is_empty());
+    }
+
+    #[test]
+    fn test_extract_e_claims_literal_dash_dash() {
+        // grep/rg -e -- means "the pattern is the literal string --", not the end-of-options
+        // boundary (confirmed against both real grep and real rg).
+        let (patterns, paths, flags, _, _) = extract_pattern_path(&["-e", "--", "f"], Engine::Grep);
+        assert_eq!(patterns, vec!["--"]);
+        assert_eq!(paths, vec!["f"]);
+        assert!(flags.is_empty());
+
+        let (patterns, paths, _, _, _) =
+            extract_pattern_path(&["--regexp", "--", "f"], Engine::Grep);
+        assert_eq!(patterns, vec!["--"]);
+        assert_eq!(paths, vec!["f"]);
     }
 
     #[test]

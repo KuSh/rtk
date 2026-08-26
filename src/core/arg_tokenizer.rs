@@ -200,7 +200,7 @@ fn is_double_dash_flag(t: &Token<'_>, dialect: Dialect, name: &str) -> bool {
     t.kind == TokenKind::Long && t.double_dash && flag_name_matches(t.text, name, dialect)
 }
 
-/// Which CLI's flag grammar `tokenize_dialect` should apply. See [`tokenize_dialect`].
+/// Which CLI's flag grammar to apply. See [`TokenizeOptions::dialect`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     /// MSBuild/dotnet-CLI-ish. `-flag`, `--flag`, and `/flag` are all one atomic flag name —
@@ -226,43 +226,63 @@ pub fn tokenize<'a, T: AsRef<str>>(
     args: &'a [T],
     takes_value: &dyn Fn(TokenKind, &str) -> bool,
 ) -> Vec<Token<'a>> {
-    tokenize_dialect(args, Dialect::Posix, takes_value)
+    tokenize_with_options(args, takes_value, TokenizeOptions::default())
 }
 
-/// Like [`tokenize`], but for a POSIX-ish tool whose value-taking `Short` flags don't uniformly
-/// support a separate-token value the way [`tokenize`]'s default (always eligible) assumes.
-/// `takes_separate_value(name, is_solo)` answers "may this `Short` flag consume a separate
-/// next-token value here" for a flag `takes_value` already said takes *some* value with an empty
-/// same-arg remainder; `is_solo` is true only when the flag is the entire arg on its own (e.g.
-/// `-n`), false when clustered with anything else (e.g. the `n` in `-cn`). git is the motivating
-/// case (see `git.rs`'s `log_takes_separate_value` for its specific `-n`/`-M`-family rules and
-/// the real-git verification behind them) but nothing here is git-specific: any POSIX-ish tool
-/// whose short flags have the same kind of clustering-dependent value rule can reuse this.
-pub fn tokenize_with_separate_value<'a, T: AsRef<str>>(
-    args: &'a [T],
-    takes_value: &dyn Fn(TokenKind, &str) -> bool,
-    takes_separate_value: &dyn Fn(&str, bool) -> bool,
-) -> Vec<Token<'a>> {
-    tokenize_dialect_ex(args, Dialect::Posix, takes_value, takes_separate_value)
-}
-
-/// Like [`tokenize`], but lets the caller pick a [`Dialect`] instead of assuming POSIX
-/// conventions.
+/// Grammar quirks beyond the base `takes_value` predicate, for a tool that needs
+/// [`tokenize_with_options`]. Defaults (via [`Default`]) match plain [`tokenize`]'s behavior, so
+/// a caller only sets the field(s) it actually needs.
 ///
-/// Generic over `T: AsRef<str>` so a caller can pass either `&[String]` (the common case,
-/// e.g. already-owned args from [`crate::core::args_utils::restore_double_dash`]) or `&[&str]`
-/// (handy for tests) without cloning either way — `Token` still borrows straight from `args`,
-/// zero-copy. Not generic over `OsStr`/`OsString`: unlike `str`, `OsStr` exposes almost no
-/// string-manipulation API by design (no `strip_prefix`, `split_once`, char-boundary slicing),
-/// so tokenizing it would mean re-deriving that machinery byte-by-byte the way `clap_lex` does
-/// internally — a much bigger change for a case rtk doesn't hit today (its own CLI parsing
-/// already assumes UTF-8 args for every subcommand this module serves).
-pub fn tokenize_dialect<'a, T: AsRef<str>>(
+/// Generic over `T: AsRef<str>` (in [`tokenize_with_options`]) so a caller can pass either
+/// `&[String]` (the common case, e.g. already-owned args from
+/// [`crate::core::args_utils::restore_double_dash`]) or `&[&str]` (handy for tests) without
+/// cloning either way — `Token` still borrows straight from `args`, zero-copy. Not generic over
+/// `OsStr`/`OsString`: unlike `str`, `OsStr` exposes almost no string-manipulation API by design
+/// (no `strip_prefix`, `split_once`, char-boundary slicing), so tokenizing it would mean
+/// re-deriving that machinery byte-by-byte the way `clap_lex` does internally — a much bigger
+/// change for a case rtk doesn't hit today (its own CLI parsing already assumes UTF-8 args for
+/// every subcommand this module serves).
+pub struct TokenizeOptions<'p> {
+    /// Which CLI's flag grammar to apply. Defaults to [`Dialect::Posix`].
+    pub dialect: Dialect,
+    /// Answers "may this `Short` flag consume a separate next-token value here" for a flag
+    /// `takes_value` already said takes *some* value with an empty same-arg remainder; `is_solo`
+    /// is true only when the flag is the entire arg on its own (e.g. `-n`), false when clustered
+    /// with anything else (e.g. the `n` in `-cn`). git is the motivating case (see `git.rs`'s
+    /// `log_takes_separate_value`) but nothing here is git-specific. Defaults to always eligible.
+    pub takes_separate_value: &'p dyn Fn(&str, bool) -> bool,
+    /// Lets specific flags consume a not-yet-seen literal `--` as their value instead of
+    /// treating it as the end-of-options boundary. Confirmed this is a per-*tool*, not per-flag,
+    /// split: grep/rg swallow `--` as any value-taking flag's value (`-A`/`-m`/`-e`/`--context`/
+    /// `--file`, ...), while git/cargo reject it as a value regardless of which flag is asking.
+    /// So a grep/rg caller passes the same predicate as `takes_value`; defaults to `false`.
+    pub claims_literal_dash_dash: &'p dyn Fn(TokenKind, &str) -> bool,
+}
+
+impl Default for TokenizeOptions<'_> {
+    fn default() -> Self {
+        Self {
+            dialect: Dialect::Posix,
+            takes_separate_value: &|_name, _is_solo| true,
+            claims_literal_dash_dash: &|_kind, _name| false,
+        }
+    }
+}
+
+/// Like [`tokenize`], but with [`TokenizeOptions`] for the handful of tools whose grammar needs
+/// more than a plain `takes_value` predicate to classify correctly.
+pub fn tokenize_with_options<'a, T: AsRef<str>>(
     args: &'a [T],
-    dialect: Dialect,
     takes_value: &dyn Fn(TokenKind, &str) -> bool,
+    options: TokenizeOptions<'_>,
 ) -> Vec<Token<'a>> {
-    tokenize_dialect_ex(args, dialect, takes_value, &|_name, _is_solo| true)
+    tokenize_dialect_ex(
+        args,
+        options.dialect,
+        takes_value,
+        options.takes_separate_value,
+        options.claims_literal_dash_dash,
+    )
 }
 
 /// Groups the mutable scan state threaded through [`tokenize_dialect_ex`]'s helper methods
@@ -277,6 +297,7 @@ struct Scanner<'a, 'p, T> {
     emitted_dash_dash: bool,
     takes_value: &'p dyn Fn(TokenKind, &str) -> bool,
     takes_separate_value: &'p dyn Fn(&str, bool) -> bool,
+    claims_literal_dash_dash: &'p dyn Fn(TokenKind, &str) -> bool,
 }
 
 impl<'a, 'p, T: AsRef<str>> Scanner<'a, 'p, T> {
@@ -316,16 +337,20 @@ impl<'a, 'p, T: AsRef<str>> Scanner<'a, 'p, T> {
     /// each caller decides how (a Long flag always consumes exactly one more token; a Short
     /// cluster's caller already accounts for the whole cluster being one arg).
     ///
-    /// The still-unseen boundary `--` can never be swallowed as a value (verified against real
-    /// git: `git log --grep -- pattern` fails with "Option '--grep' requires a value" rather
-    /// than treating `--` as the pattern) -- once the boundary has already been emitted, a later
-    /// `--` is just ordinary text and fair game (`git log -- -- pattern` works).
+    /// The still-unseen boundary `--` can't be swallowed as a value unless
+    /// `self.claims_literal_dash_dash` says this flag claims it (see
+    /// [`TokenizeOptions::claims_literal_dash_dash`]) -- once the boundary has already been
+    /// emitted, a later `--` is just ordinary text and fair game either way (`git log -- --
+    /// pattern` works).
     fn link_next_value(&mut self, flag_index: usize, value_index: usize) -> bool {
         let Some(next) = self.args.get(value_index) else {
             return false;
         };
         if next.as_ref() == "--" && !self.emitted_dash_dash {
-            return false;
+            let flag = &self.tokens[flag_index];
+            if !(self.claims_literal_dash_dash)(flag.kind, flag.text) {
+                return false;
+            }
         }
         let token_index = self.tokens.len();
         self.tokens.push(Token {
@@ -337,15 +362,14 @@ impl<'a, 'p, T: AsRef<str>> Scanner<'a, 'p, T> {
     }
 }
 
-/// Core implementation shared by [`tokenize_dialect`] and [`tokenize_with_separate_value`]. See
-/// [`tokenize_with_separate_value`] for `takes_separate_value`'s contract; [`tokenize_dialect`]
-/// passes `|_, _| true`, preserving
-/// its original "always eligible" behavior for every existing caller.
+/// Core implementation shared by every public `tokenize*` entry point. See
+/// [`TokenizeOptions`] for `takes_separate_value`/`claims_literal_dash_dash`'s contracts.
 fn tokenize_dialect_ex<'a, T: AsRef<str>>(
     args: &'a [T],
     dialect: Dialect,
     takes_value: &dyn Fn(TokenKind, &str) -> bool,
     takes_separate_value: &dyn Fn(&str, bool) -> bool,
+    claims_literal_dash_dash: &dyn Fn(TokenKind, &str) -> bool,
 ) -> Vec<Token<'a>> {
     let mut scanner = Scanner {
         tokens: Vec::with_capacity(args.len()),
@@ -355,6 +379,7 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
         emitted_dash_dash: false,
         takes_value,
         takes_separate_value,
+        claims_literal_dash_dash,
     };
 
     while scanner.i < scanner.args.len() {
@@ -611,7 +636,14 @@ mod tests {
         // one where a flag could even encounter a second "--" as its candidate value.
         let args = owned(&["--", "--logger", "--"]);
         let takes = |kind: TokenKind, name: &str| kind == TokenKind::Long && name == "logger";
-        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &takes);
+        let tokens = tokenize_with_options(
+            &args,
+            &takes,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(tokens[0].kind, TokenKind::DashDash);
         assert_eq!(tokens[1].kind, TokenKind::Long);
@@ -787,7 +819,14 @@ mod tests {
     fn msbuild_single_dash_flag_is_atomic_not_a_cluster() {
         // dotnet's "-nologo" is one flag name, not a POSIX cluster of n/o/l/o/g/o.
         let args = owned(&["-nologo"]);
-        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+        let tokens = tokenize_with_options(
+            &args,
+            &no_values,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].kind, TokenKind::Long);
@@ -801,7 +840,14 @@ mod tests {
         // value hid a following `-bl:<file>` from dotnet's own binlog detection.
         let takes_value = |kind: TokenKind, name: &str| kind == TokenKind::Long && name == "r";
         let slash = owned(&["/r", "-bl:my.binlog"]);
-        let tokens = tokenize_dialect(&slash, Dialect::Msbuild, &takes_value);
+        let tokens = tokenize_with_options(
+            &slash,
+            &takes_value,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
         assert_eq!(tokens[0].text, "r");
         assert_eq!(tokens[0].linked, None);
         assert_eq!(tokens[1].kind, TokenKind::Long);
@@ -810,14 +856,28 @@ mod tests {
 
         // The dash spelling is dotnet's own `-r <rid>`, which does consume the next token.
         let dash = owned(&["-r", "linux-x64"]);
-        let tokens = tokenize_dialect(&dash, Dialect::Msbuild, &takes_value);
+        let tokens = tokenize_with_options(
+            &dash,
+            &takes_value,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
         assert_eq!(tokens[0].value(&tokens), Some("linux-x64"));
     }
 
     #[test]
     fn msbuild_slash_prefix_is_recognized_as_a_flag() {
         let args = owned(&["/nologo"]);
-        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+        let tokens = tokenize_with_options(
+            &args,
+            &no_values,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].kind, TokenKind::Long);
@@ -827,7 +887,14 @@ mod tests {
     #[test]
     fn msbuild_slash_alone_is_positional() {
         let args = owned(&["/"]);
-        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+        let tokens = tokenize_with_options(
+            &args,
+            &no_values,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].kind, TokenKind::Positional);
@@ -844,7 +911,14 @@ mod tests {
         // "tmp/results".
         let takes = |kind: TokenKind, name: &str| kind == TokenKind::Long && name == "nologo";
         let args = owned(&["/tmp/results"]);
-        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &takes);
+        let tokens = tokenize_with_options(
+            &args,
+            &takes,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(tokens[0].kind, TokenKind::Positional);
         assert_eq!(tokens[0].text, "/tmp/results");
@@ -855,7 +929,14 @@ mod tests {
         // A genuine single-segment MSBuild switch (no internal '/') must still classify as Long,
         // including when it carries an attached value whose own text contains '/'.
         let args = owned(&["/nologo", "/p:OutDir=/tmp/out"]);
-        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+        let tokens = tokenize_with_options(
+            &args,
+            &no_values,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(tokens[0].kind, TokenKind::Long);
         assert_eq!(tokens[0].text, "nologo");
@@ -868,7 +949,14 @@ mod tests {
     fn msbuild_colon_and_equals_both_attach_a_value() {
         for arg in ["--logger:trx", "--logger=trx"] {
             let args = owned(&[arg]);
-            let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+            let tokens = tokenize_with_options(
+                &args,
+                &no_values,
+                TokenizeOptions {
+                    dialect: Dialect::Msbuild,
+                    ..Default::default()
+                },
+            );
 
             assert_eq!(tokens[0].text, "logger", "for {arg}");
             assert_eq!(tokens[0].attached, Some("trx"), "for {arg}");
@@ -880,7 +968,14 @@ mod tests {
         let args = owned(&["--results-directory", "/tmp/out"]);
         let takes =
             |kind: TokenKind, name: &str| kind == TokenKind::Long && name == "results-directory";
-        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &takes);
+        let tokens = tokenize_with_options(
+            &args,
+            &takes,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(tokens.len(), 2);
         assert_eq!(tokens[0].linked, Some(1));
@@ -893,7 +988,14 @@ mod tests {
         // host); unlike Posix, that doesn't stop classification -- flags after it (e.g.
         // --report-trx, forwarded to the test host) must still be recognized as flags.
         let args = owned(&["--", "-nologo"]);
-        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+        let tokens = tokenize_with_options(
+            &args,
+            &no_values,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(tokens[0].kind, TokenKind::DashDash);
         assert_eq!(tokens[1].kind, TokenKind::Long);
@@ -908,7 +1010,14 @@ mod tests {
         let args = owned(&["--", "--results-directory", "/tmp/out"]);
         let takes =
             |kind: TokenKind, name: &str| kind == TokenKind::Long && name == "results-directory";
-        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &takes);
+        let tokens = tokenize_with_options(
+            &args,
+            &takes,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(tokens[0].kind, TokenKind::DashDash);
         assert_eq!(tokens[1].kind, TokenKind::Long);
@@ -922,7 +1031,14 @@ mod tests {
         // classification doesn't stop at `--` (unlike Posix, where a second `--` already falls
         // into the seen_dash_dash positional catch-all for free).
         let args = owned(&["--", "a", "--", "b"]);
-        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+        let tokens = tokenize_with_options(
+            &args,
+            &no_values,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(tokens[0].kind, TokenKind::DashDash);
         assert_eq!(tokens[1].kind, TokenKind::Positional);
@@ -943,7 +1059,14 @@ mod tests {
     #[test]
     fn msbuild_dialect_never_produces_short_tokens() {
         let args = owned(&["-a", "-bc", "/d", "--e"]);
-        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+        let tokens = tokenize_with_options(
+            &args,
+            &no_values,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
 
         assert!(tokens.iter().all(|t| t.kind != TokenKind::Short));
     }
@@ -966,7 +1089,14 @@ mod tests {
     #[test]
     fn msbuild_has_flag_is_case_insensitive() {
         let args = owned(&["-NoLogo"]);
-        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+        let tokens = tokenize_with_options(
+            &args,
+            &no_values,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
 
         assert!(has_flag(&tokens, Dialect::Msbuild, "nologo"));
         assert!(has_flag(&tokens, Dialect::Msbuild, "NOLOGO"));
@@ -996,7 +1126,14 @@ mod tests {
     #[test]
     fn double_dash_flag_value_is_case_insensitive_but_prefix_strict() {
         let args = owned(&["--Logger:trx"]);
-        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+        let tokens = tokenize_with_options(
+            &args,
+            &no_values,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(
             double_dash_flag_value(&tokens, Dialect::Msbuild, "logger"),
@@ -1015,7 +1152,14 @@ mod tests {
         // like -nologo) are double-dash-only -- "-results-directory"/"/results-directory" get
         // misparsed as unrelated MSBuild switches, not treated as this flag at all.
         let args = owned(&["-results-directory", "/tmp/out"]);
-        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+        let tokens = tokenize_with_options(
+            &args,
+            &no_values,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
 
         assert!(has_flag(&tokens, Dialect::Msbuild, "results-directory"));
         assert!(!has_double_dash_flag(
@@ -1029,7 +1173,14 @@ mod tests {
         );
 
         let args = owned(&["/results-directory", "/tmp/out"]);
-        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &no_values);
+        let tokens = tokenize_with_options(
+            &args,
+            &no_values,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
         assert!(!has_double_dash_flag(
             &tokens,
             Dialect::Msbuild,
@@ -1045,7 +1196,14 @@ mod tests {
         // checkable.
         let args = owned(&["--logger:console;verbosity=normal", "--logger", "trx"]);
         let takes = |kind: TokenKind, name: &str| kind == TokenKind::Long && name == "logger";
-        let tokens = tokenize_dialect(&args, Dialect::Msbuild, &takes);
+        let tokens = tokenize_with_options(
+            &args,
+            &takes,
+            TokenizeOptions {
+                dialect: Dialect::Msbuild,
+                ..Default::default()
+            },
+        );
 
         let values: Vec<&str> =
             double_dash_flag_values(&tokens, Dialect::Msbuild, "logger").collect();

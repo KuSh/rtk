@@ -790,22 +790,10 @@ fn detect_test_runner_mode_in_dir(tokens: &[Token<'_>], scan_dir: &Path) -> Test
     TestRunnerMode::Classic
 }
 
-/// dotnet's CLI grammar isn't POSIX/GNU: `-flag`, `--flag`, and `/flag` are all one atomic
-/// name (no short-flag clustering) and a value may attach via `:` or `=`
-/// ([`Dialect::Msbuild`]); flag names are matched case-insensitively, same as the CLI itself.
-/// Confirmed via a real dotnet 9 SDK (Docker, `dotnet test --help`/`dotnet build --help`) that
-/// each of these takes a separate-token value: `--filter`, `-c`/`--configuration`,
-/// `-f`/`--framework`, `-r`/`--runtime`, `-a`/`--arch`, `--os`, plus the pre-existing
-/// `--logger`/`--report`/`--results-directory`. Not exhaustive -- dotnet has more value-taking
-/// options than this covers -- but each addition here directly closes a case where the value
-/// would otherwise tokenize as an unlinked Positional and could be misread as an explicit project
-/// path by detect_test_runner_mode_in_dir's explicit_projects filter if it happened to end in
-/// `.csproj`/`.fsproj`/`.vbproj`. The short forms (`-c`/`-f`/`-r`/`-a`) are matched under
-/// `TokenKind::Long`, not `Short`: under `Dialect::Msbuild`, tokenize_dialect routes every
-/// single-dash arg through `push_atomic_flag`, which always produces a `Long` token (Msbuild has
-/// no character-clustering concept the way `Dialect::Posix` does) -- confirmed that dotnet
-/// doesn't support a glued short form like `-cRelease` either way (`MSB1001: Unknown switch`;
-/// only `-c Release` or `-c=Release` work).
+/// dotnet's CLI grammar isn't POSIX/GNU ([`Dialect::Msbuild`]): `-flag`/`--flag`/`/flag` are one
+/// atomic flag name with no short-flag clustering (so `-c`/`-f`/`-r`/`-a` match as `Long`, not
+/// `Short`), a value may attach via `:` or `=`, and names match case-insensitively. Not
+/// exhaustive -- dotnet has more value-taking flags than this covers.
 fn dotnet_takes_value(kind: TokenKind, name: &str) -> bool {
     kind == TokenKind::Long
         && matches!(
@@ -827,7 +815,14 @@ fn dotnet_takes_value(kind: TokenKind, name: &str) -> bool {
 }
 
 fn dotnet_tokens(args: &[String]) -> Vec<Token<'_>> {
-    arg_tokenizer::tokenize_dialect(args, Dialect::Msbuild, &dotnet_takes_value)
+    arg_tokenizer::tokenize_with_options(
+        args,
+        &dotnet_takes_value,
+        arg_tokenizer::TokenizeOptions {
+            dialect: Dialect::Msbuild,
+            ..Default::default()
+        },
+    )
 }
 
 /// Strict lookup (the safe default -- prefer this name): only a literal `--flag` matches, never
