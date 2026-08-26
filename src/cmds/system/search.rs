@@ -20,6 +20,34 @@ use std::io::IsTerminal;
 use std::process::Command;
 use std::sync::LazyLock;
 
+/// True if stdin is something the engine actually reads: a regular file, FIFO or socket --
+/// ripgrep's own `is_readable_stdin` rule, and confirmed for both engines (`rg foo < file`
+/// searches the file; `rg foo < /dev/null`, a character device, searches the cwd instead).
+/// `!is_terminal()` is wider and wrongly matches that `/dev/null` case.
+#[cfg(unix)]
+fn stdin_is_readable() -> bool {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::FileTypeExt;
+    std::io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .map(std::fs::File::from)
+        .and_then(|f| f.metadata())
+        .map(|m| {
+            let kind = m.file_type();
+            kind.is_file() || kind.is_fifo() || kind.is_socket()
+        })
+        .unwrap_or(false)
+}
+
+/// KNOWN LIMITATION: no portable file-type check here, so Windows keeps the wider
+/// `!is_terminal()` rule -- `rtk rg foo < NUL` still routes to the streaming path and drops
+/// filenames there.
+#[cfg(not(unix))]
+fn stdin_is_readable() -> bool {
+    !std::io::stdin().is_terminal()
+}
+
 /// Which flags consume a value, transcribed per engine from that engine's own `--help`.
 /// grep and rg only intersect -- 13 of ~50 entries -- and disagree outright on `-T`, `-r`,
 /// `-E` and `--color`, so one merged table with per-flag exceptions misreads whichever engine
@@ -609,8 +637,8 @@ pub fn run(
         eprintln!("grep: '{}' in {}", pattern_display, path_display);
     }
 
-    let reads_piped_stdin = !std::io::stdin().is_terminal()
-        && (paths.is_empty() || paths.iter().any(|path| path == "-"));
+    let reads_piped_stdin =
+        stdin_is_readable() && (paths.is_empty() || paths.iter().any(|path| path == "-"));
 
     // format/shape flags (-c/-l/-o/...): already-minimal native output, passthrough.
     if extra_args_has_format_flag {
@@ -1013,6 +1041,68 @@ mod tests {
         let path = "/Users/patrick/dev/project/src/components/Button.tsx";
         let compact = compact_path(path);
         assert!(compact.len() <= 60);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_rg_z_shows_filenames_when_stdin_is_not_a_pipe() {
+        // `rtk rg -z foo < /dev/null` in a multi-file dir used to drop filenames: stdin being a
+        // non-terminal, non-pipe redirect was misread as "the engine reads stdin," routing into
+        // the streaming path, which can't discover "multiple files" the way the buffered path
+        // does. Real rg still searches the cwd here (confirmed empirically), not stdin.
+        let bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("debug")
+            .join("rtk");
+        assert!(bin.exists(), "Run `cargo build` first");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "foo one\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "foo two\n").unwrap();
+
+        let output = std::process::Command::new(&bin)
+            .args(["rg", "-z", "foo"])
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("failed to run rtk rg");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("a.txt"), "filename missing: {stdout}");
+        assert!(stdout.contains("b.txt"), "filename missing: {stdout}");
+    }
+
+    #[test]
+    #[ignore]
+    fn test_grep_reads_stdin_when_it_is_a_redirected_file() {
+        // The other side of the same call: a regular file on stdin *is* read by both engines
+        // (rg's own is_readable_stdin counts files and sockets, not just FIFOs), so the search
+        // must return that file's match rather than the cwd's.
+        let bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("debug")
+            .join("rtk");
+        assert!(bin.exists(), "Run `cargo build` first");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "foo from the cwd\n").unwrap();
+        let piped = dir.path().join("piped.log");
+        std::fs::write(&piped, "foo from stdin\n").unwrap();
+
+        for engine in ["grep", "rg"] {
+            let output = std::process::Command::new(&bin)
+                .args([engine, "foo"])
+                .current_dir(dir.path())
+                .stdin(std::fs::File::open(&piped).unwrap())
+                .output()
+                .expect("failed to run rtk");
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("foo from stdin"),
+                "{engine} did not read stdin: {stdout}"
+            );
+        }
     }
 
     #[test]
