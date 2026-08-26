@@ -10,9 +10,7 @@ use crate::core::stream::{
 };
 use crate::core::tracking;
 use crate::core::truncate::{CAP_LIST, CAP_WARNINGS};
-use crate::core::utils::{
-    exit_code_from_status, join_with_overflow, resolved_command, strip_ansi,
-};
+use crate::core::utils::{exit_code_from_status, join_with_overflow, resolved_command, strip_ansi};
 use anyhow::{Context, Result};
 use std::ffi::OsString;
 use std::process::Command;
@@ -91,10 +89,7 @@ pub fn run(
     verbose: u8,
     global_args: &[String],
 ) -> Result<i32> {
-    // Re-insert `--` when clap's trailing_var_arg consumed it (issue #1215), once here for every
-    // subcommand rather than ad hoc per handler: restore_double_dash is a no-op when `--` wasn't
-    // stripped, so centralizing it costs nothing for handlers that don't need it, and closes the
-    // gap for any handler whose own boundary-sensitive logic forgets to call it.
+    // Centralized here, once, rather than ad hoc per handler.
     let args = &args_utils::restore_double_dash(args);
     match cmd {
         GitCommand::Diff => run_diff(args, max_lines, verbose, global_args),
@@ -123,16 +118,10 @@ fn run_diff(
 ) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
-    // Check if user wants a raw-shaped diff output. Shares git log's value-taking-flag predicate
-    // (log_takes_value) and diff option grammar, but uses the narrower
-    // requests_diff_show_raw_shape (not requests_raw_diff_shape): unlike log, diff's default
-    // output already is patch text, so -p/-u/--patch don't need the raw passthrough path.
-    let tokens = git_log_tokens(args);
+    let tokens = tokenize_git_log_args(args);
     let wants_stat = tokens.iter().any(requests_diff_show_raw_shape);
 
-    // Check if user wants compact diff (default RTK behavior). --no-compact is RTK's own
-    // pseudo-flag, always double-dash (never a real git diff option), so no loose matching
-    // concern here the way dotnet's Msbuild dialect has.
+    // Compact diff is the default RTK behavior; --no-compact is RTK's own pseudo-flag.
     let wants_compact = !tokens
         .iter()
         .any(|t| t.kind == TokenKind::Long && t.attached.is_none() && t.text == "no-compact")
@@ -233,11 +222,7 @@ fn run_show(
 ) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
-    // If user wants a raw-shaped diff or --format only, pass through. Shares git log's
-    // value-taking-flag predicate (log_takes_value) and diff/log option grammar, but uses the
-    // narrower requests_diff_show_raw_shape (not requests_raw_diff_shape): unlike log, show's
-    // default output already is patch text, so -p/-u/--patch don't need the raw passthrough path.
-    let tokens = git_log_tokens(args);
+    let tokens = tokenize_git_log_args(args);
     let wants_stat_only = tokens.iter().any(requests_diff_show_raw_shape);
 
     let wants_format = tokens
@@ -838,11 +823,7 @@ fn run_log(
     verbose: u8,
     global_args: &[String],
 ) -> Result<i32> {
-    // Tokenize once and share it: flag-vs-value classification is reused below by the raw-shape
-    // check, the flag-presence checks, and the limit parsing, and a value belonging to
-    // --grep/--author/etc. (e.g. `--grep --pretty`) must not be misread as one of the flags
-    // below.
-    let tokens = git_log_tokens(args);
+    let tokens = tokenize_git_log_args(args);
 
     if tokens.iter().any(requests_raw_diff_shape) {
         let passthrough_args: Vec<OsString> = std::iter::once(OsString::from("log"))
@@ -929,23 +910,8 @@ fn run_log(
     Ok(0)
 }
 
-/// True for git log/diff options that take their value as a separate,
-/// space-delimited token (e.g. `--grep -p` searches messages for the
-/// literal string "-p"; it does not request patch output). Consuming
-/// that value token keeps flag-lookalike values from being misread as
-/// the corresponding boolean flag. Passed to [`arg_tokenizer::tokenize`]
-/// as its value predicate; `--max-count` lives here too rather than as a
-/// bolted-on special case, since it's the same question for every caller.
-/// Which of `log_takes_value`'s `Short` flags may consume a separate next-token value, passed to
-/// [`arg_tokenizer::TokenizeOptions::takes_separate_value`]. `is_solo` is true only when the flag is the
-/// entire arg on its own (`-n`), false when clustered with anything else (`-cn`'s `n`). Confirmed
-/// against real git:
-/// `-n`/`-l` accept a separate-token value only when solo (`-n 2` works, `-cn 2` fails with
-/// "ambiguous argument"); `-M`/`-U`/`-C`/`-B` never do, solo or clustered (`git log -U 3` fails
-/// the same way). `-G`/`-I`/`-O`/`-S` are left at their pre-existing "always eligible" behavior
-/// (unconditionally `true`, matching how this predicate worked before `-n`/`-l`/`-M`/`-U`/`-C`/`-B`
-/// needed the distinction) since no bug was found in their handling and re-deriving their exact
-/// clustering behavior wasn't part of this fix.
+/// `-n`/`-l` accept a separate-token value only when solo (`-cn 2` fails as "ambiguous
+/// argument"); `-M`/`-U`/`-C`/`-B` never do, solo or clustered.
 fn log_takes_separate_value(name: &str, is_solo: bool) -> bool {
     match name {
         "B" | "C" | "M" | "U" => false,
@@ -954,6 +920,8 @@ fn log_takes_separate_value(name: &str, is_solo: bool) -> bool {
     }
 }
 
+/// E.g. `--grep -p` searches messages for the literal string "-p"; it does not request patch
+/// output.
 fn log_takes_value(kind: TokenKind, name: &str) -> bool {
     match kind {
         TokenKind::Long => matches!(
@@ -998,22 +966,17 @@ fn log_takes_value(kind: TokenKind, name: &str) -> bool {
                 | "word-diff-regex"
                 | "ws-error-highlight"
         ),
-        // -M/-U/-C/-B take an OPTIONAL attached numeric value ("-M50", never a separate token --
-        // confirmed against real git that even `git log -M 50` fails, treating "50" as an
-        // unrelated revision). Marking them here fixes a real bug: without it, a glued form like
-        // "-M50" had no recognized value-taking char in its cluster, so it decomposed into
-        // per-char Short tokens "M"/"5"/"0" instead of one "M" token with attached "50" -- and
-        // those stray digit tokens were then misread by has_limit_flag/parse_limit_from_tokens as
-        // if a bare "-5" limit flag had been passed.
-        TokenKind::Short => matches!(name, "B" | "C" | "G" | "I" | "L" | "M" | "O" | "S" | "U" | "l" | "n"),
+        // -M/-U/-C/-B take an optional attached numeric value ("-M50"), never a separate token.
+        TokenKind::Short => matches!(
+            name,
+            "B" | "C" | "G" | "I" | "L" | "M" | "O" | "S" | "U" | "l" | "n"
+        ),
         _ => false,
     }
 }
 
-/// Tokenizes `args` with git log/diff/show's shared value-taking-flag predicates
-/// (log_takes_value/log_takes_separate_value), reused by run_log/run_diff/run_show/run_stash
-/// and their test helpers instead of each repeating the same `tokenize_with_options(...)` call.
-fn git_log_tokens(args: &[String]) -> Vec<Token<'_>> {
+/// Shared git log/diff/show tokenization (log_takes_value/log_takes_separate_value).
+fn tokenize_git_log_args(args: &[String]) -> Vec<Token<'_>> {
     arg_tokenizer::tokenize_with_options(
         args,
         &log_takes_value,
@@ -1024,27 +987,19 @@ fn git_log_tokens(args: &[String]) -> Vec<Token<'_>> {
     )
 }
 
-/// Filters `args` down to the tokens that are actual flags (dash-free flag
-/// name, e.g. "grep" not "--grep"), dropping every token consumed as a value
-/// by the preceding option. Test-only convenience wrapper; `run_log` shares
-/// a single [`arg_tokenizer::tokenize`] call directly instead.
 #[cfg(test)]
 fn real_flag_args(args: &[String]) -> Vec<&str> {
-    git_log_tokens(args)
+    tokenize_git_log_args(args)
         .iter()
         .filter(|t| matches!(t.kind, TokenKind::Long | TokenKind::Short))
         .map(|t| t.text)
         .collect()
 }
 
-/// True for git log flags that change the *shape* of git's raw output
-/// (patch text, diffstat, name lists) in a way RTK's injected
-/// `--pretty=format` + `---END---` markers can't coexist with — matching
-/// this must request the untouched passthrough path instead of RTK's
-/// filtered one (see [`requests_raw_log_output`]). `log`'s own default output has no diff
-/// content at all, so `-p`/`-u`/`--patch` belong here too: they request something RTK's
-/// filtered log path never produces. `diff`/`show` use the narrower
-/// [`requests_diff_show_raw_shape`] instead, since their default output already is patch text.
+/// True for git log flags that change the *shape* of git's raw output (patch text, diffstat,
+/// name lists) in a way incompatible with RTK's injected `--pretty=format` markers, requiring
+/// the raw passthrough path instead (see [`requests_raw_log_output`]). `diff`/`show` use the
+/// narrower [`requests_diff_show_raw_shape`] instead.
 fn requests_raw_diff_shape(token: &Token<'_>) -> bool {
     match token.kind {
         TokenKind::Long => matches!(
@@ -1066,29 +1021,21 @@ fn requests_raw_diff_shape(token: &Token<'_>) -> bool {
     }
 }
 
-/// Like [`requests_raw_diff_shape`], but for `diff`/`show`: excludes `--patch`/`-p`/`-u`. Unlike
-/// `log` (whose default output has no diff content at all), `diff`/`show`'s default output
-/// already *is* patch text -- so an explicit `-p`/`--patch`/`-u` there is redundant with the
-/// default, not a request for a shape RTK's own stat + compacted-diff pipeline can't produce,
-/// and must not divert onto the raw passthrough path. `--patch-with-raw`/`--patch-with-stat`
-/// still do: they mix patch text with a raw/stat format RTK's own extra `--stat` step would
-/// double up against. Delegates to [`requests_raw_diff_shape`] and excludes the patch-only cases
-/// rather than repeating its Long-flag list verbatim -- an earlier commit on this branch had the
-/// two lists drift apart when this exclusion was still hand-copied, the exact class of bug this
-/// delegation now rules out.
+/// Like [`requests_raw_diff_shape`], but excludes `--patch`/`-p`/`-u`: unlike `log`, `diff`/
+/// `show`'s default output already *is* patch text, so those are redundant with the default
+/// rather than a request for a shape RTK can't produce. Delegates rather than repeating the
+/// Long-flag list, so the two can't silently drift apart.
 fn requests_diff_show_raw_shape(token: &Token<'_>) -> bool {
-    if token.kind == TokenKind::Short || (token.kind == TokenKind::Long && token.text == "patch")
-    {
+    if token.kind == TokenKind::Short || (token.kind == TokenKind::Long && token.text == "patch") {
         return false;
     }
     requests_raw_diff_shape(token)
 }
 
-/// Test-only convenience wrapper; `run_log` shares a single tokenization with
-/// [`requests_raw_diff_shape`] directly instead, to avoid tokenizing `args` twice.
+/// Test-only convenience wrapper.
 #[cfg(test)]
 fn requests_raw_log_output(args: &[String]) -> bool {
-    git_log_tokens(args)
+    tokenize_git_log_args(args)
         .iter()
         .any(requests_raw_diff_shape)
 }
@@ -1099,7 +1046,7 @@ fn requests_raw_log_output(args: &[String]) -> bool {
 /// instead; this convenience wrapper exists for tests.
 #[cfg(test)]
 fn parse_user_limit(args: &[String]) -> Option<usize> {
-    parse_limit_from_tokens(&git_log_tokens(args))
+    parse_limit_from_tokens(&tokenize_git_log_args(args))
 }
 
 /// True if the user explicitly requested a commit-count limit (-N, -n N, --max-count=N,
@@ -1313,17 +1260,9 @@ fn detect_status_state(line: &str) -> Option<GitStatusState> {
     }
 }
 
-/// Extract a compact in-progress state summary from plain `git status` output.
-///
-/// Compact mode runs `git status --porcelain -b`, which omits the state header
-/// git prints for rebase / merge / cherry-pick / revert / bisect / am / sparse
-/// checkout. Hiding that block is a correctness bug — e.g. during an interactive
-/// rebase edit, the user sees a "clean" status and misses "You are currently
-/// editing a commit while rebasing ...".
-///
-/// This helper walks the plain-status output we already capture for tracking
-/// and emits a compact, RTK-style summary rather than dumping git's full prose.
-/// Returns `None` when no state is in progress.
+/// `git status --porcelain -b` (compact mode) omits the state header for rebase/merge/
+/// cherry-pick/etc, so an in-progress rebase can look like a clean status. Extracts a compact
+/// summary of that state from plain `git status` output instead. `None` if none is in progress.
 fn extract_state_header(raw: &str) -> Option<String> {
     // Headers of the file-change blocks — everything relevant to state appears
     // above these in git's output, so they double as a terminator.
@@ -1352,13 +1291,9 @@ fn extract_state_header(raw: &str) -> Option<String> {
     None
 }
 
-/// Extract the explicit "HEAD detached at/from <ref>" line from plain
-/// `git status` output.
-///
-/// Porcelain `-b` collapses a detached HEAD to the opaque `## HEAD (no branch)`,
-/// which an agent (or a distracted human) can misread as a branch literally
-/// named `HEAD`. The plain-status output keeps the explicit SHA/ref, so we
-/// surface that instead. Returns `None` when HEAD is on a branch.
+/// Porcelain `-b` collapses a detached HEAD to the opaque `## HEAD (no branch)`, which can be
+/// misread as a branch literally named `HEAD`. Extracts the explicit "HEAD detached at/from
+/// <ref>" line from plain `git status` output instead. `None` if HEAD is on a branch.
 fn extract_detached_head(raw: &str) -> Option<String> {
     raw.lines()
         .map(str::trim)
@@ -1591,12 +1526,8 @@ fn build_commit_command(args: &[String], global_args: &[String]) -> Command {
 /// Handles: `[main abc1234def] message`, `[main (root-commit) abc1234def] msg`,
 /// localized variants, and multibyte branch names.
 fn parse_commit_output(line: &str) -> String {
-    // Locate the summary's own brackets rather than assuming the line starts
-    // with '['. git prints hook output before its summary, so the first line
-    // is often something else entirely; slicing from byte 1 panics outright
-    // when that line opens with a multi-byte character ("✅ lint passed]"),
-    // and a line decoded from non-UTF-8 bytes starts with a multi-byte U+FFFD.
-    // Both indices come from `find`, so both land on character boundaries.
+    // Locate the brackets rather than assume the line starts with '[': git prints hook output
+    // first, and slicing from byte 1 would panic on a multi-byte leading character.
     let (Some(open), Some(bracket_end)) = (line.find('['), line.find(']')) else {
         return "ok".to_string();
     };
@@ -2046,8 +1977,11 @@ fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
 
     // Detect write operations: delete, rename, copy, upstream tracking
     let has_action_flag = tokens.iter().any(|t| match t.kind {
-        TokenKind::Short => matches!(t.text, "d" | "D" | "m" | "M" | "c" | "C" | "u"),
-        TokenKind::Long => matches!(t.text, "set-upstream-to" | "unset-upstream" | "edit-description"),
+        TokenKind::Short => matches!(t.text, "C" | "D" | "M" | "c" | "d" | "m" | "u"),
+        TokenKind::Long => matches!(
+            t.text,
+            "edit-description" | "set-upstream-to" | "unset-upstream"
+        ),
         _ => false,
     });
 
@@ -2061,15 +1995,16 @@ fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
         TokenKind::Short => matches!(t.text, "a" | "r"),
         TokenKind::Long => matches!(
             t.text,
-            "all" | "remotes"
+            "all"
+                | "contains"
+                | "format"
                 | "list"
                 | "merged"
-                | "no-merged"
-                | "contains"
                 | "no-contains"
-                | "format"
-                | "sort"
+                | "no-merged"
                 | "points-at"
+                | "remotes"
+                | "sort"
         ),
         _ => false,
     });
@@ -2077,9 +2012,7 @@ fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
     // Detect positional arguments (not flags) — indicates branch creation. A value consumed by
     // a preceding flag (e.g. -u/--set-upstream-to's upstream ref) is that flag's value, not an
     // independent positional branch name, so linked tokens are excluded.
-    let has_positional_arg = tokens
-        .iter()
-        .any(|t| t.is_free_positional());
+    let has_positional_arg = tokens.iter().any(|t| t.is_free_positional());
 
     // --show-current: passthrough with raw stdout (not "ok")
     if has_show_flag {
@@ -2693,12 +2626,7 @@ mod tests {
 
     #[test]
     fn test_branch_dash_u_links_its_upstream_value_not_a_free_positional() {
-        // Regression: -u's short form was missing from branch_takes_value (only its long form
-        // --set-upstream-to was included), so `git branch -u origin/main` left "origin/main" as
-        // an unlinked Positional token instead of -u's linked value. Currently masked in
-        // run_branch's own has_action_flag/has_positional_arg decision (short "u" is already
-        // matched independently by has_action_flag), but the token classification itself was
-        // still wrong and would misfire for any future code consuming these tokens directly.
+        // -u's short form must link its value like its long form --set-upstream-to does.
         let args = vec!["-u".to_string(), "origin/main".to_string()];
         let tokens = arg_tokenizer::tokenize(&args, &branch_takes_value);
         assert_eq!(tokens[0].kind, TokenKind::Short);
@@ -2713,10 +2641,7 @@ mod tests {
 
     #[test]
     fn test_checkout_new_branch_arg_accepts_glued_short_flag() {
-        // Confirmed against real git 2.51: `git checkout -bmy-branch` (glued, no space) creates
-        // "my-branch", same as the separate-token form `-b my-branch`. Token::value's
-        // attached-or-linked lookup recognizes both automatically; this pins that real behavior
-        // now that it's tokenizer-driven rather than a hand-rolled `arg == "-b"` string match.
+        // `-bmy-branch` (glued) and `-b my-branch` (separate) must both work.
         let args = vec!["-bmy-branch".to_string()];
         let tokens = arg_tokenizer::tokenize(&args, &checkout_takes_value);
         assert_eq!(checkout_new_branch_arg(&tokens), Some("my-branch"));
@@ -3954,15 +3879,9 @@ A  added.rs
 
     #[test]
     fn test_parse_user_limit_malformed_combined_digit_run() {
-        // "-5x" isn't a valid git log limit (git itself rejects it: `git log -5x` fails with
-        // "fatal: '5x': not an integer", verified against real git 2.51). The tokenizer's
-        // digit-run rule only looks at the leading digit run ("5"), so this now parses as 5
-        // rather than failing outright the way the pre-arg_tokenizer whole-string parse did
-        // (which required all of "5x" to parse as a number and returned None on failure).
-        // This is intentionally left as-is, not "fixed": run_log bails out on
-        // `!result.success()` before ever using `limit`/`user_set_limit` for formatting, since
-        // real git rejects "-5x" outright -- so this value is computed but never observably
-        // used either way.
+        // "-5x" isn't a valid git log limit (real git rejects it outright), but the digit-run
+        // rule only looks at the leading run and parses 5 anyway -- harmless since run_log bails
+        // out on git's own failure before ever using this value.
         let args: Vec<String> = vec!["-5x".into()];
         assert_eq!(parse_user_limit(&args), Some(5));
     }
@@ -4030,14 +3949,9 @@ A  added.rs
 
     #[test]
     fn test_diff_show_raw_shape_excludes_patch_flags() {
-        // Regression: git diff/show's default output already IS patch text, unlike log's plain
-        // commit-message default -- so an explicit -p/-u/--patch is redundant with the default,
-        // not a request for an incompatible shape, and must not divert diff/show onto the raw
-        // passthrough path (that would defeat RTK's whole compaction purpose for a very common
-        // invocation: `git diff -p`, `git show -p <rev>`).
         for flag in ["--patch", "-p", "-u"] {
             let args = vec![flag.to_string()];
-            let tokens = git_log_tokens(&args);
+            let tokens = tokenize_git_log_args(&args);
             assert!(
                 !tokens.iter().any(requests_diff_show_raw_shape),
                 "{flag} must stay on diff/show's compact path, not the raw passthrough path"
@@ -4060,7 +3974,7 @@ A  added.rs
             "--summary",
         ] {
             let args = vec![flag.to_string()];
-            let tokens = git_log_tokens(&args);
+            let tokens = tokenize_git_log_args(&args);
             assert!(
                 tokens.iter().any(requests_diff_show_raw_shape),
                 "{flag} changes output shape and should still request the raw passthrough path"
@@ -4113,12 +4027,8 @@ A  added.rs
 
     #[test]
     fn test_optional_value_options_do_not_consume_next_token() {
-        // These options only take an attached value (-U3, --unified=3,
-        // --expand-tabs=4, --max-parents=2); a bare separate token after
-        // them is not their value, so it must not be swallowed. Confirmed
-        // against git 2.53.0: e.g. `git log --expand-tabs 4` fails with
-        // "fatal: ambiguous argument '4'" rather than treating 4 as the
-        // option's value.
+        // These options only take an attached value (-U3, --unified=3, --expand-tabs=4,
+        // --max-parents=2); a bare separate token after them is not their value.
         for opt in [
             "-U",
             "--unified",
@@ -4136,13 +4046,8 @@ A  added.rs
 
     #[test]
     fn test_glued_diff_shape_short_flag_is_not_misread_as_a_limit() {
-        // Regression: -M/-C/-B/-U take only an attached optional numeric value ("-M50"), never a
-        // separate token (confirmed above and via Docker-free real-git checks in this fix's
-        // commit message). Before -M/-U/-C/-B were added to log_takes_value, none of their
-        // letters were recognized as taking a value at all, so a glued form like "-M50" had no
-        // value-taking char in its cluster and decomposed into per-char Short tokens
-        // "M"/"5"/"0" -- the stray "5" token then passed is_digit_run and was misread by
-        // parse_limit_from_tokens as if a bare "-5" limit flag had been passed.
+        // -M/-C/-B/-U take only an attached optional numeric value ("-M50"); the "50" must not
+        // decompose into a stray digit-run token misread as a "-5" limit flag.
         for glued in ["-M50", "-C5", "-B10", "-U3"] {
             let args = vec![glued.to_string()];
             assert_eq!(
@@ -4155,12 +4060,8 @@ A  added.rs
 
     #[test]
     fn test_clustered_short_flag_does_not_consume_separate_value() {
-        // Regression: confirmed against real git 2.51 that `git log -n 2` succeeds (bare -n
-        // consumes the separate "2"), but `git log -cn 2` fails with "ambiguous argument '2'" --
-        // clustered with another short flag, -n's value is only the (empty) remainder of the
-        // same arg, never the next token. Before log_takes_separate_value's is_solo gating, the
-        // tokenizer consumed "2" as -n's linked value regardless of clustering, so RTK's own
-        // parse_limit_from_tokens would wrongly believe the user set an explicit limit of 2.
+        // `-n 2` consumes the separate "2", but clustered with another short flag (`-cn 2`),
+        // -n's value is only the (empty) remainder of the same arg, never the next token.
         let args = vec!["-cn".to_string(), "2".to_string()];
         assert_eq!(
             parse_user_limit(&args),
@@ -4209,18 +4110,14 @@ A  added.rs
 
     #[test]
     fn test_has_limit_flag_ignores_a_clustered_n_with_no_captured_value() {
-        // Regression: has_limit_flag used to match any Short "n" token by text alone, even one
-        // clustered with another short flag where log_takes_separate_value's is_solo gate
-        // refuses to link a value ("-cn" leaves "n" with no attached/linked value at all). RTK
-        // would then believe the user explicitly set a commit-count limit (skipping its own
-        // --no-merges default) even though no value was ever actually captured.
+        // A clustered "n" with no captured value (e.g. "-cn") must not count as a limit.
         let args = vec!["-cn".to_string(), "2".to_string()];
-        let tokens = git_log_tokens(&args);
+        let tokens = tokenize_git_log_args(&args);
         assert!(!has_limit_flag(&tokens));
 
         // The bare, standalone form still counts.
         let args = vec!["-n".to_string(), "2".to_string()];
-        let tokens = git_log_tokens(&args);
+        let tokens = tokenize_git_log_args(&args);
         assert!(has_limit_flag(&tokens));
     }
 
@@ -4243,7 +4140,11 @@ A  added.rs
 
     #[test]
     fn test_real_flag_args_keeps_genuine_flags() {
-        let args = vec!["--grep".to_string(), "fix".to_string(), "--oneline".to_string()];
+        let args = vec![
+            "--grep".to_string(),
+            "fix".to_string(),
+            "--oneline".to_string(),
+        ];
         assert_eq!(real_flag_args(&args), vec!["grep", "oneline"]);
     }
 
@@ -4289,11 +4190,7 @@ A  added.rs
     fn test_parse_user_limit_skips_foreign_option_values() {
         // A real limit later in the args is still found after a
         // value-taking option's value is skipped.
-        let args = vec![
-            "--grep".to_string(),
-            "-5".to_string(),
-            "-20".to_string(),
-        ];
+        let args = vec!["--grep".to_string(), "-5".to_string(), "-20".to_string()];
         assert_eq!(parse_user_limit(&args), Some(20));
     }
 

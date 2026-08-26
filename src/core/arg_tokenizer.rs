@@ -1,35 +1,20 @@
 //! Shared tokenizer for re-classifying an already-`--`-restored passthrough args slice
 //! (see [`crate::core::args_utils::restore_double_dash`]) into flags, their values, and
 //! positionals, matching the GNU/POSIX-ish conventions used by git, cargo, rg, and friends.
+//! Callers keep their own list of which flags take a value (inherently per-tool) and pass it in
+//! as a predicate instead of reimplementing the token-walking around it.
 //!
-//! This exists because every `src/cmds/**` filter that needs to know "does this flag consume
-//! the next token as its value, and where does `--` end options" was reimplementing that
-//! question independently (git.rs's `LogArg`/`consumes_next_token_as_value`, search.rs's
-//! `VALUE_FLAGS_SHORT`/`VALUE_FLAGS_LONG`/`ClusterResult`, golangci_cmd.rs's
-//! `GLOBAL_FLAGS_WITH_VALUE`), and each one accumulated its own one-off bugs over time.
-//! `tokenize` centralizes the classification; callers keep their own list of which flags take a
-//! value (that part is inherently per-tool) but pass it in as a predicate instead of
-//! reimplementing the token-walking around it.
-//!
-//! Deliberately *not* merged with `restore_double_dash`, even though every caller has to do
-//! both in sequence: `restore_double_dash` needs both the clap-parsed args and the raw process
-//! argv to detect what clap's `trailing_var_arg` stripped, and its restored result has to be an
-//! owned `Vec<String>` the caller holds in its own `let` binding — `Token<'a>` borrows straight
-//! from `args`, so tokenizing a `Vec<String>` built *inside* this module (from a hypothetical
-//! internal `restore_double_dash` call) would tie every `Token` to a value that's dropped when
-//! the function returns. Same root cause as why this module doesn't build on `clap_lex`.
+//! Not merged with `restore_double_dash`: `Token<'a>` borrows straight from `args`, so
+//! tokenizing an owned `Vec<String>` built *inside* this module would tie every `Token` to a
+//! value dropped when the function returns.
 
 /// What kind of unit a [`Token`] represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
     /// The literal `--` separator. Emitted exactly once, for the first `--` encountered. Under
-    /// [`Dialect::Posix`], this ends option parsing: every token after it is `Positional`
-    /// unconditionally and `takes_value` is never consulted again (a second or later `--` comes
-    /// back as a plain `Positional` with `text == "--"`, matching real git/GNU semantics). Under
-    /// [`Dialect::Msbuild`], `--` is an argument-*forwarding* boundary rather than an
-    /// end-of-options marker (dotnet's `--` hands the rest to a different receiving parser that
-    /// can share flag names with dotnet's own), so classification continues normally past it —
-    /// only its position is recorded.
+    /// [`Dialect::Posix`] it ends option parsing (everything after is `Positional`); under
+    /// [`Dialect::Msbuild`] it's an argument-*forwarding* boundary instead, so classification
+    /// continues normally past it, with only its position recorded.
     DashDash,
     /// `--name` (see `Token::text` for the name, without the leading `--`).
     Long,
@@ -82,12 +67,8 @@ impl<'a> Token<'a> {
             .or_else(|| self.linked.map(|idx| tokens[idx].text))
     }
 
-    /// True for a genuine free-standing positional: `Positional` kind, and not itself consumed
-    /// as some preceding flag's separate-token value (`Token::linked`). A value consumed that
-    /// way belongs to its owning flag, not to whatever question the caller is asking about
-    /// positionals (e.g. "is there a branch name to create", "is there an explicit project
-    /// path") -- callers across `git.rs`/`golangci_cmd.rs`/`search.rs` each answered this
-    /// identically by hand before this method existed.
+    /// True for a genuine free-standing positional: `Positional` kind, not itself consumed as
+    /// some preceding flag's separate-token value (`Token::linked`).
     pub fn is_free_positional(&self) -> bool {
         self.kind == TokenKind::Positional && self.linked.is_none()
     }
@@ -102,13 +83,9 @@ pub fn is_digit_run(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// True if `text` (a `Long` token's name) matches `name` under `dialect`'s naming rules:
-/// exact for [`Dialect::Posix`] (git/cargo/rg/golangci-lint are case-sensitive), ASCII
-/// case-insensitive for [`Dialect::Msbuild`] (Windows/MSBuild-ecosystem tools fold case
-/// broadly — this isn't a dotnet-CLI particularity, e.g. classic MSBuild.exe's `/nologo` and
-/// `/NoLogo` are equally valid). `text` can't be case-folded once at tokenize time without
-/// giving up `Token`'s zero-copy `&'a str` (there's no borrowed "lowercased" view), so instead
-/// every dialect-aware lookup goes through this and [`has_flag`]/[`double_dash_flag_value`].
+/// True if `text` (a `Long` token's name) matches `name` under `dialect`'s naming rules: exact
+/// for [`Dialect::Posix`], ASCII case-insensitive for [`Dialect::Msbuild`] (MSBuild-ecosystem
+/// tools fold case broadly, e.g. `/nologo` and `/NoLogo` are equally valid).
 fn flag_name_matches(text: &str, name: &str, dialect: Dialect) -> bool {
     match dialect {
         Dialect::Msbuild => text.eq_ignore_ascii_case(name),
@@ -128,13 +105,10 @@ pub fn has_dashdash(tokens: &[Token<'_>]) -> bool {
     dashdash_index(tokens).is_some()
 }
 
-/// True if `name` (matched per `dialect`) appears as a `Long` token anywhere in `tokens`.
-///
-/// Under `Dialect::Msbuild`, this deliberately matches `-flag`/`--flag`/`/flag` uniformly —
-/// correct for genuine legacy MSBuild.exe passthrough switches (`nologo`, `bl`, `v`), but
-/// *not* correct in general for dotnet's own System.CommandLine-parsed options or VSTest
-/// options forwarded through `dotnet test`. See [`has_double_dash_flag`] before using this for
-/// any Msbuild-dialect flag that isn't one of those legacy switches.
+/// True if `name` (matched per `dialect`) appears as a `Long` token anywhere in `tokens`. Under
+/// `Dialect::Msbuild`, this matches `-flag`/`--flag`/`/flag` uniformly — correct only for
+/// legacy MSBuild.exe passthrough switches (`nologo`, `bl`, `v`); see [`has_double_dash_flag`]
+/// for anything else.
 pub fn has_flag(tokens: &[Token<'_>], dialect: Dialect, name: &str) -> bool {
     tokens
         .iter()
@@ -143,20 +117,10 @@ pub fn has_flag(tokens: &[Token<'_>], dialect: Dialect, name: &str) -> bool {
 
 /// Like [`double_dash_flag_value`], but only reports presence, not the value; only matches a
 /// token written with a literal `--` prefix (`Token::double_dash`), not `-flag`/`/flag` under
-/// [`Dialect::Msbuild`].
-///
-/// Under `Dialect::Msbuild`, [`has_flag`] treats `-flag`, `--flag`, and `/flag` as
-/// interchangeable — correct for the handful of options MSBuild.exe itself has
-/// always accepted in all three forms (`-nologo`, `-bl`, `-v`/`-verbosity`) and forwards
-/// straight through to. It is *not* correct for dotnet's own System.CommandLine-parsed options
-/// (`dotnet format`'s `--verify-no-changes`/`--report`, `dotnet test`'s `--logger`/
-/// `--results-directory`) or VSTest-console options forwarded through `dotnet test`: verified
-/// against a real dotnet 9 SDK that these are double-dash-only, and a single-dash or slash
-/// spelling doesn't just get rejected -- it gets *misparsed* as an unrelated MSBuild switch
-/// (`-results-directory` is read as MSBuild's own unrecognized switch "results-directory";
-/// `-logger` collides with MSBuild's own `-logger` switch, which expects a logger assembly
-/// spec, not "trx"). Use this (or [`double_dash_flag_value`]/[`double_dash_flag_values`]) for
-/// any option that isn't a genuine legacy MSBuild.exe passthrough switch.
+/// [`Dialect::Msbuild`]. Under that dialect, a single-dash or slash spelling of a modern
+/// System.CommandLine option (e.g. dotnet's `--logger`) doesn't just get rejected — it gets
+/// misparsed as an unrelated legacy MSBuild switch — so use this (not [`has_flag`]) for any
+/// option that isn't a genuine legacy MSBuild.exe passthrough switch.
 pub fn has_double_dash_flag(tokens: &[Token<'_>], dialect: Dialect, name: &str) -> bool {
     tokens.iter().any(|t| is_double_dash_flag(t, dialect, name))
 }
@@ -176,12 +140,9 @@ pub fn double_dash_flag_value<'a>(
 }
 
 /// Every value for `name` (matched per `dialect`), in order, for a `--`-prefixed flag that can
-/// legitimately be repeated (e.g. dotnet test's `--logger console;verbosity=normal --logger
-/// trx`, where each occurrence must be checked, not just the first —
-/// [`double_dash_flag_value`] only reports the first match). Occurrences with no value (bare
-/// flag, or a value-taking flag with nothing left to consume) are skipped rather than yielding
-/// `None`. See [`has_double_dash_flag`] for why the `--`-only restriction is load-bearing under
-/// `Dialect::Msbuild`.
+/// legitimately repeat (e.g. dotnet test's `--logger`, usable more than once) — unlike
+/// [`double_dash_flag_value`], which only reports the first match. Occurrences with no value are
+/// skipped rather than yielding `None`.
 pub fn double_dash_flag_values<'a, 't>(
     tokens: &'t [Token<'a>],
     dialect: Dialect,
@@ -215,13 +176,9 @@ pub enum Dialect {
 }
 
 /// Tokenizes `args` into [`Token`]s using [`Dialect::Posix`] conventions. `takes_value(kind,
-/// name)` is called for each `Long`/`Short` flag that has no attached value, to decide whether
-/// the following whole token should be consumed as its separate-token value; it is never called
-/// for tokens at or after `--`.
-///
-/// Never panics and never fails to classify: a value-taking flag with nothing left to consume
-/// simply gets `attached: None, linked: None`, matching RTK's fallback/never-block-the-user
-/// convention.
+/// name)` decides whether a flag with no attached value should consume the following token as
+/// its separate value; never panics, a value-taking flag with nothing left to consume simply
+/// gets `attached: None, linked: None`.
 pub fn tokenize<'a, T: AsRef<str>>(
     args: &'a [T],
     takes_value: &dyn Fn(TokenKind, &str) -> bool,
@@ -233,15 +190,9 @@ pub fn tokenize<'a, T: AsRef<str>>(
 /// [`tokenize_with_options`]. Defaults (via [`Default`]) match plain [`tokenize`]'s behavior, so
 /// a caller only sets the field(s) it actually needs.
 ///
-/// Generic over `T: AsRef<str>` (in [`tokenize_with_options`]) so a caller can pass either
-/// `&[String]` (the common case, e.g. already-owned args from
-/// [`crate::core::args_utils::restore_double_dash`]) or `&[&str]` (handy for tests) without
-/// cloning either way — `Token` still borrows straight from `args`, zero-copy. Not generic over
-/// `OsStr`/`OsString`: unlike `str`, `OsStr` exposes almost no string-manipulation API by design
-/// (no `strip_prefix`, `split_once`, char-boundary slicing), so tokenizing it would mean
-/// re-deriving that machinery byte-by-byte the way `clap_lex` does internally — a much bigger
-/// change for a case rtk doesn't hit today (its own CLI parsing already assumes UTF-8 args for
-/// every subcommand this module serves).
+/// `tokenize_with_options` is generic over `T: AsRef<str>`, not `OsStr`/`OsString`: `OsStr`
+/// exposes almost no string-manipulation API (no `strip_prefix`, `split_once`), so tokenizing
+/// it would mean re-deriving that machinery byte-by-byte the way `clap_lex` does internally.
 pub struct TokenizeOptions<'p> {
     /// Which CLI's flag grammar to apply. Defaults to [`Dialect::Posix`].
     pub dialect: Dialect,
@@ -302,15 +253,11 @@ struct Scanner<'a, 'p, T> {
 
 impl<'a, 'p, T: AsRef<str>> Scanner<'a, 'p, T> {
     /// Pushes one atomic (non-clustering) flag token — used for `--flag` in both dialects, and
-    /// for `-flag`/`/flag` in [`Dialect::Msbuild`] — splitting off an attached value per
-    /// `self.dialect` and, absent one, consulting `self.takes_value` to maybe consume the next
-    /// whole token as a separate value. `rest` is the flag text with its prefix (`--`, `-`, or
-    /// `/`) already stripped; `double_dash` records which prefix that was (see
-    /// `Token::double_dash`). Advances `self.i` past both the flag and, if consumed, its
-    /// separate-token value. `separate_value` is false for the `/flag` spelling: an MSBuild
-    /// switch attaches its value with `:` (`/bl:x.binlog`) and never consumes the next argument,
-    /// so `/r` (MSBuild's `restore`) must not swallow the token after it the way dotnet's own
-    /// `-r <rid>` does.
+    /// for `-flag`/`/flag` in [`Dialect::Msbuild`]. `rest` is the flag text with its prefix
+    /// already stripped; `double_dash` records which prefix that was. `separate_value` is false
+    /// for the `/flag` spelling: an MSBuild switch attaches its value with `:` (`/bl:x.binlog`)
+    /// and never consumes the next argument, so `/r` (MSBuild's `restore`) must not swallow the
+    /// token after it the way dotnet's own `-r <rid>` does.
     fn push_atomic_flag(&mut self, rest: &'a str, double_dash: bool, separate_value: bool) {
         let (name, attached) = split_attached(rest, self.dialect);
         let flag_index = self.tokens.len();
@@ -332,16 +279,9 @@ impl<'a, 'p, T: AsRef<str>> Scanner<'a, 'p, T> {
 
     /// If `self.args[value_index]` exists and isn't the still-unseen boundary `--`, pushes it as
     /// a `Positional` token linked to `flag_index` (and links `flag_index` back to it). Returns
-    /// whether a value was consumed. Shared by `push_atomic_flag` and the `Short`-cluster path
-    /// so the boundary guard lives in exactly one place. Does *not* itself advance `self.i` --
-    /// each caller decides how (a Long flag always consumes exactly one more token; a Short
-    /// cluster's caller already accounts for the whole cluster being one arg).
-    ///
-    /// The still-unseen boundary `--` can't be swallowed as a value unless
-    /// `self.claims_literal_dash_dash` says this flag claims it (see
-    /// [`TokenizeOptions::claims_literal_dash_dash`]) -- once the boundary has already been
-    /// emitted, a later `--` is just ordinary text and fair game either way (`git log -- --
-    /// pattern` works).
+    /// whether a value was consumed; does *not* itself advance `self.i`. The still-unseen `--`
+    /// can be swallowed as a value only if `self.claims_literal_dash_dash` says this flag claims
+    /// it (see [`TokenizeOptions::claims_literal_dash_dash`]).
     fn link_next_value(&mut self, flag_index: usize, value_index: usize) -> bool {
         let Some(next) = self.args.get(value_index) else {
             return false;
@@ -385,14 +325,8 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
     while scanner.i < scanner.args.len() {
         let arg = scanner.args[scanner.i].as_ref();
 
-        // In Posix conventions `--` ends option parsing: everything after is a literal
-        // positional/pathspec, never a flag. dotnet's `--` means something different -- an
-        // argument-*forwarding* boundary, not an end-of-options marker: what follows is still
-        // real flags, just meant for a different receiving parser (the VSTest/MTP test host)
-        // that can share flag names with dotnet's own (e.g. --logger, --results-directory are
-        // forwarded VSTest-console options). So only Posix stops classifying at the boundary;
-        // Msbuild keeps going, just with the separator's position on record via the DashDash
-        // token below.
+        // Posix stops classifying at `--`; Msbuild's `--` is a forwarding boundary, so it keeps
+        // classifying flags past it (see TokenKind::DashDash).
         if scanner.emitted_dash_dash && scanner.dialect == Dialect::Posix {
             scanner.tokens.push(positional(arg, scanner.i));
             scanner.i += 1;
@@ -421,24 +355,12 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
 
         if scanner.dialect == Dialect::Msbuild {
             if let Some(rest) = arg.strip_prefix('/') {
-                // A real MSBuild switch name never contains another '/' (confirmed via a real
-                // dotnet 9 SDK, Docker: `dotnet build /abs/path/Project.csproj` builds the
-                // absolute Unix path as the project positional, not a switch attempt). Without
-                // this guard, an absolute path -- the common case on Linux/macOS -- would be
-                // misclassified as a Long flag named e.g. "tmp/results".
-                //
-                // KNOWN LIMITATION, not fixed here: a single-segment absolute path (`/app`,
-                // `/tmp`) is indistinguishable from a genuine switch name by structure alone --
-                // confirmed via Docker that real dotnet/MSBuild itself only resolves this
-                // ambiguity with a filesystem check (`dotnet build /tmp`, which exists, is
-                // accepted as a path attempt; `dotnet build /nonexistentdir`, which doesn't
-                // exist, is rejected as "MSB1001: Unknown switch" -- byte-for-byte structural
-                // parsing alone can't tell them apart, real dotnet needs a stat() call to do
-                // it). This tokenizer is a pure function with no I/O by design, so replicating
-                // that exactly isn't possible here; the impact is narrow regardless, since it
-                // only matters for the loose flag lookup ([`has_flag`]) and only collides with
-                // an actual single-segment path that's spelled exactly like one of the few loose
-                // switch names ("nologo", "bl", "v", "verbosity").
+                // A real MSBuild switch name never contains another '/' -- without this guard,
+                // an absolute Unix path would misclassify as a Long flag (e.g. "tmp/results").
+                // KNOWN LIMITATION: a single-segment path (`/app`) is indistinguishable from a
+                // genuine switch by structure alone; this pure function has no I/O to resolve it
+                // the way real MSBuild does (a filesystem check), but the impact is narrow --
+                // only the loose flag lookup ([`has_flag`]) is affected.
                 let name_part = rest.split(['=', ':']).next().unwrap_or(rest);
                 if !rest.is_empty() && !name_part.contains('/') {
                     scanner.push_atomic_flag(rest, false, false);
@@ -513,12 +435,8 @@ fn split_attached(s: &str, dialect: Dialect) -> (&str, Option<&str>) {
     }
 }
 
-/// Base constructor for a freshly-scanned token that hasn't been linked to anything yet:
-/// `attached`/`linked` default to `None`. Every token-construction site in this module builds on
-/// top of this via struct-update syntax rather than writing out a full `Token { ... }` literal,
-/// so `Token` gaining a field later means updating one constructor instead of updating every
-/// call site (and a call site accidentally missing the new field would fail to compile instead
-/// of silently defaulting it wrong).
+/// Base constructor for a freshly-scanned token: `attached`/`linked` default to `None`. Every
+/// token-construction site builds on this via struct-update syntax instead of a full literal.
 fn token(kind: TokenKind, text: &str, source_index: usize, double_dash: bool) -> Token<'_> {
     Token {
         kind,
@@ -903,12 +821,7 @@ mod tests {
 
     #[test]
     fn msbuild_absolute_path_is_positional_not_a_flag() {
-        // Regression: confirmed via a real dotnet 9 SDK (Docker) that `dotnet build
-        // /abs/path/Project.csproj` builds the absolute Unix path as the project positional --
-        // real MSBuild never treats a multi-segment "/a/b" as a switch attempt. Before this fix,
-        // any '/'-prefixed token was classified as a Long flag regardless of internal '/'s, so
-        // an absolute path (the common case on Linux/macOS) was misread as a flag named e.g.
-        // "tmp/results".
+        // Real MSBuild never treats a multi-segment "/a/b" as a switch attempt.
         let takes = |kind: TokenKind, name: &str| kind == TokenKind::Long && name == "nologo";
         let args = owned(&["/tmp/results"]);
         let tokens = tokenize_with_options(

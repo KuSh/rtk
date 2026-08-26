@@ -29,13 +29,8 @@ fn is_golangci_subcommand(name: &str) -> bool {
     )
 }
 
-/// True for golangci-lint flags that take a separate-token value when they appear *before* the
-/// `run` subcommand, passed to [`arg_tokenizer::tokenize`] as `find_subcommand_index`'s value
-/// predicate. `-c` is `--config`'s shorthand. Confirmed via a real golangci-lint 2.13.1 (Docker):
-/// `golangci-lint --help`'s own "Global Flags" section lists only `--color`/`-h`/`-v`/`--version`,
-/// but `--config`/`-c`, `--cpu-profile-path`, `--mem-profile-path`, and `--trace-path` are also
-/// accepted before `run` in practice (e.g. `golangci-lint --config foo.yml run` parses `--config`
-/// without an "unknown flag" error), so this list reflects verified behavior, not the --help text.
+/// Value-taking flags accepted *before* the `run` subcommand. `-c` is `--config`'s shorthand;
+/// this list is wider than `--help`'s "Global Flags" section, which omits several of these.
 fn golangci_takes_value(kind: TokenKind, name: &str) -> bool {
     match kind {
         TokenKind::Long => matches!(
@@ -47,14 +42,9 @@ fn golangci_takes_value(kind: TokenKind, name: &str) -> bool {
     }
 }
 
-/// True for `golangci-lint run`'s own value-taking flags, passed to [`arg_tokenizer::tokenize`]
-/// as `has_output_flag`'s value predicate over `run_args` -- a distinct, wider list from
-/// [`golangci_takes_value`] (scoped to flags valid *before* `run`), confirmed via a real
-/// golangci-lint 2.13.1 `run --help` (Docker). Without this, a run-level value-taking flag not in
-/// this list would leave its separate-token value as an unlinked, independently-classified token;
-/// if that value happened to be spelled like a recognized flag name (e.g. `--path-prefix
-/// --out-format`), it would tokenize as its own genuine Long token and be misdetected by
-/// has_output_flag's presence check.
+/// `run`'s own value-taking flags -- a wider list than [`golangci_takes_value`] (which is scoped
+/// to flags valid *before* `run`). Missing an entry here risks a value like `--path-prefix
+/// --out-format` tokenizing as its own flag and being misdetected by `has_output_flag`.
 fn golangci_run_takes_value(kind: TokenKind, name: &str) -> bool {
     // The one exception to one-grammar-per-command (`src/core/README.md`), earned by a strict
     // subset: every flag valid before `run` stays valid after it. Grammars that merely
@@ -189,9 +179,6 @@ pub(crate) fn detect_major_version() -> u32 {
 }
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
-    // Re-insert `--` when clap's trailing_var_arg consumed it (issue #1215): without this,
-    // both classify_invocation's `--` detection and the raw args run_passthrough forwards to
-    // the real binary would be missing the user's own `--`.
     let args = &args_utils::restore_double_dash(args);
     match classify_invocation(args) {
         Invocation::FilteredRun(invocation) => run_filtered(args, &invocation, verbose),
@@ -683,33 +670,22 @@ mod tests {
 
     #[test]
     fn test_has_output_flag_does_not_misread_a_run_level_flags_value() {
-        // Regression: has_output_flag used to tokenize run_args with golangci_takes_value, which
-        // is scoped to golangci-lint's pre-`run` flags and doesn't know about run-level
-        // value-taking flags like --path-prefix (confirmed via a real golangci-lint 2.13.1,
-        // Docker: `golangci-lint run --path-prefix foo` is accepted). Without --path-prefix in
-        // the predicate, its separate-token value tokenized independently -- if that value was
-        // itself spelled like "--output.json.path", it became its own genuine Long token and was
-        // misdetected as the real output flag.
+        // --path-prefix's separate-token value must not be misdetected as the real output flag.
         assert!(!has_output_flag(&[
             "--path-prefix".to_string(),
             "--output.json.path".to_string(),
         ]));
-        // Real run-level flags with separate-token values must still link correctly (not become
-        // stray unlinked Positionals that could themselves be misread elsewhere).
         assert!(!has_output_flag(&[
             "--disable".to_string(),
             "errcheck".to_string(),
         ]));
         assert!(!has_output_flag(&["--timeout".to_string(), "30s".to_string()]));
-
     }
 
     #[test]
     fn test_golangci_run_takes_value_links_out_format_separate_token_value() {
-        // Regression: --out-format (v1-only legacy flag) was missing from
-        // golangci_run_takes_value's list, so its separate-token value ("json") tokenized
-        // independently as an unlinked Positional instead of being linked as --out-format's own
-        // value -- the same bug class already fixed for --path-prefix in this diff.
+        // --out-format is a v1-only legacy flag; its value must still link, not tokenize as an
+        // unlinked Positional.
         let args = vec!["--out-format".to_string(), "json".to_string()];
         let tokens = arg_tokenizer::tokenize(&args, &golangci_run_takes_value);
         assert!(tokens[0].linked.is_some(), "\"json\" must link to --out-format");

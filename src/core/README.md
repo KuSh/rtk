@@ -109,11 +109,11 @@ Key functions available to all command modules:
 
 ## Argument Tokenizer (arg_tokenizer.rs)
 
-Shared classifier for an already-`--`-restored args slice (see `args_utils::restore_double_dash`) into flags, their values, and positionals. `tokenize`/`tokenize_with_options` take a `takes_value(kind, name)` predicate the caller supplies — the list of which flags take a value is inherently per-tool, but the token-walking around it (short-flag clustering, `--` boundaries, attached vs. separate-token values) isn't. Consumers: `cmds/git`, `cmds/dotnet`, `cmds/go` (golangci-lint), `cmds/system/search.rs` (grep/rg).
+Shared classifier for an already-`--`-restored args slice (see `args_utils::restore_double_dash`) into flags, their values, and positionals. `tokenize`/`tokenize_with_options` take a `takes_value(kind, name)` predicate the caller supplies — the list of which flags take a value is per-tool, but the token-walking around it isn't.
 
-**Design rule: one grammar per subcommand.** Never reuse a sibling command's predicate wholesale just because it looks close enough — two confirmed bugs came from exactly that shortcut: `git.rs`'s `stash_show_wants_patch` copied `git log`'s `-u`-means-`-p` mapping, but `git stash show`'s `-u` means `--include-untracked`; and `requests_diff_show_raw_shape` hand-duplicated `requests_raw_diff_shape`'s flag list instead of delegating to it, letting the two drift apart. When a new subcommand needs its own value-taking or `--`-boundary rules, verify against the real tool rather than assuming it matches a sibling.
+**Design rule: one grammar per subcommand.** Never reuse a sibling command's predicate wholesale just because it looks close enough — e.g. `-u` means `-p` in `git log` but `--include-untracked` in `git stash show`. Verify against the real tool rather than assuming it matches a sibling.
 
-`TokenizeOptions` (passed to `tokenize_with_options`) is where a subcommand's grammar exceptions live: `dialect` (POSIX vs. MSBuild), `takes_separate_value` (can a clustered `Short` flag still take a separate-token value), and `claims_literal_dash_dash` (does a value-taking flag consume a literal `--` as its value instead of treating it as the end-of-options boundary — true for grep/rg, false for git/cargo, confirmed per-tool not per-flag). All default to the common case, so a caller only sets what it needs.
+`TokenizeOptions` (passed to `tokenize_with_options`) is where a subcommand's grammar exceptions live: `dialect`, `takes_separate_value`, `claims_literal_dash_dash` (does a value-taking flag consume a literal `--` as its value, or is `--` the end-of-options boundary — this is a per-tool split). All default to the common case.
 
 ## Consumer Contracts
 
