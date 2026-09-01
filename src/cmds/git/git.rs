@@ -125,7 +125,7 @@ fn run_diff(
     let wants_compact = !tokens
         .iter()
         .any(|t| t.kind == TokenKind::Long && t.attached.is_none() && t.text == "no-compact")
-        && !emits_word_diff(args);
+        && !emits_word_diff(&tokens);
 
     if wants_stat || !wants_compact {
         // User wants stat or explicitly no compacting - pass through directly
@@ -233,7 +233,7 @@ fn run_show(
     // pass through directly to avoid duplicated output from compact-show steps.
     let wants_blob_show = args.iter().any(|arg| is_blob_show_arg(arg));
 
-    if wants_stat_only || wants_format || wants_blob_show || emits_word_diff(args) {
+    if wants_stat_only || wants_format || wants_blob_show || emits_word_diff(&tokens) {
         let mut cmd = git_cmd(global_args);
         cmd.arg("show");
         for arg in args {
@@ -341,19 +341,22 @@ fn run_show(
 /// `--word-diff=none` is the mode that turns a word diff back off, leaving an
 /// ordinary unified diff to compact. Modes are last-one-wins, which is what
 /// that mode is for: overriding an alias or an earlier flag on the same line.
-fn emits_word_diff(args: &[String]) -> bool {
+///
+/// Takes tokens rather than raw args: a `--word-diff` consumed as another option's value
+/// (`--author --word-diff`) or sitting past `--` as a pathspec is not a word diff request, and
+/// real git agrees on both.
+fn emits_word_diff(tokens: &[Token]) -> bool {
     let mut word_diff = false;
-    for arg in args {
-        if let Some(mode) = arg.strip_prefix("--word-diff=") {
-            word_diff = mode != "none";
-        } else if arg == "--word-diff"
-            || arg.starts_with("--word-diff-regex")
-            || arg == "--color-words"
-            || arg.starts_with("--color-words=")
-        {
-            // `--color-words[=<regex>]` takes a regex rather than a mode, so
-            // there is no `none` to honour on that spelling.
-            word_diff = true;
+    for token in tokens {
+        if token.kind != TokenKind::Long {
+            continue;
+        }
+        match token.text {
+            "word-diff" => word_diff = token.attached != Some("none"),
+            // `--color-words[=<regex>]` takes a regex rather than a mode, so there is no `none`
+            // to honour on that spelling.
+            "color-words" | "word-diff-regex" => word_diff = true,
+            _ => {}
         }
     }
     word_diff
@@ -2306,7 +2309,10 @@ fn run_stash(
                 return Ok(result.exit_code);
             }
 
-            let filtered = if patch_mode && !emits_word_diff(args) {
+            // Log's grammar, unlike `stash_show_wants_patch`'s: `stash show` parses `-p`/`-u`
+            // itself, but hands the rest to the revision machinery, which does consume a
+            // following `--word-diff` as `--author`'s value.
+            let filtered = if patch_mode && !emits_word_diff(&tokenize_git_log_args(args)) {
                 compact_diff(&result.stdout, 100)
             } else if patch_mode {
                 result.stdout.clone()
@@ -3085,6 +3091,11 @@ mod tests {
         );
     }
 
+    fn word_diff_from(args: &[&str]) -> bool {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        emits_word_diff(&tokenize_git_log_args(&args))
+    }
+
     #[test]
     fn test_emits_word_diff_detects_every_form() {
         for flag in [
@@ -3095,15 +3106,11 @@ mod tests {
             "--color-words",
             "--color-words=.",
         ] {
-            assert!(
-                emits_word_diff(&[flag.to_string()]),
-                "{} must pass through",
-                flag
-            );
+            assert!(word_diff_from(&[flag]), "{} must pass through", flag);
         }
-        assert!(!emits_word_diff(&["--stat".to_string()]));
-        assert!(!emits_word_diff(&["-U10".to_string()]));
-        assert!(!emits_word_diff(&[]));
+        assert!(!word_diff_from(&["--stat"]));
+        assert!(!word_diff_from(&["-U10"]));
+        assert!(!word_diff_from(&[]));
     }
 
     #[test]
@@ -3111,18 +3118,25 @@ mod tests {
         // `--word-diff=none` leaves an ordinary unified diff, which compacts
         // like any other. Treating it as a word diff passed the whole raw diff
         // through, so a defensive `--word-diff=none` lost every saving.
-        assert!(!emits_word_diff(&["--word-diff=none".to_string()]));
+        assert!(!word_diff_from(&["--word-diff=none"]));
         // Modes are last-one-wins, which is what `none` exists to do.
-        assert!(!emits_word_diff(&[
-            "--word-diff".to_string(),
-            "--word-diff=none".to_string()
-        ]));
-        assert!(emits_word_diff(&[
-            "--word-diff=none".to_string(),
-            "--word-diff".to_string()
-        ]));
+        assert!(!word_diff_from(&["--word-diff", "--word-diff=none"]));
+        assert!(word_diff_from(&["--word-diff=none", "--word-diff"]));
         // `--color-words` takes a regex, so `none` there is a pattern.
-        assert!(emits_word_diff(&["--color-words=none".to_string()]));
+        assert!(word_diff_from(&["--color-words=none"]));
+    }
+
+    #[test]
+    fn test_emits_word_diff_ignores_a_consumed_or_pathspec_word_diff() {
+        // Real git 2.53.0: `git diff --author --word-diff` emits an ordinary line diff (the
+        // flag is `--author`'s value), and `git diff -- --word-diff` treats it as a pathspec.
+        assert!(!word_diff_from(&["--author", "--word-diff"]));
+        // `-M` takes an attached value only, so it consumes nothing and git does word-diff:
+        // reading this as `-M`'s value would hand compact_diff a word diff to mangle.
+        assert!(word_diff_from(&["-M", "--word-diff"]));
+        assert!(!word_diff_from(&["--", "--word-diff"]));
+        // `--word-diff-regex` still requests one when its own value is flag-shaped.
+        assert!(word_diff_from(&["--word-diff-regex", "--stat"]));
     }
 
     #[test]
