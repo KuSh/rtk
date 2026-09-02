@@ -961,12 +961,10 @@ struct DetectedFlags {
 /// instead of tokenizing the reconstructed `flags` strings a second time.
 #[cfg(test)]
 fn has_format_flag<T: AsRef<str>>(engine: Engine, extra_args: &[T]) -> bool {
-    // Shares search_takes_value with extract_pattern_path so a value-taking flag's value (e.g.
-    // `-e --json`, where "--json" is -e's pattern, not the real --json flag) is never misread as
-    // one of these.
-    let tokens = arg_tokenizer::tokenize(extra_args, &|kind, name| {
-        search_takes_value(engine, kind, name)
-    });
+    // The module's shared tokenizer, so a value-taking flag's value (e.g. `-e --json`, where
+    // "--json" is -e's pattern, not the real --json flag) is classified exactly as
+    // extract_pattern_path classifies it.
+    let tokens = tokenize_search_args(extra_args, engine);
     tokens
         .iter()
         .any(|t| is_format_flag_token(engine, t.kind, t.text))

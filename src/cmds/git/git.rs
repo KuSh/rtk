@@ -2459,6 +2459,11 @@ fn format_stash_message(subcommand: Option<&str>, result: &CaptureResult) -> Str
 }
 
 /// True if `-p`/`--patch` was requested. Note: `-u` means `--include-untracked` here, not `-p`.
+///
+/// The "nothing takes a value" predicate *is* `stash show`'s grammar for this question, not a
+/// placeholder: git parses `-p`/`-u` itself before handing the rest to the revision machinery,
+/// so no flag it sees here consumes a following token, and treating one as if it did swallowed
+/// the `-p` after it (confirmed against git 2.53 with `git stash show --author -p`).
 fn stash_show_wants_patch(args: &[String]) -> bool {
     let tokens = arg_tokenizer::tokenize(args, &|_kind, _name| false);
     tokens.iter().any(|t| match t.kind {

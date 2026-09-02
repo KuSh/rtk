@@ -669,8 +669,8 @@ fn parse_global_json_mtp_mode(path: &Path) -> bool {
 
 /// Checks whether the `global.json` closest to the current directory enables the .NET 10
 /// native MTP mode (`"test": { "runner": "Microsoft.Testing.Platform" }`).
-fn is_global_json_mtp_mode() -> bool {
-    let Ok(mut dir) = std::env::current_dir() else {
+fn is_global_json_mtp_mode(start_dir: &Path) -> bool {
+    let Ok(mut dir) = start_dir.canonicalize() else {
         return false;
     };
     loop {
@@ -697,13 +697,15 @@ fn detect_test_runner_mode(tokens: &[Token<'_>]) -> TestRunnerMode {
     detect_test_runner_mode_in_dir(tokens, Path::new("."))
 }
 
-/// `scan_dir` is the directory scanned for a project file when no explicit project is given --
-/// a parameter (rather than hardcoding ".") so tests can point it at an isolated tempdir instead
-/// of racing on the real process cwd.
+/// `scan_dir` is where every filesystem probe starts: the project-file scan when no project is
+/// named, and the upward walks for `global.json` and `Directory.Build.props`. A parameter
+/// rather than a hardcoded "." so tests point it at an isolated tempdir instead of racing on
+/// the real process cwd -- all three probes have to honour it, or a developer working beneath
+/// a `global.json` decides the result and the tempdir assertions become decorative.
 fn detect_test_runner_mode_in_dir(tokens: &[Token<'_>], scan_dir: &Path) -> TestRunnerMode {
     // global.json MTP mode takes overall precedence — when set, dotnet test runs MTP
     // natively regardless of project file properties.
-    if is_global_json_mtp_mode() {
+    if is_global_json_mtp_mode(scan_dir) {
         return TestRunnerMode::MtpNative;
     }
 
@@ -764,8 +766,8 @@ fn detect_test_runner_mode_in_dir(tokens: &[Token<'_>], scan_dir: &Path) -> Test
         return TestRunnerMode::MtpVsTestBridge;
     }
 
-    // Walk up from current directory looking for Directory.Build.props.
-    if let Ok(mut dir) = std::env::current_dir() {
+    // Walk up from the scanned directory looking for Directory.Build.props.
+    if let Ok(mut dir) = scan_dir.canonicalize() {
         loop {
             let props = dir.join("Directory.Build.props");
             if props.exists() {
@@ -783,7 +785,9 @@ fn detect_test_runner_mode_in_dir(tokens: &[Token<'_>], scan_dir: &Path) -> Test
     TestRunnerMode::Classic
 }
 
-/// Not exhaustive -- dotnet has more value-taking flags than this covers.
+/// The value-taking flags that matter for RTK's own decisions, not every flag dotnet accepts:
+/// a missing entry leaves the value as a free positional, which `detect_test_runner_mode`'s
+/// project-path scan then has to filter by extension for exactly that reason.
 fn dotnet_takes_value(kind: TokenKind, name: &str) -> bool {
     kind == TokenKind::Long
         && matches!(
@@ -867,6 +871,10 @@ fn has_trx_logger_arg(tokens: &[Token<'_>]) -> bool {
     // trx`), so every occurrence must be checked, not just the first. `-l` is dotnet's own
     // alias for it; MSBuild's `/l:` is an unrelated logger-assembly switch, so the slash
     // spelling is excluded.
+    //
+    // Scoped to dotnet's own region, unlike the results-directory lookups below: `dotnet test
+    // --help` says the arguments after `--` go "to the application that is being run", so a
+    // `--logger` there is the test app's, not VSTest's, and RTK still owes it a trx logger.
     let own = dotnet_own_tokens(tokens);
     arg_tokenizer::double_dash_flag_values(own, Dialect::Msbuild, "logger")
         .chain(
@@ -2208,6 +2216,40 @@ mod tests {
         let injected = build_dotnet_args_for_test("test", &args, true);
         let trx_logger_count = injected.iter().filter(|a| *a == "trx").count();
         assert_eq!(trx_logger_count, 1);
+    }
+
+    #[test]
+    fn test_runner_mode_probes_follow_scan_dir_not_the_process_cwd() {
+        // All three probes have to start from scan_dir: while only the project scan did, a
+        // developer working beneath a global.json decided the result and every tempdir
+        // assertion in these tests was decorative.
+        let mtp_root = tempfile::tempdir().expect("create temp dir");
+        fs::write(
+            mtp_root.path().join("global.json"),
+            r#"{"test":{"runner":"Microsoft.Testing.Platform"}}"#,
+        )
+        .expect("write global.json");
+        let nested = mtp_root.path().join("nested");
+        fs::create_dir(&nested).expect("create nested");
+
+        let tokens = tokenize_dotnet_args(&[]);
+        assert_eq!(
+            detect_test_runner_mode_in_dir(&tokens, &nested),
+            TestRunnerMode::MtpNative,
+            "a global.json above the scanned directory still counts"
+        );
+
+        // A directory with no global.json above it is unaffected by wherever the process is.
+        let plain = tempfile::tempdir().expect("create temp dir");
+        fs::write(
+            plain.path().join("Classic.Tests.csproj"),
+            r#"<Project Sdk="Microsoft.NET.Sdk"></Project>"#,
+        )
+        .expect("write csproj");
+        assert_eq!(
+            detect_test_runner_mode_in_dir(&tokens, plain.path()),
+            TestRunnerMode::Classic
+        );
     }
 
     #[test]

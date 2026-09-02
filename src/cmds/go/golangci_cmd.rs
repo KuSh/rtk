@@ -52,6 +52,9 @@ fn golangci_run_takes_value(kind: TokenKind, name: &str) -> bool {
     if golangci_takes_value(kind, name) {
         return true;
     }
+    if OUTPUT_PATH_FLAGS.contains(&name) && kind == TokenKind::Long {
+        return true;
+    }
     match kind {
         TokenKind::Long => matches!(
             name,
@@ -72,15 +75,6 @@ fn golangci_run_takes_value(kind: TokenKind, name: &str) -> bool {
                 // by output.json.path/etc.), kept for v1 installs since has_output_flag checks
                 // for it explicitly.
                 | "out-format"
-                | "output.checkstyle.path"
-                | "output.code-climate.path"
-                | "output.html.path"
-                | "output.json.path"
-                | "output.junit-xml.path"
-                | "output.sarif.path"
-                | "output.tab.path"
-                | "output.teamcity.path"
-                | "output.text.path"
                 | "path-mode"
                 | "path-prefix"
                 // Deprecated in 2.x but still value-taking there ("flag needs an argument"),
@@ -288,6 +282,8 @@ fn build_filtered_args(invocation: &RunInvocation, version: u32) -> Vec<String> 
 
 /// The nine `--output.<format>.path` sinks golangci-lint 2.x accepts, enumerated rather than
 /// pattern-matched: `starts_with("output.")` would also swallow spellings golangci rejects.
+/// One list, read by both the value-taking predicate and the collision check, so they cannot
+/// drift apart.
 const OUTPUT_PATH_FLAGS: &[&str] = &[
     "output.checkstyle.path",
     "output.code-climate.path",
