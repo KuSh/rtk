@@ -3,8 +3,31 @@
 use crate::core::guard::never_worse;
 use crate::core::tracking;
 use anyhow::{Context, Result};
+use regex::Regex;
 use std::fs;
 use std::path::Path;
+use std::sync::LazyLock;
+
+/// A format-patch diffstat body line: ` <path> | <count>[ <+- graph>]`, or the
+/// binary form ` <path> | Bin [<n> -> <m> bytes]`. Anchored on the count-and-
+/// signs right-hand side rather than a bare ` | `, so a commit message's
+/// markdown table (` col | val`, ` --- | ---`) is prose, not a diffstat. The
+/// bare-count form has no graph: a pure rename or mode change stats as `0`.
+static MBOX_DIFFSTAT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^ .+\| *(?:\d+(?: [-+]+)?|Bin\b.*) *$").unwrap());
+
+/// Column-0 marked shapes a commit message writes: a `- text` / `+ text`
+/// bullet, a rule or table separator (`-`, `--`, `---------`), and a long
+/// option (`--no-stat`) that prose wrapped to the start of a line. Hunk
+/// content carries its marker against the line's own first byte, so a body
+/// line takes one of these shapes only by coincidence: over 111k marked
+/// lines from 698 real diffs, 3.4% are prose-shaped and no whole diff is
+/// entirely so. The long-option arm is what admitting it costs: 4 more of
+/// those 111k lines, and still no whole diff. Wrapping a *short* option
+/// (`-p`) is left out — `-` plus a letter is the commonest diff line there
+/// is, and admitting it would answer the question with "always prose".
+static MARKED_PROSE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:[-+] \S|-+\s*$|--[A-Za-z])").unwrap());
 
 /// Ultra-condensed diff - only changed lines, no context.
 /// Returns the diff-convention exit code: 0 if identical, 1 if files differ.
@@ -557,15 +580,29 @@ fn parse_hunk_header(line: &str) -> Option<(Vec<usize>, usize)> {
 ///    up to format-patch's diffstat, column-0 marked lines are commit
 ///    prose — bullet lists, quoted hunks, the `---` separator, version
 ///    notes between it and the diffstat. From the first diffstat line
-///    (` <path> | N +-`) on, nothing but diffstat precedes the file header,
-///    so a marked line there is a hand-edited or reflowed patch's lost
-///    content and falls back raw. The stream-start prologue earns no
-///    exemption at all: a marked line before the first file header of a
-///    never-mbox stream is a head-truncated stream's lost content. (Bound:
-///    a `--no-stat` patch has no diffstat, so its tolerance runs to the
-///    file header; and a message whose own prose has a space-indented
-///    ` | ` line followed by column-0 marked lines falls back raw — noise,
-///    not loss.)
+///    ([`MBOX_DIFFSTAT_RE`]) on, nothing but diffstat precedes the file
+///    header, so a marked line there is a hand-edited or reflowed patch's
+///    lost content and falls back raw. That covers a stat-ful patch
+///    whichever of its file sections lost its headers, first or last.
+///    The stream-start prologue earns no exemption at all: a marked line
+///    before the first file header of a never-mbox stream is a
+///    head-truncated stream's lost content.
+///    A `--no-stat` patch has no diffstat to end the tolerance, so there
+///    the exemption is provisional: it is settled when the region closes
+///    (the next rule 2 separator, or end of stream), and only for a region
+///    that never reached a file header. Such a region is either bodyless
+///    by construction — a cover letter, an `--always` empty commit — or a
+///    patch whose whole body lost its headers, and only the second kind is
+///    loss. A region that quotes whole hunks in its message is never
+///    judged, because it does reach its own file header. The two are told
+///    apart by shape, per [`MARKED_PROSE_RE`]: if any line the region
+///    exempted is not a prose shape → `None`. (Bounds: a message whose own
+///    prose imitates a diffstat line (` name | 3`) and then carries
+///    column-0 marked lines falls back raw — noise, not loss; and an
+///    orphaned body whose every marked line happens to be prose-shaped is
+///    still dropped, as is a `--no-stat` region that lost one section's
+///    headers but kept another's; and a bodyless region whose prose wraps
+///    a *short* option to column 0 falls back raw — noise, not loss.)
 /// 9. Everything else is prose and is dropped.
 ///
 /// Every rule reads the line through [`structural`] (ANSI- and CR-stripped);
@@ -593,9 +630,15 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
     // and the file header, so a column-0 marked line there is lost content,
     // not prose. Keyed on the diffstat rather than the `---` separator
     // because version notes (`Changes in v2:` + bullets) conventionally go
-    // between the two, and on the per-file ` | ` shape rather than the
-    // `N files changed` summary because the latter is localized.
+    // between the two, and on the per-file count-and-signs shape rather
+    // than the `N files changed` summary because the latter is localized.
     let mut past_diffstat = false;
+    // Rule 8's two facts about the open message region, which settle the
+    // exemption for a region the diffstat never bounded: whether it reached
+    // a file header (then its exempted lines are prose by position and are
+    // never judged), and whether any line it exempted broke prose shape.
+    let mut region_reached_body = false;
+    let mut region_exempt_nonprose = false;
 
     fn flush(entries: &mut Vec<FileEntry>, current: &mut Option<FileEntry>) {
         if let Some(e) = current.take() {
@@ -682,10 +725,16 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
 
         // Rule 2: mbox patch separator → back to the prose prologue.
         if is_mbox_from(line) {
+            // Rule 8's shape check: the region this separator closes is judged.
+            if region_exempt_nonprose && !region_reached_body {
+                return None;
+            }
             flush(&mut entries, &mut current);
             seen_mbox_from = true;
             in_mbox_message = true;
             past_diffstat = false;
+            region_reached_body = false;
+            region_exempt_nonprose = false;
             continue;
         }
 
@@ -697,6 +746,7 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
         {
             flush(&mut entries, &mut current);
             in_mbox_message = false;
+            region_reached_body = true;
             // `diff --git X Y`: with prefixes X=a/P, Y=b/P' (never equal);
             // `--no-prefix` (or `diff.noprefix`) repeats one path. That
             // equality, not the user's config, decides whether the header
@@ -793,6 +843,7 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
                         }
                     }
                     in_mbox_message = false;
+                    region_reached_body = true;
                     i += 1; // consume the `+++` line too
                     continue;
                 }
@@ -879,22 +930,29 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
         // the mbox message region is exempt, and only up to format-patch's
         // diffstat: past it nothing but diffstat precedes the file header,
         // so a marked line there — like one in the stream-start prologue —
-        // is a truncated or hand-edited stream's lost content.
-        if (line.starts_with('+') || line.starts_with('-'))
-            && (!in_mbox_message || past_diffstat)
-        {
-            return None;
+        // is a truncated or hand-edited stream's lost content. Before the
+        // diffstat, and in a `--no-stat` region that has none, the exemption
+        // is provisional: the region's close settles it by shape.
+        if line.starts_with('+') || line.starts_with('-') {
+            if !in_mbox_message || past_diffstat {
+                return None;
+            }
+            region_exempt_nonprose |= !MARKED_PROSE_RE.is_match(line);
         }
 
-        // Rule 9: prose. A diffstat line (` <path> | N +-`) in the mbox
-        // message region ends rule 8's tolerance.
-        if in_mbox_message && line.starts_with(' ') && line.contains(" | ") {
+        // Rule 9: prose. A diffstat line in the mbox message region ends
+        // rule 8's tolerance.
+        if in_mbox_message && MBOX_DIFFSTAT_RE.is_match(line) {
             past_diffstat = true;
         }
     }
 
     // Budget owed at EOF.
     if hunk.is_some() {
+        return None;
+    }
+    // Rule 8's shape check: end of stream closes the last message region.
+    if region_exempt_nonprose && !region_reached_body {
         return None;
     }
     flush(&mut entries, &mut current);
@@ -1964,6 +2022,72 @@ diff --git a/b.rs b/b.rs
         let out = condense_unified_diff_strict(&notes).expect("version notes must stay prose");
         assert!(out.contains("[file] y.txt (+1 -1)"), "got:\n{out}");
         assert!(!out.contains("rebased"), "got:\n{out}");
+    }
+
+    #[test]
+    fn a_prose_table_is_not_a_diffstat() {
+        // A markdown table in the commit message is space-indented and holds
+        // a ` | `, but it is prose: the bullet after it must stay prose too,
+        // not read as a marked line past the diffstat.
+        let base = "From fe6a6d0d8316535b5ac232f5d7cc6d227b187b9e Mon Sep 17 00:00:00 2001\nSubject: [PATCH] one\n\n col | val\n --- | ---\n row | text\n- a bullet after the table\n---\nSTAT\n 1 file changed, 1 insertion(+), 1 deletion(-)\n\ndiff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-a\n+b\n-- \n2.54.0\n";
+        let out = condense_unified_diff_strict(&base.replace("STAT", " x.txt | 2 +-"))
+            .expect("a table in the message must not force raw");
+        assert!(out.contains("[file] x.txt (+1 -1)"), "got:\n{out}");
+        assert!(!out.contains("bullet"), "got:\n{out}");
+
+        // Every diffstat shape format-patch emits still ends the tolerance,
+        // so a marked line after one is still lost content. The bare count
+        // covers a pure rename or mode change, which stats as `0`.
+        for stat in [
+            " x.txt                        |   2 +-",
+            " added.txt                    |   1 +",
+            " img.png                      | Bin 7 -> 12 bytes",
+            " img.png                      | Bin",
+            " rename_me.txt => renamed.txt |   0",
+            " {a => b}/file.txt            |   2 +-",
+            " a | b.txt                    |   2 +-",
+        ] {
+            let lost = base
+                .replace("STAT", stat)
+                .replace("\ndiff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n", "\n");
+            assert!(
+                condense_unified_diff_strict(&lost).is_none(),
+                "marked line past the diffstat `{stat}` was dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bodyless_region_is_judged_by_shape() {
+        // `--no-stat` has no diffstat to end rule 8's tolerance, so a region
+        // that never reaches a file header is settled at its close. An
+        // orphaned hunk body is not bullet-shaped => raw.
+        let series = "From aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa Mon Sep 17 00:00:00 2001\nSubject: [PATCH 1/2] one\n\nBODY\n-- \n2.54.0\n\nFrom bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb Mon Sep 17 00:00:00 2001\nSubject: [PATCH 2/2] two\n\ndiff --git a/y.txt b/y.txt\n--- a/y.txt\n+++ b/y.txt\n@@ -1 +1 @@\n-p\n+q\n-- \n2.54.0\n";
+        assert!(
+            condense_unified_diff_strict(&series.replace("BODY", "-a\n+b")).is_none(),
+            "an orphaned no-stat body must fall back raw"
+        );
+        // Closing at end of stream, not at a separator, judges it the same.
+        let last = "From bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb Mon Sep 17 00:00:00 2001\nSubject: [PATCH 1/2] one\n\ndiff --git a/y.txt b/y.txt\n--- a/y.txt\n+++ b/y.txt\n@@ -1 +1 @@\n-p\n+q\n-- \n2.54.0\n\nFrom aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa Mon Sep 17 00:00:00 2001\nSubject: [PATCH 2/2] two\n\n-a\n+b\n-- \n2.54.0\n";
+        assert!(
+            condense_unified_diff_strict(last).is_none(),
+            "an orphaned body at end of stream must fall back raw"
+        );
+
+        // Bodyless by construction - a cover letter or an `--always` empty
+        // commit - writes bullets, and bullets keep their shape.
+        for prose in [
+            "- first, it changes a to b\n- second, it changes b to c",
+            "Before and after:\n- old_value = 1\n+ new_value = 2",
+            "A rule:\n---------\nand a bullet:\n- done",
+            // Prose that wrapped a long option to column 0, which is how
+            // 11.7% of this repo's marked-line messages break bullet shape.
+            "The relevant invocation is\n--no-stat --cover-letter\nwhich changes nothing here.",
+        ] {
+            let out = condense_unified_diff_strict(&series.replace("BODY", prose))
+                .expect("a bodyless region of prose must not force raw");
+            assert!(out.contains("[file] y.txt (+1 -1)"), "got:\n{out}");
+        }
     }
 
     #[test]
