@@ -3,7 +3,7 @@
 //! Runs the agent's exact engine (grep or rg) — never substituting one for the other — and
 //! compresses its output by grouping matches by file, capping, and teeing overflow.
 
-use crate::core::arg_tokenizer::{self, TokenKind};
+use crate::core::arg_tokenizer::{Token, self, TokenKind};
 use crate::core::stream::{
     self, exec_capture, exec_capture_stdin, CaptureResult, FilterMode, StdinMode, StreamFilter,
 };
@@ -126,6 +126,21 @@ fn rg_takes_value(kind: TokenKind, name: &str) -> bool {
     }
 }
 
+/// The module's single tokenizer entry point: every grep/rg value-taking flag claims even a
+/// literal `--` as its value, unlike git/cargo. Shared so a pre-check and `extract_pattern_path`
+/// cannot classify the same argument differently.
+fn tokenize_search_args<'a, T: AsRef<str>>(args: &'a [T], engine: Engine) -> Vec<Token<'a>> {
+    let takes_value = |kind: TokenKind, name: &str| search_takes_value(engine, kind, name);
+    arg_tokenizer::tokenize_with_options(
+        args,
+        &takes_value,
+        arg_tokenizer::TokenizeOptions {
+            claims_literal_dash_dash: &takes_value,
+            ..Default::default()
+        },
+    )
+}
+
 fn search_takes_value(engine: Engine, kind: TokenKind, name: &str) -> bool {
     match engine {
         Engine::Grep => grep_takes_value(kind, name),
@@ -164,16 +179,7 @@ fn extract_pattern_path<T: AsRef<str>>(
     args: &[T],
     engine: Engine,
 ) -> (Vec<String>, Vec<String>, Vec<String>, bool, DetectedFlags) {
-    // Every grep/rg value-taking flag claims even a literal "--" as its value, unlike git/cargo.
-    let takes_value = |kind: TokenKind, name: &str| search_takes_value(engine, kind, name);
-    let tokens = arg_tokenizer::tokenize_with_options(
-        args,
-        &takes_value,
-        arg_tokenizer::TokenizeOptions {
-            claims_literal_dash_dash: &takes_value,
-            ..Default::default()
-        },
-    );
+    let tokens = tokenize_search_args(args, engine);
 
     let mut e_patterns: Vec<String> = Vec::new();
     let mut patterns_from_file = false;
@@ -581,9 +587,7 @@ pub fn run(
     // --version / --help: pass through to the engine without filtering. Token-based and
     // scoped before the boundary, because `rtk grep -- --version` searches *for* that string.
     // `-h` is engine-specific: rg's is --help, grep's is --no-filename.
-    let help_tokens = arg_tokenizer::tokenize(args, &|kind, name| {
-        search_takes_value(engine, kind, name)
-    });
+    let help_tokens = tokenize_search_args(args, engine);
     let asks_for_help = arg_tokenizer::before_dashdash(&help_tokens).iter().any(|t| {
         (t.kind == TokenKind::Long && matches!(t.text, "version" | "help"))
             || (t.kind == TokenKind::Short && t.text == "h" && engine == Engine::Rg)
@@ -609,16 +613,14 @@ pub fn run(
         return Ok(result.exit_code);
     }
 
-    // Re-insert `--` when clap's trailing_var_arg consumed it
-    let args = args.clone();
     let real_cmd = format!("{} {}", engine.label(), args.join(" "));
     let rtk_label = format!("rtk {}", engine.label());
 
     let (patterns, paths, extra_args, extra_args_has_format_flag, detected_flags) =
-        extract_pattern_path(&args, engine);
+        extract_pattern_path(args, engine);
 
     if patterns.is_empty() {
-        return passthrough(&timer, engine, &args, &real_cmd, false);
+        return passthrough(&timer, engine, args, &real_cmd, false);
     }
 
     let pattern_display = if patterns.len() == 1 {
@@ -638,7 +640,7 @@ pub fn run(
 
     // format/shape flags (-c/-l/-o/...): already-minimal native output, passthrough.
     if extra_args_has_format_flag {
-        return passthrough(&timer, engine, &args, &real_cmd, reads_piped_stdin);
+        return passthrough(&timer, engine, args, &real_cmd, reads_piped_stdin);
     }
 
     if reads_piped_stdin {
@@ -662,7 +664,7 @@ pub fn run(
     // Unparseable shape re-runs verbatim below (with its own stderr), so handle it
     // before surfacing this run's stderr (#2333).
     if unparsed_signal(&raw_output) > 0 {
-        return passthrough(&timer, engine, &args, &real_cmd, false);
+        return passthrough(&timer, engine, args, &real_cmd, false);
     }
 
     if !result.stderr.is_empty() {
