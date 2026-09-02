@@ -67,8 +67,19 @@ impl<'a> Token<'a> {
     /// separate token (`--flag value`, `-f value`). `None` for a boolean flag, an unrecognized
     /// flag, or a non-flag token. `tokens` must be the same slice `self` came from.
     pub fn value(&self, tokens: &[Token<'a>]) -> Option<&'a str> {
-        self.attached
-            .or_else(|| self.linked.map(|idx| tokens[idx].text))
+        if self.kind == TokenKind::Positional {
+            // `linked` points the other way here -- at the flag that consumed this token, whose
+            // *name* is not this token's value.
+            return None;
+        }
+        self.attached.or_else(|| {
+            // Indices address the vec this token came from; a caller holding a slice of it
+            // (before_dashdash, `tokens[i + 1..]`) would otherwise index out of bounds, and a
+            // panic in a filter is the one thing RTK must never do.
+            self.linked
+                .and_then(|index| tokens.get(index))
+                .map(|token| token.text)
+        })
     }
 
     /// True for a genuine free-standing positional: `Positional` kind, not itself consumed as
@@ -794,6 +805,21 @@ mod tests {
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].kind, TokenKind::Long);
         assert_eq!(tokens[0].text, "nologo");
+    }
+
+    #[test]
+    fn value_is_none_on_a_consumed_positional_and_safe_on_a_slice() {
+        let args = owned(&["--grep", "x", "file.rs"]);
+        let takes_value = |kind: TokenKind, name: &str| kind == TokenKind::Long && name == "grep";
+        let tokens = tokenize(&args, &takes_value);
+
+        assert_eq!(tokens[0].value(&tokens), Some("x"));
+        // The consumed token links back at its owner; that owner's name is not its value.
+        assert_eq!(tokens[1].value(&tokens), None);
+
+        // A caller holding a slice must not index out of the slice and panic.
+        let slice = &tokens[..1];
+        assert_eq!(slice[0].value(slice), None);
     }
 
     #[test]

@@ -284,6 +284,30 @@ fn run_diff(
     Ok(0)
 }
 
+/// `git show` with RTK's own shape flags where git still reads them *and* after the user's own:
+/// git takes the last output-format flag, so a user `-p` placed after them would re-enable the
+/// patch in the summary and stat steps, and the result stopped being smaller than raw.
+fn show_cmd(
+    global_args: &[String],
+    args: &[String],
+    tokens: &[Token<'_>],
+    rtk_flags: &[&str],
+) -> Command {
+    let mut cmd = git_cmd(global_args);
+    cmd.arg("show");
+    let at = git_option_insert_point(tokens, args.len());
+    for (index, arg) in args.iter().enumerate() {
+        if index == at {
+            cmd.args(rtk_flags);
+        }
+        cmd.arg(arg);
+    }
+    if at == args.len() {
+        cmd.args(rtk_flags);
+    }
+    cmd
+}
+
 fn run_show(
     args: &[String],
     max_lines: Option<usize>,
@@ -345,11 +369,12 @@ fn run_show(
         .unwrap_or_default();
 
     // Step 1: one-line commit summary
-    let mut summary_cmd = git_cmd(global_args);
-    summary_cmd.args(["show", "--no-patch", "--pretty=format:%h %s (%ar) <%an>"]);
-    for arg in args {
-        summary_cmd.arg(arg);
-    }
+    let mut summary_cmd = show_cmd(
+        global_args,
+        args,
+        &tokens,
+        &["--no-patch", "--pretty=format:%h %s (%ar) <%an>"],
+    );
     let summary_result = exec_capture(&mut summary_cmd).context("Failed to run git show")?;
     if !summary_result.success() {
         eprintln!("{}", summary_result.stderr);
@@ -358,11 +383,12 @@ fn run_show(
     let mut printed = summary_result.stdout.trim().to_string();
 
     // Step 2: --stat summary
-    let mut stat_cmd = git_cmd(global_args);
-    stat_cmd.args(["show", "--stat", "--pretty=format:"]);
-    for arg in args {
-        stat_cmd.arg(arg);
-    }
+    let mut stat_cmd = show_cmd(
+        global_args,
+        args,
+        &tokens,
+        &["--no-patch", "--stat", "--pretty=format:"],
+    );
     let stat_result = exec_capture(&mut stat_cmd).context("Failed to run git show --stat")?;
     let stat_text = stat_result.stdout.trim();
     if !stat_text.is_empty() {
@@ -371,11 +397,7 @@ fn run_show(
     }
 
     // Step 3: compacted diff
-    let mut diff_cmd = git_cmd(global_args);
-    diff_cmd.args(["show", "--pretty=format:"]);
-    for arg in args {
-        diff_cmd.arg(arg);
-    }
+    let mut diff_cmd = show_cmd(global_args, args, &tokens, &["--patch", "--pretty=format:"]);
     let diff_result = exec_capture(&mut diff_cmd).context("Failed to run git show (diff)")?;
     let diff_text = diff_result.stdout.trim();
 

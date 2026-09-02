@@ -1,6 +1,6 @@
 //! Filters golangci-lint output, grouping issues by rule.
 
-use crate::core::arg_tokenizer::{self, Dialect, TokenKind};
+use crate::core::arg_tokenizer::{self, TokenKind};
 use crate::core::args_utils;
 use crate::core::config;
 use crate::core::runner;
@@ -56,6 +56,7 @@ fn golangci_run_takes_value(kind: TokenKind, name: &str) -> bool {
         TokenKind::Long => matches!(
             name,
             "build-tags"
+                | "concurrency"
                 | "default"
                 | "disable"
                 | "enable"
@@ -82,9 +83,17 @@ fn golangci_run_takes_value(kind: TokenKind, name: &str) -> bool {
                 | "output.text.path"
                 | "path-mode"
                 | "path-prefix"
+                // Deprecated in 2.x but still value-taking there ("flag needs an argument"),
+                // and current in the 1.x installs run_filtered still supports.
+                | "deadline"
+                | "exclude"
+                | "presets"
+                | "skip-dirs"
+                | "skip-files"
                 | "timeout"
         ),
-        TokenKind::Short => matches!(name, "D" | "E" | "j"),
+        // `-e`/`-p` are 1.x's --exclude/--presets; 2.x rejects them outright either way.
+        TokenKind::Short => matches!(name, "D" | "E" | "e" | "j" | "p"),
         _ => false,
     }
 }
@@ -277,10 +286,16 @@ fn build_filtered_args(invocation: &RunInvocation, version: u32) -> Vec<String> 
     args
 }
 
+/// Any user-chosen output destination, not just the two RTK itself injects: golangci-lint 2.x
+/// has one `--output.<format>.path` per format, and adding a second sink makes it write two
+/// reports to stdout, which the JSON parse then chokes on.
 fn has_output_flag(args: &[String]) -> bool {
     let tokens = arg_tokenizer::tokenize(args, &golangci_run_takes_value);
-    arg_tokenizer::has_flag(&tokens, Dialect::Posix, "out-format")
-        || arg_tokenizer::has_flag(&tokens, Dialect::Posix, "output.json.path")
+    tokens.iter().any(|t| {
+        t.kind == TokenKind::Long
+            && (t.text == "out-format"
+                || (t.text.starts_with("output.") && t.text.ends_with(".path")))
+    })
 }
 
 fn format_command(base: &str, args: &[String]) -> String {
@@ -666,6 +681,42 @@ mod tests {
         ]));
         assert!(has_output_flag(&["--out-format=json".to_string()]));
         assert!(has_output_flag(&["--output.json.path".to_string()]));
+    }
+
+    #[test]
+    fn test_has_output_flag_sees_every_output_destination() {
+        // golangci-lint 2.x has one --output.<format>.path per format; RTK injecting a second
+        // sink makes it write two reports to stdout and the JSON parse then fails.
+        for flag in [
+            "--output.text.path",
+            "--output.tab.path",
+            "--output.sarif.path",
+            "--output.checkstyle.path",
+            "--output.code-climate.path",
+            "--output.html.path",
+            "--output.junit-xml.path",
+            "--output.teamcity.path",
+            "--output.json.path",
+        ] {
+            assert!(
+                has_output_flag(&[flag.to_string(), "stdout".to_string()]),
+                "{flag} is a user-chosen destination"
+            );
+        }
+        assert!(!has_output_flag(&["--tests".to_string()]));
+    }
+
+    #[test]
+    fn test_run_level_value_flags_swallow_their_own_values() {
+        // `-e '--out-format'` is 1.x's --exclude pattern, not an output flag.
+        assert!(!has_output_flag(&[
+            "-e".to_string(),
+            "--out-format".to_string()
+        ]));
+        assert!(!has_output_flag(&[
+            "--concurrency".to_string(),
+            "--output.json.path".to_string()
+        ]));
     }
 
     #[test]
