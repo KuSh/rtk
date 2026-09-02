@@ -3,7 +3,7 @@
 //! Runs the agent's exact engine (grep or rg) — never substituting one for the other — and
 //! compresses its output by grouping matches by file, capping, and teeing overflow.
 
-use crate::core::arg_tokenizer::{Token, self, TokenKind};
+use crate::core::arg_tokenizer::{self, Token, TokenKind};
 use crate::core::stream::{
     self, exec_capture, exec_capture_stdin, CaptureResult, FilterMode, StdinMode, StreamFilter,
 };
@@ -126,6 +126,16 @@ fn rg_takes_value(kind: TokenKind, name: &str) -> bool {
     }
 }
 
+/// rg accepts `-A=1`/`-e=PAT` and strips the `=` itself; GNU grep does not ("invalid context
+/// length argument"), so only rg's value is unwrapped -- re-emitting `=1` as its own argument
+/// broke rg's parse, and keeping it in a pattern made the search match nothing.
+fn unwrap_attached_value(engine: Engine, value: &str) -> &str {
+    match engine {
+        Engine::Rg => value.strip_prefix('=').unwrap_or(value),
+        Engine::Grep => value,
+    }
+}
+
 /// The module's single tokenizer entry point: every grep/rg value-taking flag claims even a
 /// literal `--` as its value, unlike git/cargo. Shared so a pre-check and `extract_pattern_path`
 /// cannot classify the same argument differently.
@@ -186,10 +196,9 @@ fn extract_pattern_path<T: AsRef<str>>(
     let mut positionals: Vec<String> = Vec::new();
     let mut flags: Vec<String> = Vec::new();
     let mut has_format_flag = false;
-    let mut show_file = false;
-    let mut show_line_on = false;
-    let mut show_file_off = false;
-    let mut show_line_off = false;
+    // `None` until the user says either way; the last spelling wins, as both engines do.
+    let mut show_file_flag: Option<bool> = None;
+    let mut show_line_flag: Option<bool> = None;
     let mut context = false;
     let mut i = 0;
 
@@ -209,20 +218,23 @@ fn extract_pattern_path<T: AsRef<str>>(
                     has_format_flag = true;
                 }
                 if is_show_file_token(engine, t.kind, t.text) {
-                    show_file = true;
+                    show_file_flag = Some(true);
                 }
+                if is_show_line_on_token(t.kind, t.text) {
+                    show_line_flag = Some(true);
+                }
+                // Neither negation is forwarded: RTK forces `-nH` so it can parse the output,
+                // and the user's `--no-filename`/`--no-line-number` would win as the later
+                // flag, leaving nothing parseable and forcing a second run of the whole search.
                 if is_show_file_off_token(t.kind, t.text) {
-                    show_file_off = true;
-                    // Not forwarded: RTK forces `-H` to parse the output, and the user's
-                    // `--no-filename` would win as the later flag, leaving nothing parseable.
+                    show_file_flag = Some(false);
                     i += 1;
                     continue;
                 }
-                if is_show_line_on_token(t.kind, t.text) {
-                    show_line_on = true;
-                }
                 if is_show_line_off_token(t.kind, t.text) {
-                    show_line_off = true;
+                    show_line_flag = Some(false);
+                    i += 1;
+                    continue;
                 }
                 if is_context_token(engine, t.kind, t.text) {
                     context = true;
@@ -260,29 +272,19 @@ fn extract_pattern_path<T: AsRef<str>>(
                 {
                     has_format_flag = true;
                 }
-                if cluster
-                    .iter()
-                    .any(|c| is_show_file_token(engine, c.kind, c.text))
-                {
-                    show_file = true;
-                }
-                if cluster
-                    .iter()
-                    .any(|c| is_show_file_off_token(c.kind, c.text))
-                {
-                    show_file_off = true;
-                }
-                if cluster
-                    .iter()
-                    .any(|c| is_show_line_on_token(c.kind, c.text))
-                {
-                    show_line_on = true;
-                }
-                if cluster
-                    .iter()
-                    .any(|c| is_show_line_off_token(c.kind, c.text))
-                {
-                    show_line_off = true;
+                // Letter by letter, so `-hH` and `-Hh` land where the engine lands them: the
+                // later spelling wins.
+                for c in cluster {
+                    if is_show_file_token(engine, c.kind, c.text) {
+                        show_file_flag = Some(true);
+                    } else if is_show_file_off_token(c.kind, c.text) {
+                        show_file_flag = Some(false);
+                    }
+                    if is_show_line_on_token(c.kind, c.text) {
+                        show_line_flag = Some(true);
+                    } else if is_show_line_off_token(c.kind, c.text) {
+                        show_line_flag = Some(false);
+                    }
                 }
                 if cluster.iter().any(|c| is_context_token(engine, c.kind, c.text)) {
                     context = true;
@@ -300,7 +302,10 @@ fn extract_pattern_path<T: AsRef<str>>(
                 // forces `-H` to parse the output and the user's later `-h` would win.
                 let glued: String = bool_chars
                     .iter()
-                    .filter(|c| !is_show_file_off_token(c.kind, c.text))
+                    .filter(|c| {
+                        !is_show_file_off_token(c.kind, c.text)
+                            && !is_show_line_off_token(c.kind, c.text)
+                    })
                     .map(|c| c.text)
                     .collect();
                 if !glued.is_empty() {
@@ -311,7 +316,9 @@ fn extract_pattern_path<T: AsRef<str>>(
                     let value = vt.value(&tokens);
                     if vt.text == "e" {
                         match value {
-                            Some(v) => e_patterns.push(v.to_string()),
+                            // `-e=PAT` is rg's own spelling for `-e PAT`; keeping the `=` made
+                            // it part of the pattern and the search silently matched nothing.
+                            Some(v) => e_patterns.push(unwrap_attached_value(engine, v).to_string()),
                             None => flags.push("-e".to_string()),
                         }
                     } else {
@@ -320,14 +327,7 @@ fn extract_pattern_path<T: AsRef<str>>(
                         }
                         flags.push(format!("-{}", vt.text));
                         if let Some(v) = value {
-                            // rg accepts `-A=1` and strips the `=` itself; GNU grep does not
-                            // ("invalid context length argument"), so only rg's value is
-                            // unwrapped -- re-emitting `=1` as its own arg broke rg's parse.
-                            let v = match engine {
-                                Engine::Rg => v.strip_prefix('=').unwrap_or(v),
-                                Engine::Grep => v,
-                            };
-                            flags.push(v.to_string());
+                            flags.push(unwrap_attached_value(engine, v).to_string());
                         }
                     }
                 }
@@ -351,9 +351,8 @@ fn extract_pattern_path<T: AsRef<str>>(
     };
 
     let detected = DetectedFlags {
-        show_file,
-        show_file_off,
-        show_line: show_line_on && !show_line_off,
+        show_file: show_file_flag,
+        show_line: show_line_flag.unwrap_or(false),
         context,
     };
 
@@ -513,8 +512,9 @@ fn run_streaming_search(
     detected_flags: DetectedFlags,
 ) -> Result<i32> {
     let filter = SearchStreamFilter {
-        show_file: !detected_flags.show_file_off
-            && wants_show_file(paths, detected_flags.show_file),
+        show_file: detected_flags
+            .show_file
+            .unwrap_or_else(|| wants_show_file(paths, false)),
         show_line: detected_flags.show_line,
         max_results,
         shown: 0,
@@ -713,8 +713,9 @@ pub fn run(
     // reads stdin instead (whatever stdin is), where a filename would be `(standard input)`,
     // so the same reasoning does not carry over.
     let walks_cwd = engine == Engine::Rg && paths.is_empty();
-    let show_file = !detected_flags.show_file_off
-        && (by_file.len() > 1 || walks_cwd || wants_show_file(&paths, detected_flags.show_file));
+    let show_file = detected_flags.show_file.unwrap_or_else(|| {
+        by_file.len() > 1 || walks_cwd || wants_show_file(&paths, false)
+    });
     let show_line = detected_flags.show_line;
 
     // Faithful baseline: exactly what the real command prints, full content.
@@ -944,13 +945,11 @@ fn is_context_token(engine: Engine, kind: TokenKind, text: &str) -> bool {
 /// pushed into `flags` as a bare string, could otherwise be misread as one of these).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct DetectedFlags {
-    /// `-H`/`-r`/`-R`/`--with-filename`/`--recursive` (engine-aware, see
-    /// [`is_show_file_token`]) -- does *not* include the paths-based reasons (multiple paths, a
-    /// directory among them) `show_file` also considers; those are checked directly against
-    /// `paths` at the call site instead.
-    show_file: bool,
-    /// `-h`/`--no-filename`: the user asked for bare lines, whatever the paths imply.
-    show_file_off: bool,
+    /// What the user asked for with `-H`/`-r`/`-R`/`--with-filename` (`Some(true)`) or
+    /// `-h`/`--no-filename` (`Some(false)`), last spelling winning as both engines do; `None`
+    /// when they said neither, leaving the decision to the paths (multiple paths, a directory
+    /// among them), which the call sites check against `paths` themselves.
+    show_file: Option<bool>,
     /// `-n`/`--line-number`, unless negated by `-N`/`--no-line-number`.
     show_line: bool,
     /// `-A`/`-B`/`-C` or their long forms.
@@ -1197,13 +1196,28 @@ mod tests {
         // parse fails on every line, and the whole search runs a second time.
         let (_, _, flags, _, detected) =
             extract_pattern_path(&["--no-filename", "x", "a.txt"], Engine::Grep);
-        assert!(detected.show_file_off);
+        assert_eq!(detected.show_file, Some(false));
         assert!(!flags.iter().any(|f| f == "--no-filename"));
 
         let (_, _, flags, _, detected) =
             extract_pattern_path(&["-ih", "x", "a.txt"], Engine::Grep);
-        assert!(detected.show_file_off);
+        assert_eq!(detected.show_file, Some(false));
         assert_eq!(flags, vec!["-i"], "the rest of the cluster survives");
+
+        // Both engines arbitrate the pair by last-one-wins, so RTK must too.
+        let (_, _, _, _, detected) =
+            extract_pattern_path(&["-h", "-H", "x", "a.txt"], Engine::Grep);
+        assert_eq!(detected.show_file, Some(true));
+        let (_, _, _, _, detected) =
+            extract_pattern_path(&["-H", "-h", "x", "a.txt"], Engine::Grep);
+        assert_eq!(detected.show_file, Some(false));
+        let (_, _, _, _, detected) = extract_pattern_path(&["-Hh", "x", "a.txt"], Engine::Grep);
+        assert_eq!(detected.show_file, Some(false), "within one cluster too");
+
+        // rg's -N is its --no-line-number; withheld for the same reason as -h.
+        let (_, _, flags, _, detected) = extract_pattern_path(&["-nN", "x", "a.txt"], Engine::Rg);
+        assert!(!detected.show_line);
+        assert!(!flags.iter().any(|f| f.contains('N')));
     }
 
     #[test]
@@ -1666,7 +1680,7 @@ mod tests {
         // Same for show_file's -H/-r/-R and show_line's -n/-N letters.
         let (_, _, _, _, detected) =
             extract_pattern_path(&["--replace", "-Hart", "pattern", "src"], Engine::Rg);
-        assert!(!detected.show_file, "--replace's value must not trigger -H");
+        assert_eq!(detected.show_file, None, "--replace's value must not trigger -H");
 
         let (_, _, _, _, detected) =
             extract_pattern_path(&["--replace", "-normal", "pattern", "src"], Engine::Rg);
@@ -1677,7 +1691,7 @@ mod tests {
             extract_pattern_path(&["-C", "3", "pattern", "src"], Engine::Grep);
         assert!(detected.context);
         let (_, _, _, _, detected) = extract_pattern_path(&["-H", "pattern", "src"], Engine::Grep);
-        assert!(detected.show_file);
+        assert_eq!(detected.show_file, Some(true));
         let (_, _, _, _, detected) = extract_pattern_path(&["-n", "pattern", "src"], Engine::Grep);
         assert!(detected.show_line);
     }

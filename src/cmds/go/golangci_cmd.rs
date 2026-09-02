@@ -300,21 +300,25 @@ const OUTPUT_PATH_FLAGS: &[&str] = &[
     "output.text.path",
 ];
 
-/// True when the user already directs a report at **stdout**, which is the only case where
-/// RTK's own `--output.json.path stdout` would collide: two reports interleaved there, and the
-/// JSON parse chokes on whichever lands first. A sink pointing at a *file* takes nothing away
-/// from stdout, so RTK still has to inject its own or it is left with nothing to parse.
+/// True when RTK's own `--output.json.path stdout` would collide with what the user asked for:
+/// they already configured the json sink (whatever its destination -- golangci takes one path
+/// per format), or they directed some other format at stdout, where two reports would
+/// interleave and the json parse would choke on whichever landed first. A *file* sink for some
+/// other format takes nothing away from stdout, so RTK still injects there or it is left with
+/// nothing to parse.
 fn has_output_flag(args: &[String]) -> bool {
     let tokens = arg_tokenizer::tokenize(args, &golangci_run_takes_value);
     tokens.iter().any(|t| {
         if t.kind != TokenKind::Long {
             return false;
         }
-        if t.text == "out-format" {
-            return true;
+        match t.text {
+            "out-format" | "output.json.path" => true,
+            other => {
+                OUTPUT_PATH_FLAGS.contains(&other)
+                    && t.value(&tokens).is_none_or(|dest| dest == "stdout")
+            }
         }
-        OUTPUT_PATH_FLAGS.contains(&t.text)
-            && t.value(&tokens).is_none_or(|dest| dest == "stdout")
     })
 }
 

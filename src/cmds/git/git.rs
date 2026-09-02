@@ -324,7 +324,10 @@ fn run_diff(
     Ok(0)
 }
 
-/// `git show` with RTK's own shape flags in front and the user's patch-shape flags removed:
+/// `git show` with RTK's own shape flags in front. `drop_patch_shape` removes the user's
+/// patch-enabling flags, which the summary and stat steps need (git takes the last one, so a
+/// `-p` anywhere would bring the patch back) but the diff step must not -- `-U5` sets the
+/// context width of the patch RTK is about to compact.
 /// git takes the last output-format flag, so a `-p` left anywhere in the args -- including
 /// after a revision, where RTK's flags cannot be placed -- would re-enable the patch in the
 /// summary and stat steps and the result stopped being smaller than raw.
@@ -333,11 +336,17 @@ fn show_cmd(
     args: &[String],
     tokens: &[Token<'_>],
     rtk_flags: &[&str],
+    drop_patch_shape: bool,
 ) -> Command {
     let mut cmd = git_cmd(global_args);
     cmd.arg("show");
     cmd.args(rtk_flags);
-    for arg in args_without_patch_shape(args, tokens) {
+    let forwarded = if drop_patch_shape {
+        args_without_patch_shape(args, tokens)
+    } else {
+        args.to_vec()
+    };
+    for arg in forwarded {
         cmd.arg(arg);
     }
     cmd
@@ -409,6 +418,7 @@ fn run_show(
         args,
         &tokens,
         &["--no-patch", "--pretty=format:%h %s (%ar) <%an>"],
+        true,
     );
     let summary_result = exec_capture(&mut summary_cmd).context("Failed to run git show")?;
     if !summary_result.success() {
@@ -437,6 +447,7 @@ fn run_show(
         args,
         &tokens,
         &["--no-patch", "--stat", "--pretty=format:"],
+        true,
     );
     let stat_result = exec_capture(&mut stat_cmd).context("Failed to run git show --stat")?;
     let stat_text = stat_result.stdout.trim();
@@ -448,7 +459,7 @@ fn run_show(
     // Step 3: compacted diff
     // No `--patch` here: a patch is `show`'s default, and forcing it would override a user
     // `-s`/`--no-patch`, whose whole point is that there is no body to print.
-    let mut diff_cmd = show_cmd(global_args, args, &tokens, &["--pretty=format:"]);
+    let mut diff_cmd = show_cmd(global_args, args, &tokens, &["--pretty=format:"], false);
     let diff_result = exec_capture(&mut diff_cmd).context("Failed to run git show (diff)")?;
     let diff_text = diff_result.stdout.trim();
 
@@ -1186,7 +1197,11 @@ fn requests_raw_diff_shape(token: &Token<'_>) -> bool {
     match token.kind {
         TokenKind::Long => matches!(
             token.text,
-            "dirstat"
+            // A binary patch is meant to be fed back to `git apply`; compacting it destroys
+            // that, so it takes the raw route rather than merely being kept out of the header.
+            "binary"
+                | "compact-summary"
+                | "dirstat"
                 | "name-only"
                 | "name-status"
                 | "numstat"
@@ -1197,8 +1212,12 @@ fn requests_raw_diff_shape(token: &Token<'_>) -> bool {
                 | "shortstat"
                 | "stat"
                 | "summary"
+                | "unified"
         ),
-        TokenKind::Short => matches!(token.text, "p" | "u"),
+        // `-U<n>`/`-W` make `git log` emit a patch, which the one-line-per-commit compaction
+        // cannot represent; `--compact-summary` above is a diffstat variant whose compact path
+        // left an empty "Changes:" section.
+        TokenKind::Short => matches!(token.text, "U" | "W" | "p" | "u"),
         _ => false,
     }
 }
@@ -2759,7 +2778,15 @@ fn run_worktree(args: &[String], verbose: u8, global_args: &[String]) -> Result<
         let result = exec_capture(&mut cmd).context("Failed to run git worktree")?;
         let combined = result.combined();
 
-        let msg = if result.success() { "ok" } else { &combined };
+        // A write action that reported something keeps its report: `prune --dry-run` names
+        // every worktree it would remove -- on stderr -- and that list is the whole point of
+        // the command. "ok" is only right when git itself said nothing.
+        let said = combined.trim();
+        let msg = if !result.success() || said.is_empty() {
+            &combined
+        } else {
+            said
+        };
 
         timer.track(
             &format!("git worktree {}", args.join(" ")),
@@ -2769,7 +2796,11 @@ fn run_worktree(args: &[String], verbose: u8, global_args: &[String]) -> Result<
         );
 
         if result.success() {
-            println!("ok");
+            if said.is_empty() {
+                println!("ok");
+            } else {
+                println!("{said}");
+            }
         } else {
             eprintln!("FAILED: git worktree {}", args.join(" "));
             if !result.stderr.trim().is_empty() {
