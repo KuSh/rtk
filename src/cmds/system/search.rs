@@ -661,11 +661,13 @@ pub fn run(
     // show one (multiple files, a directory, -r or -H), the line number only with
     // -n. We force -nH--null for robust parsing, then drop what the engine itself
     // would not have shown.
-    // No explicit path means the engine walked the cwd itself, and there the filename is the
-    // only way to tell matches apart -- real rg prints it even when a single file matched. This
-    // branch never sees piped stdin (that goes streaming), where a filename would be wrong.
+    // With no path given, rg walks the cwd, and there the filename is the only way to tell
+    // matches apart -- real rg prints it even when a single file matched. grep with no path
+    // reads stdin instead (whatever stdin is), where a filename would be `(standard input)`,
+    // so the same reasoning does not carry over.
+    let walks_cwd = engine == Engine::Rg && paths.is_empty();
     let show_file =
-        by_file.len() > 1 || paths.is_empty() || wants_show_file(&paths, detected_flags.show_file);
+        by_file.len() > 1 || walks_cwd || wants_show_file(&paths, detected_flags.show_file);
     let show_line = detected_flags.show_line;
 
     // Faithful baseline: exactly what the real command prints, full content.

@@ -11,8 +11,21 @@ fn rtk() -> Command {
     cmd
 }
 
+/// Each test guards on the engine it actually drives -- guarding an rg test on grep (or the
+/// reverse) turns a missing tool into a silent pass rather than a skip.
+fn engine_available(engine: &str) -> bool {
+    Command::new(engine)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 #[test]
 fn rg_shows_filenames_when_stdin_is_not_a_pipe() {
+    if !engine_available("rg") {
+        return;
+    }
     // `rtk rg -z foo < /dev/null` in a multi-file dir used to drop filenames: stdin being a
     // non-terminal, non-pipe redirect was misread as "the engine reads stdin," routing into the
     // streaming path, which can't discover "multiple files" the way the buffered path does.
@@ -35,6 +48,9 @@ fn rg_shows_filenames_when_stdin_is_not_a_pipe() {
 
 #[test]
 fn a_single_matching_file_still_gets_its_name() {
+    if !engine_available("rg") {
+        return;
+    }
     // The engine walked the cwd itself, so the filename is the only way to place the match --
     // real rg prints it even when exactly one file matched.
     let dir = tempfile::tempdir().unwrap();
@@ -63,6 +79,9 @@ fn both_engines_read_a_redirected_file_on_stdin() {
     std::fs::write(&piped, "foo from stdin\n").unwrap();
 
     for engine in ["grep", "rg"] {
+        if !engine_available(engine) {
+            continue;
+        }
         let output = rtk()
             .args([engine, "foo"])
             .current_dir(dir.path())

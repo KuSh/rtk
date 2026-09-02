@@ -118,6 +118,10 @@ pub fn before_dashdash<'t, 'a>(tokens: &'t [Token<'a>]) -> &'t [Token<'a>] {
 /// Where RTK's own flags have to be spliced into `args`: before the user's `--`, since
 /// anything past the boundary is a pathspec or an argument forwarded to another program, not
 /// an option the tool will read. `args_len` when there is no boundary.
+///
+/// A tool that also refuses options *after a positional* (git: "option '--no-patch' must come
+/// before non-option arguments") needs a stricter point than this -- see git.rs's
+/// `git_option_insert_point`.
 pub fn injection_point(tokens: &[Token<'_>], args_len: usize) -> usize {
     dashdash_index(tokens)
         .map(|index| tokens[index].source_index)

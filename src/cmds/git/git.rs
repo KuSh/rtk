@@ -56,21 +56,27 @@ fn git_cmd_c_locale(global_args: &[String]) -> Command {
 fn uses_compact_status_path(args: &[String]) -> bool {
     let tokens = arg_tokenizer::tokenize(args, &|_, _| false);
 
-    // A `--` with no pathspec after it selects nothing, so `git status --` is `git status`.
-    if tokens.iter().all(|t| t.kind == TokenKind::DashDash) {
+    if tokens.is_empty() {
         return true;
     }
 
     let mut saw_branch = false;
+    let mut saw_flag = false;
     for token in &tokens {
         match (token.kind, token.text) {
-            (TokenKind::Short, "b") | (TokenKind::Long, "branch") => saw_branch = true,
-            (TokenKind::Short, "s") | (TokenKind::Long, "short") => {}
+            // A `--` with no pathspec after it selects nothing, so `git status -sb --` is
+            // `git status -sb`, and a lone `--` is plain `git status`.
+            (TokenKind::DashDash, _) => {}
+            (TokenKind::Short, "b") | (TokenKind::Long, "branch") => {
+                saw_branch = true;
+                saw_flag = true;
+            }
+            (TokenKind::Short, "s") | (TokenKind::Long, "short") => saw_flag = true,
             _ => return false,
         }
     }
 
-    saw_branch
+    saw_branch || !saw_flag
 }
 
 fn build_status_command(args: &[String], global_args: &[String]) -> Command {
@@ -137,6 +143,18 @@ fn split_stash_region(region: &[String]) -> (Option<String>, Vec<String>) {
     }
 }
 
+/// Where git still reads an option: before the user's `--` and before the first non-option
+/// argument, since git refuses an option that follows one ("option '--no-patch' must come
+/// before non-option arguments"). Stricter than [`arg_tokenizer::injection_point`], which only
+/// knows about the boundary -- dotnet, for one, has no positional rule.
+fn git_option_insert_point(tokens: &[Token<'_>], args_len: usize) -> usize {
+    tokens
+        .iter()
+        .find(|t| t.kind == TokenKind::DashDash || t.is_free_positional())
+        .map(|t| t.source_index)
+        .unwrap_or(args_len)
+}
+
 fn run_diff(
     args: &[String],
     max_lines: Option<usize>,
@@ -151,18 +169,19 @@ fn run_diff(
     // Compact diff is the default RTK behavior; --no-compact is RTK's own pseudo-flag. The
     // strip below removes the arg this token came from, so detection and removal can't
     // disagree -- re-matching the string dropped a pathspec of the same name past `--`.
-    let no_compact = tokens
+    let no_compact: Vec<usize> = tokens
         .iter()
-        .find(|t| t.kind == TokenKind::Long && t.attached.is_none() && t.text == "no-compact")
-        .map(|t| t.source_index);
-    let wants_compact = no_compact.is_none() && !emits_word_diff(&tokens);
+        .filter(|t| t.kind == TokenKind::Long && t.attached.is_none() && t.text == "no-compact")
+        .map(|t| t.source_index)
+        .collect();
+    let wants_compact = no_compact.is_empty() && !emits_word_diff(&tokens);
 
     if wants_stat || !wants_compact {
         // User wants stat or explicitly no compacting - pass through directly
         let mut cmd = git_cmd(global_args);
         cmd.arg("diff");
         for (index, arg) in args.iter().enumerate() {
-            if Some(index) == no_compact {
+            if no_compact.contains(&index) {
                 continue; // RTK flag, not a git flag
             }
             cmd.arg(arg);
@@ -170,12 +189,24 @@ fn run_diff(
 
         let result = exec_capture(&mut cmd).context("Failed to run git diff")?;
 
-        if !result.success() {
-            eprintln!("{}", result.stderr);
-            return Ok(result.exit_code);
+        // A non-zero exit does not mean there was nothing to say: `git diff --check` reports
+        // every whitespace error on stdout and *then* exits 2.
+        if !result.stdout.trim().is_empty() {
+            println!("{}", result.stdout.trim());
         }
 
-        println!("{}", result.stdout.trim());
+        if !result.success() {
+            if !result.stderr.trim().is_empty() {
+                eprintln!("{}", result.stderr.trim());
+            }
+            timer.track(
+                &format!("git diff {}", args.join(" ")),
+                &format!("rtk git diff {} (passthrough)", args.join(" ")),
+                &result.stdout,
+                &result.stdout,
+            );
+            return Ok(result.exit_code);
+        }
 
         timer.track(
             &format!("git diff {}", args.join(" ")),
@@ -193,7 +224,7 @@ fn run_diff(
     // output. The flags go before the user's own `--`, where git still reads them as options.
     let mut cmd = git_cmd(global_args);
     cmd.arg("diff");
-    let stat_at = arg_tokenizer::injection_point(&tokens, args.len());
+    let stat_at = git_option_insert_point(&tokens, args.len());
     for (index, arg) in args.iter().enumerate() {
         if index == stat_at {
             cmd.args(["--no-patch", "--stat"]);
@@ -1072,6 +1103,14 @@ fn requests_raw_diff_shape(token: &Token<'_>) -> bool {
 /// rather than a request for a shape RTK can't produce. Delegates rather than repeating the
 /// Long-flag list, so the two can't silently drift apart.
 fn requests_diff_show_raw_shape(token: &Token<'_>) -> bool {
+    // Flags that suppress or replace the diff body: RTK's own `--no-patch --stat` header would
+    // override them, turning `--check`'s whitespace report (exit 2) into a diffstat (exit 0).
+    if matches!(
+        (token.kind, token.text),
+        (TokenKind::Long, "check" | "no-patch") | (TokenKind::Short, "s")
+    ) {
+        return true;
+    }
     if token.kind == TokenKind::Short || (token.kind == TokenKind::Long && token.text == "patch") {
         return false;
     }
@@ -2555,15 +2594,18 @@ fn run_worktree(args: &[String], verbose: u8, global_args: &[String]) -> Result<
     // A write action is the subcommand -- the first positional -- not any arg that happens to
     // spell one (a worktree path named "move", say).
     let tokens = arg_tokenizer::tokenize(args, &|_, _| false);
-    let has_action = arg_tokenizer::before_dashdash(&tokens)
+    let first_positional = arg_tokenizer::before_dashdash(&tokens)
         .iter()
-        .find(|t| t.is_free_positional())
-        .is_some_and(|t| {
-            matches!(
-                t.text,
-                "add" | "remove" | "prune" | "lock" | "unlock" | "move"
-            )
-        });
+        .find(|t| t.is_free_positional());
+    let has_action = match first_positional {
+        Some(t) => matches!(
+            t.text,
+            "add" | "remove" | "prune" | "lock" | "unlock" | "move"
+        ),
+        // No subcommand before `--` at all: real git errors ("subcommand required") rather
+        // than listing, so RTK must not answer with a list of its own.
+        None => arg_tokenizer::has_dashdash(&tokens),
+    };
 
     if has_action {
         let mut cmd = git_cmd(global_args);
@@ -4140,6 +4182,25 @@ A  added.rs
     }
 
     #[test]
+    fn test_git_option_insert_point_stops_at_the_first_non_option_argument() {
+        // git refuses an option that follows a non-option argument, so RTK's own `--no-patch
+        // --stat` has to go before a pathspec or revision, not just before `--`.
+        let point = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let tokens = tokenize_git_log_args(&args);
+            git_option_insert_point(&tokens, args.len())
+        };
+
+        assert_eq!(point(&["f.txt"]), 0);
+        assert_eq!(point(&["--cached", "f.txt"]), 1);
+        assert_eq!(point(&["HEAD~1", "f.txt"]), 0);
+        assert_eq!(point(&["--", "src/"]), 0);
+        assert_eq!(point(&["-p"]), 1);
+        // A flag's own value is not a positional.
+        assert_eq!(point(&["--author", "bob"]), 2);
+    }
+
+    #[test]
     fn test_stat_header_flags_land_before_the_users_pathspec_boundary() {
         // `--no-patch --stat` after the user's `--` would be pathspecs, not options.
         let args = vec!["--".to_string(), "src/".to_string()];
@@ -4172,9 +4233,16 @@ A  added.rs
     #[test]
     fn test_status_compact_path_survives_a_bare_double_dash() {
         // `git status --` selects no pathspec, so it is `git status` -- and must keep the
-        // compact porcelain path rather than falling through to git's prose output.
+        // compact porcelain path rather than falling through to git's prose output. The
+        // separator has to be ignored wherever it sits, not only when it is the only token.
         assert!(uses_compact_status_path(&[]));
         assert!(uses_compact_status_path(&["--".to_string()]));
+        assert!(uses_compact_status_path(&["-sb".to_string(), "--".to_string()]));
+        assert!(uses_compact_status_path(&[
+            "-s".to_string(),
+            "-b".to_string(),
+            "--".to_string()
+        ]));
         assert!(uses_compact_status_path(&["-sb".to_string()]));
         assert!(uses_compact_status_path(&["-b".to_string()]));
         // A real pathspec still passes through.
