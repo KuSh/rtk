@@ -3,7 +3,7 @@
 //! Runs the agent's exact engine (grep or rg) — never substituting one for the other — and
 //! compresses its output by grouping matches by file, capping, and teeing overflow.
 
-use crate::core::arg_tokenizer::{self, Token, TokenKind};
+use crate::core::arg_tokenizer::{self, Dialect, Token, TokenKind, ValueSpec};
 use crate::core::stream::{
     self, exec_capture, exec_capture_stdin, CaptureResult, FilterMode, StdinMode, StreamFilter,
 };
@@ -136,26 +136,24 @@ fn unwrap_attached_value(engine: Engine, value: &str) -> &str {
     }
 }
 
-/// The module's single tokenizer entry point: every grep/rg value-taking flag claims even a
-/// literal `--` as its value, unlike git/cargo. Shared so a pre-check and `extract_pattern_path`
+/// The module's single tokenizer entry point. Shared so a pre-check and `extract_pattern_path`
 /// cannot classify the same argument differently.
 fn tokenize_search_args<'a, T: AsRef<str>>(args: &'a [T], engine: Engine) -> Vec<Token<'a>> {
-    let takes_value = |kind: TokenKind, name: &str| search_takes_value(engine, kind, name);
-    arg_tokenizer::tokenize_with_options(
+    arg_tokenizer::tokenize_grammar(
         args,
-        &takes_value,
-        arg_tokenizer::TokenizeOptions {
-            claims_literal_dash_dash: &takes_value,
-            ..Default::default()
-        },
+        &|kind, name| search_takes_value(engine, kind, name),
+        Dialect::Posix,
     )
 }
 
-fn search_takes_value(engine: Engine, kind: TokenKind, name: &str) -> bool {
-    match engine {
+/// Every grep/rg value-taking flag claims even a literal `--` as its value, unlike git/cargo --
+/// verified against both engines for short and long, numeric- and file-typed flags alike.
+fn search_takes_value(engine: Engine, kind: TokenKind, name: &str) -> Option<ValueSpec> {
+    let takes = match engine {
         Engine::Grep => grep_takes_value(kind, name),
         Engine::Rg => rg_takes_value(kind, name),
-    }
+    };
+    takes.then(|| ValueSpec::value().claiming_dash_dash())
 }
 
 /// Unique, descriptive tee slug for a file's overflow matches. `idx` disambiguates
@@ -298,7 +296,7 @@ fn extract_pattern_path<T: AsRef<str>>(
                 }
                 let (bool_chars, value_char) = match cluster.split_last() {
                     Some((last, rest))
-                        if search_takes_value(engine, TokenKind::Short, last.text) =>
+                        if search_takes_value(engine, TokenKind::Short, last.text).is_some() =>
                     {
                         (rest, Some(last))
                     }
@@ -603,7 +601,7 @@ pub fn run(
     });
     let dangling_value_flag = help_tokens.iter().any(|t| {
         matches!(t.kind, TokenKind::Long | TokenKind::Short)
-            && search_takes_value(engine, t.kind, t.text)
+            && search_takes_value(engine, t.kind, t.text).is_some()
             && t.value(&help_tokens).is_none()
     });
     if dangling_value_flag {
@@ -1197,9 +1195,11 @@ mod tests {
     fn test_help_short_circuit_respects_the_boundary_and_the_engine() {
         let asks = |engine: Engine, args: &[&str]| -> bool {
             let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-            let tokens = arg_tokenizer::tokenize(&args, &|kind, name| {
-                search_takes_value(engine, kind, name)
-            });
+            let tokens = arg_tokenizer::tokenize_grammar(
+                &args,
+                &|kind, name| search_takes_value(engine, kind, name),
+                Dialect::Posix,
+            );
             arg_tokenizer::before_dashdash(&tokens).iter().any(|t| {
                 (t.kind == TokenKind::Long && matches!(t.text, "version" | "help"))
                     || (t.kind == TokenKind::Short && t.text == "h" && engine == Engine::Rg)

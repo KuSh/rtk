@@ -1,6 +1,6 @@
 //! Filters git output — log, status, diff, and more — keeping just the essential info.
 
-use crate::core::arg_tokenizer::{self, is_digit_run, Token, TokenKind};
+use crate::core::arg_tokenizer::{self, is_digit_run, Dialect, Token, TokenKind, ValueSpec};
 use crate::core::args_utils;
 use crate::core::guard::never_worse;
 use crate::core::runner::{self, RunOptions};
@@ -54,7 +54,7 @@ fn git_cmd_c_locale(global_args: &[String]) -> Command {
 }
 
 fn uses_compact_status_path(args: &[String]) -> bool {
-    let tokens = arg_tokenizer::tokenize(args, &|_, _| false);
+    let tokens = arg_tokenizer::tokenize(args);
 
     if tokens.is_empty() {
         return true;
@@ -134,7 +134,7 @@ pub fn run(
 /// Splits a restored `stash` region back into subcommand and remainder, the way clap did
 /// before the `--` came back: a leading token that is neither a flag nor the boundary.
 fn split_stash_region(region: &[String]) -> (Option<String>, Vec<String>) {
-    let tokens = arg_tokenizer::tokenize(region, &|_, _| false);
+    let tokens = arg_tokenizer::tokenize(region);
     match tokens.first() {
         Some(token) if token.kind == TokenKind::Positional => {
             (Some(region[0].clone()), region[1..].to_vec())
@@ -1107,35 +1107,15 @@ fn run_log(
     Ok(0)
 }
 
-/// `-n` accepts a separate-token value only when solo (`git log -pn 2` fails on the `-n`);
-/// `-M`/`-U`/`-C`/`-B` never do, solo or clustered. `-l` is kept solo-only here out of
-/// caution rather than evidence: `git log -pl 2` and `-wl 2` both succeed against git 2.53,
-/// and only run_log uses this, where a stray positional is inert.
-fn log_takes_separate_value(name: &str, is_solo: bool) -> bool {
-    match name {
-        "B" | "C" | "M" | "U" => false,
-        "l" | "n" => is_solo,
-        _ => true,
-    }
-}
-
-/// Same, for `diff`/`show`, whose `-l` is the rename limit and *does* cluster: `git diff -wl
-/// 100` works where `git log -cl 2` does not. Sharing log's predicate here made RTK read the
-/// 100 as a pathspec and splice its own flags in front of it.
-fn diff_takes_separate_value(name: &str, is_solo: bool) -> bool {
-    match name {
-        "B" | "C" | "M" | "U" => false,
-        "n" => is_solo,
-        _ => true,
-    }
-}
-
+/// The long flags `git log`, `diff` and `show` all take a value for. Shared deliberately: these
+/// are revision-walk options all three parse the same way. The *short* grammar is where they
+/// differ, so each subcommand states its own below.
+///
 /// E.g. `--grep -p` searches messages for the literal string "-p"; it does not request patch
 /// output.
-fn log_takes_value(kind: TokenKind, name: &str) -> bool {
-    match kind {
-        TokenKind::Long => matches!(
-            name,
+fn shared_long_takes_value(name: &str) -> bool {
+    matches!(
+        name,
             "after"
                 | "anchored"
                 | "author"
@@ -1179,38 +1159,48 @@ fn log_takes_value(kind: TokenKind, name: &str) -> bool {
                 | "until"
                 | "word-diff-regex"
                 | "ws-error-highlight"
-        ),
-        // -M/-U/-C/-B take an optional attached numeric value ("-M50"), never a separate token.
-        TokenKind::Short => matches!(
-            name,
-            "B" | "C" | "G" | "I" | "L" | "M" | "O" | "S" | "U" | "l" | "n"
-        ),
-        _ => false,
+    )
+}
+
+/// `git log`'s grammar. `-M`/`-U`/`-C`/`-B` take an optional attached number and never a
+/// separate token; `-n` and `-l` take one only when solo (`git log -pn 2` fails against git
+/// 2.53, and `-l` is kept solo-only out of caution -- only run_log uses this, where a stray
+/// positional is inert).
+fn log_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
+    match kind {
+        TokenKind::Long => shared_long_takes_value(name).then(ValueSpec::value),
+        TokenKind::Short => match name {
+            "B" | "C" | "M" | "U" => Some(ValueSpec::attached_only()),
+            "G" | "I" | "L" | "O" | "S" => Some(ValueSpec::value()),
+            "l" | "n" => Some(ValueSpec::solo_only()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
-/// `git log`'s grammar: shared value list, and `-n`/`-l` taking a separate value only when
-/// solo. `diff`/`show` use [`tokenize_git_diff_args`], whose `-l` clusters.
-fn tokenize_git_diff_args(args: &[String]) -> Vec<Token<'_>> {
-    arg_tokenizer::tokenize_with_options(
-        args,
-        &log_takes_value,
-        arg_tokenizer::TokenizeOptions {
-            takes_separate_value: &diff_takes_separate_value,
-            ..Default::default()
+/// `diff`/`show`'s grammar. Same long list, but `-l` is the rename limit here and *does*
+/// cluster: `git diff -wl 100` works where `git log -cl 2` does not. Sharing log's short
+/// grammar made RTK read the 100 as a pathspec and splice its own flags in front of it.
+fn diff_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
+    match kind {
+        TokenKind::Long => shared_long_takes_value(name).then(ValueSpec::value),
+        TokenKind::Short => match name {
+            "B" | "C" | "M" | "U" => Some(ValueSpec::attached_only()),
+            "G" | "I" | "L" | "O" | "S" | "l" => Some(ValueSpec::value()),
+            "n" => Some(ValueSpec::solo_only()),
+            _ => None,
         },
-    )
+        _ => None,
+    }
+}
+
+fn tokenize_git_diff_args(args: &[String]) -> Vec<Token<'_>> {
+    arg_tokenizer::tokenize_grammar(args, &diff_takes_value, Dialect::Posix)
 }
 
 fn tokenize_git_log_args(args: &[String]) -> Vec<Token<'_>> {
-    arg_tokenizer::tokenize_with_options(
-        args,
-        &log_takes_value,
-        arg_tokenizer::TokenizeOptions {
-            takes_separate_value: &log_takes_separate_value,
-            ..Default::default()
-        },
-    )
+    arg_tokenizer::tokenize_grammar(args, &log_takes_value, Dialect::Posix)
 }
 
 #[cfg(test)]
@@ -1332,7 +1322,7 @@ fn has_limit_flag(tokens: &[Token<'_>]) -> bool {
     tokens.iter().any(|t| match t.kind {
         TokenKind::Long => t.text == "max-count",
         // "n" only counts if it actually captured a value -- e.g. clustered with another short
-        // flag (log_takes_separate_value's is_solo gate refuses to link a value there), it's
+        // flag (log_takes_value's solo_only spec refuses to link a value there), it's
         // just an inert letter, not a real limit request.
         TokenKind::Short => (t.text == "n" && t.value(tokens).is_some()) || is_digit_run(t.text),
         _ => false,
@@ -1921,7 +1911,7 @@ fn format_checkout_output(args: &[String], raw: &str, exit_code: i32) -> String 
 }
 
 fn format_checkout_success(args: &[String], raw: &str) -> String {
-    let tokens = arg_tokenizer::tokenize(args, &checkout_takes_value);
+    let tokens = arg_tokenizer::tokenize_grammar(args, &checkout_takes_value, Dialect::Posix);
 
     if let Some(restored) = checkout_restored_count(&tokens) {
         return format!(
@@ -1968,11 +1958,13 @@ fn format_checkout_success(args: &[String], raw: &str) -> String {
 /// answers "requires a value"). `-t`/`--track`/`--detach` and any other `-`-prefixed token are
 /// booleans. Shared by every `checkout_*_arg` helper below via one
 /// [`arg_tokenizer::tokenize`] call instead of each hand-rolling its own scan over `args`.
-fn checkout_takes_value(kind: TokenKind, name: &str) -> bool {
+fn checkout_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
     match kind {
-        TokenKind::Long => matches!(name, "conflict" | "orphan" | "pathspec-from-file"),
-        TokenKind::Short => matches!(name, "B" | "b"),
-        _ => false,
+        TokenKind::Long => {
+            matches!(name, "conflict" | "orphan" | "pathspec-from-file").then(ValueSpec::value)
+        }
+        TokenKind::Short => matches!(name, "B" | "b").then(ValueSpec::value),
+        _ => None,
     }
 }
 
@@ -2241,7 +2233,7 @@ fn run_pull(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32>
     Ok(0)
 }
 
-fn branch_takes_value(kind: TokenKind, name: &str) -> bool {
+fn branch_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
     // -c/-C/-m/-M/-d/-D are followed by positional branch names, not a "flag value" in the
     // attached/separate-value sense, so they're excluded here. -u IS a genuine value-taking flag
     // (its short form takes the same single upstream-ref value as --set-upstream-to) and must be
@@ -2258,9 +2250,10 @@ fn branch_takes_value(kind: TokenKind, name: &str) -> bool {
                 | "points-at"
                 | "set-upstream-to"
                 | "sort"
-        ),
-        TokenKind::Short => name == "u",
-        _ => false,
+        )
+        .then(ValueSpec::value),
+        TokenKind::Short => (name == "u").then(ValueSpec::value),
+        _ => None,
     }
 }
 
@@ -2271,7 +2264,7 @@ fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
         eprintln!("git branch");
     }
 
-    let tokens = arg_tokenizer::tokenize(args, &branch_takes_value);
+    let tokens = arg_tokenizer::tokenize_grammar(args, &branch_takes_value, Dialect::Posix);
 
     // Detect write operations: delete, rename, copy, upstream tracking
     let has_action_flag = tokens.iter().any(|t| match t.kind {
@@ -2547,7 +2540,7 @@ fn format_stash_message(subcommand: Option<&str>, result: &CaptureResult) -> Str
 /// so no flag it sees here consumes a following token, and treating one as if it did swallowed
 /// the `-p` after it (confirmed against git 2.53 with `git stash show --author -p`).
 fn stash_show_wants_patch(args: &[String]) -> bool {
-    let tokens = arg_tokenizer::tokenize(args, &|_kind, _name| false);
+    let tokens = arg_tokenizer::tokenize(args);
     tokens.iter().any(|t| match t.kind {
         TokenKind::Long => t.text == "patch",
         TokenKind::Short => t.text == "p",
@@ -2833,7 +2826,7 @@ fn run_worktree(args: &[String], verbose: u8, global_args: &[String]) -> Result<
 
     // The subcommand is the first positional, not any arg that happens to spell one (a
     // worktree path named "move", say).
-    let tokens = arg_tokenizer::tokenize(args, &|_, _| false);
+    let tokens = arg_tokenizer::tokenize(args);
     let subcommand = arg_tokenizer::before_dashdash(&tokens)
         .iter()
         .find(|t| t.is_free_positional())
@@ -3002,7 +2995,7 @@ mod tests {
     fn test_branch_dash_u_links_its_upstream_value_not_a_free_positional() {
         // -u's short form must link its value like its long form --set-upstream-to does.
         let args = vec!["-u".to_string(), "origin/main".to_string()];
-        let tokens = arg_tokenizer::tokenize(&args, &branch_takes_value);
+        let tokens = arg_tokenizer::tokenize_grammar(&args, &branch_takes_value, Dialect::Posix);
         assert_eq!(tokens[0].kind, TokenKind::Short);
         assert_eq!(tokens[0].text, "u");
         assert_eq!(tokens[0].value(&tokens), Some("origin/main"));
@@ -3017,11 +3010,11 @@ mod tests {
     fn test_checkout_new_branch_arg_accepts_glued_short_flag() {
         // `-bmy-branch` (glued) and `-b my-branch` (separate) must both work.
         let args = vec!["-bmy-branch".to_string()];
-        let tokens = arg_tokenizer::tokenize(&args, &checkout_takes_value);
+        let tokens = arg_tokenizer::tokenize_grammar(&args, &checkout_takes_value, Dialect::Posix);
         assert_eq!(checkout_new_branch_arg(&tokens), Some("my-branch"));
 
         let args = vec!["-b".to_string(), "my-branch".to_string()];
-        let tokens = arg_tokenizer::tokenize(&args, &checkout_takes_value);
+        let tokens = arg_tokenizer::tokenize_grammar(&args, &checkout_takes_value, Dialect::Posix);
         assert_eq!(checkout_new_branch_arg(&tokens), Some("my-branch"));
     }
 
@@ -3029,7 +3022,7 @@ mod tests {
     fn test_checkout_reset_branch_arg_accepts_glued_short_flag() {
         // Same glued-form guarantee as -b, for -B (force-create/reset).
         let args = vec!["-Bmy-branch".to_string()];
-        let tokens = arg_tokenizer::tokenize(&args, &checkout_takes_value);
+        let tokens = arg_tokenizer::tokenize_grammar(&args, &checkout_takes_value, Dialect::Posix);
         assert_eq!(checkout_reset_branch_arg(&tokens), Some("my-branch"));
     }
 
@@ -4018,7 +4011,7 @@ mod tests {
     fn test_worktree_asked_for_report() {
         let report = |args: &[&str]| {
             let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-            worktree_asked_for_report(&arg_tokenizer::tokenize(&owned, &|_, _| false))
+            worktree_asked_for_report(&arg_tokenizer::tokenize(&owned))
         };
         // `add` writes two progress lines that "ok" exists to replace, and has no --dry-run or
         // --verbose of its own.

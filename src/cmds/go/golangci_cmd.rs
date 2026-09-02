@@ -1,6 +1,6 @@
 //! Filters golangci-lint output, grouping issues by rule.
 
-use crate::core::arg_tokenizer::{self, TokenKind};
+use crate::core::arg_tokenizer::{self, Dialect, TokenKind, ValueSpec};
 use crate::core::args_utils;
 use crate::core::config;
 use crate::core::runner;
@@ -31,29 +31,30 @@ fn is_golangci_subcommand(name: &str) -> bool {
 
 /// Value-taking flags accepted *before* the `run` subcommand. `-c` is `--config`'s shorthand;
 /// this list is wider than `--help`'s "Global Flags" section, which omits several of these.
-fn golangci_takes_value(kind: TokenKind, name: &str) -> bool {
+fn golangci_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
     match kind {
         TokenKind::Long => matches!(
             name,
             "color" | "config" | "cpu-profile-path" | "mem-profile-path" | "trace-path"
-        ),
-        TokenKind::Short => name == "c",
-        _ => false,
+        )
+        .then(ValueSpec::value),
+        TokenKind::Short => (name == "c").then(ValueSpec::value),
+        _ => None,
     }
 }
 
 /// `run`'s own value-taking flags -- a wider list than [`golangci_takes_value`] (which is scoped
 /// to flags valid *before* `run`). Missing an entry here risks a value like `--path-prefix
 /// --out-format` tokenizing as its own flag and being misdetected by `has_output_flag`.
-fn golangci_run_takes_value(kind: TokenKind, name: &str) -> bool {
+fn golangci_run_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
     // The one exception to one-grammar-per-command (`src/core/README.md`), earned by a strict
     // subset: every flag valid before `run` stays valid after it. Grammars that merely
     // intersect get a table each instead.
-    if golangci_takes_value(kind, name) {
-        return true;
+    if let Some(spec) = golangci_takes_value(kind, name) {
+        return Some(spec);
     }
     if OUTPUT_PATH_FLAGS.contains(&name) && kind == TokenKind::Long {
-        return true;
+        return Some(ValueSpec::value());
     }
     match kind {
         TokenKind::Long => matches!(
@@ -85,10 +86,11 @@ fn golangci_run_takes_value(kind: TokenKind, name: &str) -> bool {
                 | "skip-dirs"
                 | "skip-files"
                 | "timeout"
-        ),
+        )
+        .then(ValueSpec::value),
         // `-e`/`-p` are 1.x's --exclude/--presets; 2.x rejects them outright either way.
-        TokenKind::Short => matches!(name, "D" | "E" | "e" | "j" | "p"),
-        _ => false,
+        TokenKind::Short => matches!(name, "D" | "E" | "e" | "j" | "p").then(ValueSpec::value),
+        _ => None,
     }
 }
 
@@ -245,7 +247,7 @@ fn classify_invocation(args: &[String]) -> Invocation {
 /// entirely at `--` or at a non-flag token that isn't a recognized subcommand — mirroring
 /// golangci-lint's own arg parsing just enough to locate `run`, not fully replicate it.
 fn find_subcommand_index(args: &[String]) -> Option<usize> {
-    let tokens = arg_tokenizer::tokenize(args, &golangci_takes_value);
+    let tokens = arg_tokenizer::tokenize_grammar(args, &golangci_takes_value, Dialect::Posix);
 
     for token in &tokens {
         match token.kind {
@@ -303,7 +305,7 @@ const OUTPUT_PATH_FLAGS: &[&str] = &[
 /// other format takes nothing away from stdout, so RTK still injects there or it is left with
 /// nothing to parse.
 fn has_output_flag(args: &[String]) -> bool {
-    let tokens = arg_tokenizer::tokenize(args, &golangci_run_takes_value);
+    let tokens = arg_tokenizer::tokenize_grammar(args, &golangci_run_takes_value, Dialect::Posix);
     tokens.iter().any(|t| {
         if t.kind != TokenKind::Long {
             return false;
@@ -758,7 +760,7 @@ mod tests {
         // --out-format is a v1-only legacy flag; its value must still link, not tokenize as an
         // unlinked Positional.
         let args = vec!["--out-format".to_string(), "json".to_string()];
-        let tokens = arg_tokenizer::tokenize(&args, &golangci_run_takes_value);
+        let tokens = arg_tokenizer::tokenize_grammar(&args, &golangci_run_takes_value, Dialect::Posix);
         assert!(tokens[0].linked.is_some(), "\"json\" must link to --out-format");
     }
 

@@ -1,7 +1,7 @@
 //! Filters dotnet CLI output — build, test, and format results.
 
 use crate::binlog;
-use crate::core::arg_tokenizer::{self, Dialect, Token, TokenKind};
+use crate::core::arg_tokenizer::{self, Dialect, Token, TokenKind, ValueSpec};
 use crate::core::args_utils;
 use crate::core::guard::never_worse;
 use crate::core::stream::exec_capture;
@@ -788,8 +788,8 @@ fn detect_test_runner_mode_in_dir(tokens: &[Token<'_>], scan_dir: &Path) -> Test
 /// The value-taking flags that matter for RTK's own decisions, not every flag dotnet accepts:
 /// a missing entry leaves the value as a free positional, which `detect_test_runner_mode`'s
 /// project-path scan then has to filter by extension for exactly that reason.
-fn dotnet_takes_value(kind: TokenKind, name: &str) -> bool {
-    kind == TokenKind::Long
+fn dotnet_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
+    (kind == TokenKind::Long
         && matches!(
             name.to_ascii_lowercase().as_str(),
             "a" | "arch"
@@ -805,18 +805,12 @@ fn dotnet_takes_value(kind: TokenKind, name: &str) -> bool {
                 | "report"
                 | "results-directory"
                 | "runtime"
-        )
+        ))
+    .then(ValueSpec::value)
 }
 
 fn tokenize_dotnet_args(args: &[String]) -> Vec<Token<'_>> {
-    arg_tokenizer::tokenize_with_options(
-        args,
-        &dotnet_takes_value,
-        arg_tokenizer::TokenizeOptions {
-            dialect: Dialect::Msbuild,
-            ..Default::default()
-        },
-    )
+    arg_tokenizer::tokenize_grammar(args, &dotnet_takes_value, Dialect::Msbuild)
 }
 
 /// The tokens dotnet itself parses: everything the user put after `--` is forwarded to the
