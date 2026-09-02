@@ -944,12 +944,16 @@ fn run_log(
         (10, false)
     };
 
-    // Only add --no-merges if user didn't explicitly request merge commits
+    // Only add --no-merges if user didn't explicitly request merge commits. Any
+    // `--min-parents=N` with N >= 2 asks for merges; pinning it to 2 let `--min-parents=3`
+    // collect RTK's `--no-merges` as well, and the two constraints select nothing at all.
     let wants_merges = tokens.iter().any(|t| {
         t.kind == TokenKind::Long
             && (t.text == "merges"
-                || (t.text == "min-parents" && t.attached == Some("2"))
-                || t.text == "no-merges")
+                || t.text == "no-merges"
+                || (t.text == "min-parents"
+                    && t.attached
+                        .is_some_and(|v| v.parse::<u32>().is_ok_and(|n| n >= 2))))
     });
     // Don't add --no-merges if user explicitly requested merges or an exact count (-n N / --max-count)
     if !wants_merges && !has_limit_flag {
@@ -1695,7 +1699,9 @@ fn run_checkout(args: &[String], verbose: u8, global_args: &[String]) -> Result<
         eprintln!("git checkout");
     }
 
-    let mut cmd = git_cmd(global_args);
+    // format_checkout_success reads git's own "Switched to branch ..." phrasing, so the child
+    // has to speak it: in any other locale the scan missed and RTK reported the raw argument.
+    let mut cmd = git_cmd_c_locale(global_args);
     cmd.arg("checkout");
     for arg in args {
         cmd.arg(arg);
@@ -1763,12 +1769,14 @@ fn format_checkout_success(args: &[String], raw: &str) -> String {
     "ok".to_string()
 }
 
-/// `-b`/`-B`/`--orphan` all take a branch-name value; `-t`/`--track`/`--detach` and any other
-/// `-`-prefixed token are booleans. Shared by every `checkout_*_arg` helper below via one
+/// The options git consumes a separate token for: `--orphan`/`-b`/`-B` take a branch name,
+/// `--conflict` a style, `--pathspec-from-file` a file (all confirmed against git 2.53, which
+/// answers "requires a value"). `-t`/`--track`/`--detach` and any other `-`-prefixed token are
+/// booleans. Shared by every `checkout_*_arg` helper below via one
 /// [`arg_tokenizer::tokenize`] call instead of each hand-rolling its own scan over `args`.
 fn checkout_takes_value(kind: TokenKind, name: &str) -> bool {
     match kind {
-        TokenKind::Long => name == "orphan",
+        TokenKind::Long => matches!(name, "conflict" | "orphan" | "pathspec-from-file"),
         TokenKind::Short => matches!(name, "B" | "b"),
         _ => false,
     }
@@ -1804,7 +1812,8 @@ fn checkout_branch_arg<'a>(tokens: &[Token<'a>]) -> Option<&'a str> {
     }
     tokens
         .iter()
-        .find(|t| t.is_free_positional())
+        // A bare `-` is git's "the branch I was on before", not a branch name to echo back.
+        .find(|t| t.is_free_positional() && t.text != "-")
         .map(|t| t.text)
 }
 

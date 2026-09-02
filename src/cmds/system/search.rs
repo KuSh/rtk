@@ -546,14 +546,20 @@ pub fn run(
     verbose: u8,
 ) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
+    // Restored first: every check below classifies these args, and clap ate the boundary.
+    let args = &args_utils::restore_double_dash(args);
 
-    // --version / --help: pass through to the engine without filtering.
-    // Note: Clap strips `--` before populating trailing_var_arg, so both
-    // `rtk grep --version` and `rtk grep -- --version` land here identically.
-    if args
-        .iter()
-        .any(|a| a == "--version" || a == "--help" || a == "-h")
-    {
+    // --version / --help: pass through to the engine without filtering. Token-based and
+    // scoped before the boundary, because `rtk grep -- --version` searches *for* that string.
+    // `-h` is engine-specific: rg's is --help, grep's is --no-filename.
+    let help_tokens = arg_tokenizer::tokenize(args, &|kind, name| {
+        search_takes_value(engine, kind, name)
+    });
+    let asks_for_help = arg_tokenizer::before_dashdash(&help_tokens).iter().any(|t| {
+        (t.kind == TokenKind::Long && matches!(t.text, "version" | "help"))
+            || (t.kind == TokenKind::Short && t.text == "h" && engine == Engine::Rg)
+    });
+    if asks_for_help {
         let mut cmd = resolved_command(engine.bin());
         cmd.args(args);
         let result = exec_capture(&mut cmd).context("search failed")?;
@@ -565,7 +571,7 @@ pub fn run(
     }
 
     // Re-insert `--` when clap's trailing_var_arg consumed it
-    let args = args_utils::restore_double_dash(args);
+    let args = args.clone();
     let real_cmd = format!("{} {}", engine.label(), args.join(" "));
     let rtk_label = format!("rtk {}", engine.label());
 
@@ -1104,6 +1110,27 @@ mod tests {
 
         let (_, _, _, _, detected) = extract_pattern_path(&["-1", "TODO", "f.txt"], Engine::Grep);
         assert!(detected.context);
+    }
+
+    #[test]
+    fn test_help_short_circuit_respects_the_boundary_and_the_engine() {
+        let asks = |engine: Engine, args: &[&str]| -> bool {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let tokens = arg_tokenizer::tokenize(&args, &|kind, name| {
+                search_takes_value(engine, kind, name)
+            });
+            arg_tokenizer::before_dashdash(&tokens).iter().any(|t| {
+                (t.kind == TokenKind::Long && matches!(t.text, "version" | "help"))
+                    || (t.kind == TokenKind::Short && t.text == "h" && engine == Engine::Rg)
+            })
+        };
+
+        assert!(asks(Engine::Grep, &["--version"]));
+        // Past `--` it is the pattern to search for, not a request for the banner.
+        assert!(!asks(Engine::Grep, &["--", "--version", "f.txt"]));
+        // `-h` is rg's --help but grep's --no-filename.
+        assert!(asks(Engine::Rg, &["-h"]));
+        assert!(!asks(Engine::Grep, &["-h", "TODO", "f.txt"]));
     }
 
     #[test]
