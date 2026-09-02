@@ -130,9 +130,9 @@ pub fn before_dashdash<'t, 'a>(tokens: &'t [Token<'a>]) -> &'t [Token<'a>] {
 /// anything past the boundary is a pathspec or an argument forwarded to another program, not
 /// an option the tool will read. `args_len` when there is no boundary.
 ///
-/// A tool that also refuses options *after a positional* (git: "option '--no-patch' must come
-/// before non-option arguments") needs a stricter point than this -- see git.rs's
-/// `git_option_insert_point`.
+/// Takes the **whole** token vec, never a slice: `dashdash_index` on a slice whose `--` was
+/// cut off reports "no boundary" and this returns `args_len`, which would splice RTK's flags
+/// past the boundary -- the exact thing it exists to prevent.
 pub fn injection_point(tokens: &[Token<'_>], args_len: usize) -> usize {
     dashdash_index(tokens)
         .map(|index| tokens[index].source_index)

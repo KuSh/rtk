@@ -30,9 +30,9 @@ fn rg_shows_filenames_when_stdin_is_not_a_pipe() {
     // non-terminal, non-pipe redirect was misread as "the engine reads stdin," routing into the
     // streaming path, which can't discover "multiple files" the way the buffered path does.
     // Real rg searches the cwd here, not stdin.
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("a.txt"), "foo one\n").unwrap();
-    std::fs::write(dir.path().join("b.txt"), "foo two\n").unwrap();
+    let dir = tempfile::tempdir().expect("test setup");
+    std::fs::write(dir.path().join("a.txt"), "foo one\n").expect("test setup");
+    std::fs::write(dir.path().join("b.txt"), "foo two\n").expect("test setup");
 
     let output = rtk()
         .args(["rg", "-z", "foo"])
@@ -53,9 +53,9 @@ fn a_single_matching_file_still_gets_its_name() {
     }
     // The engine walked the cwd itself, so the filename is the only way to place the match --
     // real rg prints it even when exactly one file matched.
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("only.txt"), "foo here\n").unwrap();
-    std::fs::write(dir.path().join("other.txt"), "nothing\n").unwrap();
+    let dir = tempfile::tempdir().expect("test setup");
+    std::fs::write(dir.path().join("only.txt"), "foo here\n").expect("test setup");
+    std::fs::write(dir.path().join("other.txt"), "nothing\n").expect("test setup");
 
     let output = rtk()
         .args(["rg", "foo"])
@@ -73,10 +73,10 @@ fn both_engines_read_a_redirected_file_on_stdin() {
     // A regular file on stdin *is* read by both engines (rg's own is_readable_stdin counts
     // files and sockets, not just FIFOs), so the search must return that file's match rather
     // than the cwd's.
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("a.txt"), "foo from the cwd\n").unwrap();
+    let dir = tempfile::tempdir().expect("test setup");
+    std::fs::write(dir.path().join("a.txt"), "foo from the cwd\n").expect("test setup");
     let piped = dir.path().join("piped.log");
-    std::fs::write(&piped, "foo from stdin\n").unwrap();
+    std::fs::write(&piped, "foo from stdin\n").expect("test setup");
 
     for engine in ["grep", "rg"] {
         if !engine_available(engine) {
@@ -85,7 +85,7 @@ fn both_engines_read_a_redirected_file_on_stdin() {
         let output = rtk()
             .args([engine, "foo"])
             .current_dir(dir.path())
-            .stdin(std::fs::File::open(&piped).unwrap())
+            .stdin(std::fs::File::open(&piped).expect("test setup"))
             .output()
             .expect("failed to run rtk");
 

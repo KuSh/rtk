@@ -154,31 +154,49 @@ fn suppresses_diff_body(token: &Token<'_>) -> bool {
     )
 }
 
-/// Indices of the args that ask git for patch output, so a stat-only header can drop them:
-/// `-p`/`-u`/`--patch`, and the context-width flags that imply a patch (`-U3`, `--unified=3`,
-/// `-W`/`--function-context`).
-fn patch_shape_args(tokens: &[Token<'_>]) -> Vec<usize> {
-    tokens
-        .iter()
-        .filter(|t| match t.kind {
-            TokenKind::Long => matches!(t.text, "patch" | "unified" | "function-context"),
-            TokenKind::Short => matches!(t.text, "p" | "u" | "U" | "W"),
-            _ => false,
-        })
-        .map(|t| t.source_index)
-        .collect()
+/// True for a token asking git for patch output: `-p`/`-u`/`--patch`, and the context-width
+/// flags that imply a patch (`-U3`, `--unified=3`, `-W`/`--function-context`).
+fn requests_patch_output(token: &Token<'_>) -> bool {
+    match token.kind {
+        TokenKind::Long => matches!(token.text, "patch" | "unified" | "function-context"),
+        TokenKind::Short => matches!(token.text, "p" | "u" | "U" | "W"),
+        _ => false,
+    }
 }
 
-/// Where git still reads an option: before the user's `--` and before the first non-option
-/// argument, since git refuses an option that follows one ("option '--no-patch' must come
-/// before non-option arguments"). Stricter than [`arg_tokenizer::injection_point`], which only
-/// knows about the boundary -- dotnet, for one, has no positional rule.
-fn git_option_insert_point(tokens: &[Token<'_>], args_len: usize) -> usize {
-    tokens
-        .iter()
-        .find(|t| t.kind == TokenKind::DashDash || t.is_free_positional())
-        .map(|t| t.source_index)
-        .unwrap_or(args_len)
+/// `args` with the patch-shape flags removed, so a stat-only header cannot be outranked by
+/// them wherever git would have read them. Rebuilt per token rather than per arg: every short
+/// flag in a `-xyz` cluster shares one `source_index`, so dropping the whole arg would take
+/// its siblings with it -- `-pl 100` lost the `-l` and left `100` behind as a bogus revision.
+fn args_without_patch_shape(args: &[String], tokens: &[Token<'_>]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    for (index, arg) in args.iter().enumerate() {
+        let owned: Vec<&Token<'_>> = tokens
+            .iter()
+            .filter(|t| t.source_index == index && t.kind != TokenKind::Positional)
+            .collect();
+        if owned.is_empty() || !owned.iter().any(|t| requests_patch_output(t)) {
+            out.push(arg.clone());
+            continue;
+        }
+        // A cluster keeps whatever letters were not shape flags, with their attached value.
+        let kept: Vec<&&Token<'_>> = owned
+            .iter()
+            .filter(|t| t.kind == TokenKind::Short && !requests_patch_output(t))
+            .collect();
+        if kept.is_empty() {
+            continue;
+        }
+        let mut rebuilt = String::from("-");
+        for token in &kept {
+            rebuilt.push_str(token.text);
+        }
+        if let Some(attached) = kept.last().and_then(|t| t.attached) {
+            rebuilt.push_str(attached);
+        }
+        out.push(rebuilt);
+    }
+    out
 }
 
 fn run_diff(
@@ -252,22 +270,9 @@ fn run_diff(
     // ...) emits the patch too, and RTK then printed it again, compacted, for 2.4x the raw
     // output. The flags go before the user's own `--`, where git still reads them as options.
     let mut cmd = git_cmd(global_args);
-    cmd.arg("diff");
-    let stat_at = git_option_insert_point(&tokens, args.len());
-    let shape_args = patch_shape_args(&tokens);
-    for (index, arg) in args.iter().enumerate() {
-        if index == stat_at {
-            cmd.args(["--no-patch", "--stat"]);
-        }
-        // Dropped, not just outranked: git takes the last shape flag, and it accepts options
-        // after a revision (`git diff HEAD~1 -p`), where RTK's header flags can no longer be
-        // placed in front of them.
-        if !shape_args.contains(&index) {
-            cmd.arg(arg);
-        }
-    }
-    if stat_at == args.len() {
-        cmd.args(["--no-patch", "--stat"]);
+    cmd.args(["diff", "--no-patch", "--stat"]);
+    for arg in args_without_patch_shape(args, &tokens) {
+        cmd.arg(arg);
     }
 
     let result = exec_capture(&mut cmd).context("Failed to run git diff")?;
@@ -319,9 +324,10 @@ fn run_diff(
     Ok(0)
 }
 
-/// `git show` with RTK's own shape flags where git still reads them *and* after the user's own:
-/// git takes the last output-format flag, so a user `-p` placed after them would re-enable the
-/// patch in the summary and stat steps, and the result stopped being smaller than raw.
+/// `git show` with RTK's own shape flags in front and the user's patch-shape flags removed:
+/// git takes the last output-format flag, so a `-p` left anywhere in the args -- including
+/// after a revision, where RTK's flags cannot be placed -- would re-enable the patch in the
+/// summary and stat steps and the result stopped being smaller than raw.
 fn show_cmd(
     global_args: &[String],
     args: &[String],
@@ -330,15 +336,9 @@ fn show_cmd(
 ) -> Command {
     let mut cmd = git_cmd(global_args);
     cmd.arg("show");
-    let at = git_option_insert_point(tokens, args.len());
-    for (index, arg) in args.iter().enumerate() {
-        if index == at {
-            cmd.args(rtk_flags);
-        }
+    cmd.args(rtk_flags);
+    for arg in args_without_patch_shape(args, tokens) {
         cmd.arg(arg);
-    }
-    if at == args.len() {
-        cmd.args(rtk_flags);
     }
     cmd
 }
@@ -416,6 +416,20 @@ fn run_show(
         return Ok(summary_result.exit_code);
     }
     let mut printed = summary_result.stdout.trim().to_string();
+
+    if tokens.iter().any(suppresses_diff_body) {
+        // `git show -s` is the commit summary and nothing else, so the stat and diff steps
+        // below would print what the user explicitly suppressed.
+        let shown = never_worse(&raw_output, &printed);
+        println!("{}", shown);
+        timer.track(
+            &format!("git show {}", args.join(" ")),
+            &format!("rtk git show {}", args.join(" ")),
+            &raw_output,
+            shown,
+        );
+        return Ok(0);
+    }
 
     // Step 2: --stat summary
     let mut stat_cmd = show_cmd(
@@ -1050,8 +1064,10 @@ fn run_log(
     Ok(0)
 }
 
-/// `-n`/`-l` accept a separate-token value only when solo (`git log -cn 2` and `-cl 2` both
-/// fail as "ambiguous argument"); `-M`/`-U`/`-C`/`-B` never do, solo or clustered.
+/// `-n` accepts a separate-token value only when solo (`git log -pn 2` fails on the `-n`);
+/// `-M`/`-U`/`-C`/`-B` never do, solo or clustered. `-l` is kept solo-only here out of
+/// caution rather than evidence: `git log -pl 2` and `-wl 2` both succeed against git 2.53,
+/// and only run_log uses this, where a stray positional is inert.
 fn log_takes_separate_value(name: &str, is_solo: bool) -> bool {
     match name {
         "B" | "C" | "M" | "U" => false,
@@ -1099,8 +1115,10 @@ fn log_takes_value(kind: TokenKind, name: &str) -> bool {
                 | "ignore-matching-lines"
                 | "inter-hunk-context"
                 | "line-prefix"
+                | "max-age"
                 | "max-count"
                 | "max-depth"
+                | "min-age"
                 | "output"
                 | "output-indicator-context"
                 | "output-indicator-new"
@@ -4315,14 +4333,42 @@ A  added.rs
         assert_eq!(tokens[1].text, "l");
         assert_eq!(tokens[1].value(&tokens), Some("100"));
 
-        // Both options git's own completion helper lists as value-taking and RTK missed; their
-        // values were read as pathspecs, and RTK then spliced flags between flag and value.
-        for opt in ["ignore-matching-lines", "stat-graph-width"] {
+        // Options git's own completion helper lists as value-taking that RTK had missed: their
+        // values were read as free positionals, which is what the project-path and pathspec
+        // logic keys on.
+        for opt in [
+            "ignore-matching-lines",
+            "stat-graph-width",
+            "max-age",
+            "min-age",
+        ] {
             let args = vec![format!("--{opt}"), "x".to_string(), "HEAD".to_string()];
             let tokens = tokenize_git_diff_args(&args);
             assert_eq!(tokens[0].value(&tokens), Some("x"), "--{opt}");
-            assert_eq!(git_option_insert_point(&tokens, args.len()), 2, "--{opt}");
+            assert!(
+                !tokens[1].is_free_positional(),
+                "--{opt}'s value must not read as a positional"
+            );
         }
+    }
+
+    #[test]
+    fn test_patch_shape_removal_keeps_the_rest_of_a_cluster() {
+        // Every short flag in `-pl` shares one source_index, so dropping the whole arg took
+        // `-l` with it and left its `100` behind as a bogus revision.
+        let rebuild = |args: &[&str]| -> Vec<String> {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let tokens = tokenize_git_diff_args(&args);
+            args_without_patch_shape(&args, &tokens)
+        };
+
+        assert_eq!(rebuild(&["-pl", "100"]), vec!["-l", "100"]);
+        assert_eq!(rebuild(&["-pw"]), vec!["-w"]);
+        assert_eq!(rebuild(&["-wU2"]), vec!["-w"]);
+        assert_eq!(rebuild(&["-p"]), Vec::<String>::new());
+        // Nothing to strip: flags and positionals pass through untouched.
+        assert_eq!(rebuild(&["-w", "HEAD~1", "f.txt"]), vec!["-w", "HEAD~1", "f.txt"]);
+        assert_eq!(rebuild(&["--author", "-p"]), vec!["--author", "-p"]);
     }
 
     #[test]
@@ -4332,17 +4378,17 @@ A  added.rs
         // then carried the whole patch and RTK printed it again, compacted.
         let args = vec!["HEAD~1".to_string(), "-p".to_string()];
         let tokens = tokenize_git_diff_args(&args);
-        assert_eq!(patch_shape_args(&tokens), vec![1]);
+        assert_eq!(args_without_patch_shape(&args, &tokens), vec!["HEAD~1"]);
 
         for flag in ["-p", "-u", "--patch", "-U5", "-W", "--function-context"] {
             let args = vec![flag.to_string()];
             let tokens = tokenize_git_diff_args(&args);
-            assert_eq!(patch_shape_args(&tokens), vec![0], "{flag}");
+            assert!(args_without_patch_shape(&args, &tokens).is_empty(), "{flag}");
         }
         // A flag that only tunes the diff must survive into the header.
         let args = vec!["-w".to_string()];
         let tokens = tokenize_git_diff_args(&args);
-        assert!(patch_shape_args(&tokens).is_empty());
+        assert_eq!(args_without_patch_shape(&args, &tokens), vec!["-w"]);
     }
 
     #[test]
@@ -4362,25 +4408,6 @@ A  added.rs
         let args = vec!["--check".to_string()];
         let tokens = tokenize_git_diff_args(&args);
         assert!(tokens.iter().any(requests_diff_show_raw_shape));
-    }
-
-    #[test]
-    fn test_git_option_insert_point_stops_at_the_first_non_option_argument() {
-        // git refuses an option that follows a non-option argument, so RTK's own `--no-patch
-        // --stat` has to go before a pathspec or revision, not just before `--`.
-        let point = |args: &[&str]| {
-            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-            let tokens = tokenize_git_log_args(&args);
-            git_option_insert_point(&tokens, args.len())
-        };
-
-        assert_eq!(point(&["f.txt"]), 0);
-        assert_eq!(point(&["--cached", "f.txt"]), 1);
-        assert_eq!(point(&["HEAD~1", "f.txt"]), 0);
-        assert_eq!(point(&["--", "src/"]), 0);
-        assert_eq!(point(&["-p"]), 1);
-        // A flag's own value is not a positional.
-        assert_eq!(point(&["--author", "bob"]), 2);
     }
 
     #[test]

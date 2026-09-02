@@ -874,7 +874,9 @@ fn has_trx_logger_arg(tokens: &[Token<'_>]) -> bool {
                 .filter(|t| {
                     t.kind == TokenKind::Long && !t.slash && t.text.eq_ignore_ascii_case("l")
                 })
-                .filter_map(|t| t.value(tokens)),
+                // `own`, not `tokens`: Token::value resolves `linked` as an index into the
+                // slice it is handed, so mixing the two reads a different token's text.
+                .filter_map(|t| t.value(own)),
         )
         .any(|value| {
             let lower = value.to_ascii_lowercase();

@@ -182,6 +182,7 @@ fn extract_pattern_path<T: AsRef<str>>(
     let mut has_format_flag = false;
     let mut show_file = false;
     let mut show_line_on = false;
+    let mut show_file_off = false;
     let mut show_line_off = false;
     let mut context = false;
     let mut i = 0;
@@ -203,6 +204,13 @@ fn extract_pattern_path<T: AsRef<str>>(
                 }
                 if is_show_file_token(engine, t.kind, t.text) {
                     show_file = true;
+                }
+                if is_show_file_off_token(t.kind, t.text) {
+                    show_file_off = true;
+                    // Not forwarded: RTK forces `-H` to parse the output, and the user's
+                    // `--no-filename` would win as the later flag, leaving nothing parseable.
+                    i += 1;
+                    continue;
                 }
                 if is_show_line_on_token(t.kind, t.text) {
                     show_line_on = true;
@@ -254,6 +262,12 @@ fn extract_pattern_path<T: AsRef<str>>(
                 }
                 if cluster
                     .iter()
+                    .any(|c| is_show_file_off_token(c.kind, c.text))
+                {
+                    show_file_off = true;
+                }
+                if cluster
+                    .iter()
                     .any(|c| is_show_line_on_token(c.kind, c.text))
                 {
                     show_line_on = true;
@@ -276,8 +290,14 @@ fn extract_pattern_path<T: AsRef<str>>(
                     _ => (cluster, None),
                 };
 
-                if !bool_chars.is_empty() {
-                    let glued: String = bool_chars.iter().map(|c| c.text).collect();
+                // `-h` drops out of the cluster for the same reason as its long form: RTK
+                // forces `-H` to parse the output and the user's later `-h` would win.
+                let glued: String = bool_chars
+                    .iter()
+                    .filter(|c| !is_show_file_off_token(c.kind, c.text))
+                    .map(|c| c.text)
+                    .collect();
+                if !glued.is_empty() {
                     flags.push(format!("-{glued}"));
                 }
 
@@ -294,6 +314,13 @@ fn extract_pattern_path<T: AsRef<str>>(
                         }
                         flags.push(format!("-{}", vt.text));
                         if let Some(v) = value {
+                            // rg accepts `-A=1` and strips the `=` itself; GNU grep does not
+                            // ("invalid context length argument"), so only rg's value is
+                            // unwrapped -- re-emitting `=1` as its own arg broke rg's parse.
+                            let v = match engine {
+                                Engine::Rg => v.strip_prefix('=').unwrap_or(v),
+                                Engine::Grep => v,
+                            };
                             flags.push(v.to_string());
                         }
                     }
@@ -319,6 +346,7 @@ fn extract_pattern_path<T: AsRef<str>>(
 
     let detected = DetectedFlags {
         show_file,
+        show_file_off,
         show_line: show_line_on && !show_line_off,
         context,
     };
@@ -479,7 +507,8 @@ fn run_streaming_search(
     detected_flags: DetectedFlags,
 ) -> Result<i32> {
     let filter = SearchStreamFilter {
-        show_file: wants_show_file(paths, detected_flags.show_file),
+        show_file: !detected_flags.show_file_off
+            && wants_show_file(paths, detected_flags.show_file),
         show_line: detected_flags.show_line,
         max_results,
         shown: 0,
@@ -559,6 +588,16 @@ pub fn run(
         (t.kind == TokenKind::Long && matches!(t.text, "version" | "help"))
             || (t.kind == TokenKind::Short && t.text == "h" && engine == Engine::Rg)
     });
+    let dangling_value_flag = help_tokens.iter().any(|t| {
+        matches!(t.kind, TokenKind::Long | TokenKind::Short)
+            && search_takes_value(engine, t.kind, t.text)
+            && t.value(&help_tokens).is_none()
+    });
+    if dangling_value_flag {
+        let real_cmd = format!("{} {}", engine.bin(), args.join(" "));
+        return passthrough(&timer, engine, args, &real_cmd, false);
+    }
+
     if asks_for_help {
         let mut cmd = resolved_command(engine.bin());
         cmd.args(args);
@@ -672,8 +711,8 @@ pub fn run(
     // reads stdin instead (whatever stdin is), where a filename would be `(standard input)`,
     // so the same reasoning does not carry over.
     let walks_cwd = engine == Engine::Rg && paths.is_empty();
-    let show_file =
-        by_file.len() > 1 || walks_cwd || wants_show_file(&paths, detected_flags.show_file);
+    let show_file = !detected_flags.show_file_off
+        && (by_file.len() > 1 || walks_cwd || wants_show_file(&paths, detected_flags.show_file));
     let show_line = detected_flags.show_line;
 
     // Faithful baseline: exactly what the real command prints, full content.
@@ -839,7 +878,7 @@ fn is_format_flag_token(engine: Engine, kind: TokenKind, text: &str) -> bool {
 /// True for a token requesting "show which file each match came from" -- `-H`/`--with-filename`
 /// (same meaning for both engines); `-r`/`--recursive` (grep-only: recursive descent implies
 /// multiple files, so the filename is shown -- ripgrep's `-r` is `--replace`, an unrelated
-/// value-taking flag, see [`is_short_value_flag`]); `-R` (grep's `--dereference-recursive`;
+/// value-taking flag, see [`rg_takes_value`]); `-R` (grep's `--dereference-recursive`;
 /// ripgrep has no `-R` at all, so gating by engine is precise but not load-bearing).
 fn is_show_file_token(engine: Engine, kind: TokenKind, text: &str) -> bool {
     match kind {
@@ -858,6 +897,17 @@ fn is_show_line_on_token(kind: TokenKind, text: &str) -> bool {
     match kind {
         TokenKind::Long => text == "line-number",
         TokenKind::Short => text == "n",
+        _ => false,
+    }
+}
+
+/// True for `-h`/`--no-filename` (negates [`is_show_file_token`]). RTK forces `-H` so it can
+/// parse the output, so the user's request has to be honoured at display time instead --
+/// leaving it in the engine command would defeat RTK's own parse and force a second run.
+fn is_show_file_off_token(kind: TokenKind, text: &str) -> bool {
+    match kind {
+        TokenKind::Long => text == "no-filename",
+        TokenKind::Short => text == "h",
         _ => false,
     }
 }
@@ -888,7 +938,7 @@ fn is_context_token(engine: Engine, kind: TokenKind, text: &str) -> bool {
 
 /// Flags detected during [`extract_pattern_path`]'s own token pass, replacing the
 /// reconstructed-string scans `show_file`/`show_line`/`has_context_flag` used to rely on (see
-/// `has_short_flag`'s doc for the ambiguity this avoids: a value-taking flag's own value,
+/// the ambiguity this avoids: a value-taking flag's own value,
 /// pushed into `flags` as a bare string, could otherwise be misread as one of these).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct DetectedFlags {
@@ -897,6 +947,8 @@ struct DetectedFlags {
     /// directory among them) `show_file` also considers; those are checked directly against
     /// `paths` at the call site instead.
     show_file: bool,
+    /// `-h`/`--no-filename`: the user asked for bare lines, whatever the paths imply.
+    show_file_off: bool,
     /// `-n`/`--line-number`, unless negated by `-N`/`--no-line-number`.
     show_line: bool,
     /// `-A`/`-B`/`-C` or their long forms.
@@ -1134,6 +1186,33 @@ mod tests {
         // `-h` is rg's --help but grep's --no-filename.
         assert!(asks(Engine::Rg, &["-h"]));
         assert!(!asks(Engine::Grep, &["-h", "TODO", "f.txt"]));
+    }
+
+    #[test]
+    fn test_no_filename_is_honoured_at_display_not_forwarded() {
+        // RTK forces `-H` so it can parse the output, so the user's `-h`/`--no-filename` has to
+        // be applied when printing -- forwarded, it wins as the later flag, the NUL-separated
+        // parse fails on every line, and the whole search runs a second time.
+        let (_, _, flags, _, detected) =
+            extract_pattern_path(&["--no-filename", "x", "a.txt"], Engine::Grep);
+        assert!(detected.show_file_off);
+        assert!(!flags.iter().any(|f| f == "--no-filename"));
+
+        let (_, _, flags, _, detected) =
+            extract_pattern_path(&["-ih", "x", "a.txt"], Engine::Grep);
+        assert!(detected.show_file_off);
+        assert_eq!(flags, vec!["-i"], "the rest of the cluster survives");
+    }
+
+    #[test]
+    fn test_rg_unwraps_an_equals_attached_short_value_but_grep_does_not() {
+        // rg accepts `-A=1` and strips the `=`; GNU grep answers "invalid context length
+        // argument", so RTK must not normalise it for grep.
+        let (_, _, flags, _, _) = extract_pattern_path(&["-A=1", "x", "a.txt"], Engine::Rg);
+        assert_eq!(flags, vec!["-A", "1"]);
+
+        let (_, _, flags, _, _) = extract_pattern_path(&["-A=1", "x", "a.txt"], Engine::Grep);
+        assert_eq!(flags, vec!["-A", "=1"]);
     }
 
     #[test]

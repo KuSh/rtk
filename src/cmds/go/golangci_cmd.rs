@@ -286,15 +286,35 @@ fn build_filtered_args(invocation: &RunInvocation, version: u32) -> Vec<String> 
     args
 }
 
-/// Any user-chosen output destination, not just the two RTK itself injects: golangci-lint 2.x
-/// has one `--output.<format>.path` per format, and adding a second sink makes it write two
-/// reports to stdout, which the JSON parse then chokes on.
+/// The nine `--output.<format>.path` sinks golangci-lint 2.x accepts, enumerated rather than
+/// pattern-matched: `starts_with("output.")` would also swallow spellings golangci rejects.
+const OUTPUT_PATH_FLAGS: &[&str] = &[
+    "output.checkstyle.path",
+    "output.code-climate.path",
+    "output.html.path",
+    "output.json.path",
+    "output.junit-xml.path",
+    "output.sarif.path",
+    "output.tab.path",
+    "output.teamcity.path",
+    "output.text.path",
+];
+
+/// True when the user already directs a report at **stdout**, which is the only case where
+/// RTK's own `--output.json.path stdout` would collide: two reports interleaved there, and the
+/// JSON parse chokes on whichever lands first. A sink pointing at a *file* takes nothing away
+/// from stdout, so RTK still has to inject its own or it is left with nothing to parse.
 fn has_output_flag(args: &[String]) -> bool {
     let tokens = arg_tokenizer::tokenize(args, &golangci_run_takes_value);
     tokens.iter().any(|t| {
-        t.kind == TokenKind::Long
-            && (t.text == "out-format"
-                || (t.text.starts_with("output.") && t.text.ends_with(".path")))
+        if t.kind != TokenKind::Long {
+            return false;
+        }
+        if t.text == "out-format" {
+            return true;
+        }
+        OUTPUT_PATH_FLAGS.contains(&t.text)
+            && t.value(&tokens).is_none_or(|dest| dest == "stdout")
     })
 }
 
