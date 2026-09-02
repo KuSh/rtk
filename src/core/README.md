@@ -111,7 +111,14 @@ Key functions available to all command modules:
 
 Shared classifier for an already-`--`-restored args slice (see `args_utils::restore_double_dash`) into flags, their values, and positionals. `tokenize`/`tokenize_with_options` take a `takes_value(kind, name)` predicate the caller supplies — the list of which flags take a value is per-tool, but the token-walking around it isn't.
 
-**Design rule: one grammar per subcommand.** Never reuse a sibling command's predicate wholesale just because it looks close enough — e.g. `-u` means `-p` in `git log` but `--include-untracked` in `git stash show`. Verify against the real tool rather than assuming it matches a sibling.
+**Use it for anything that decides what an argument is.** A new command filter, a new flag on an existing one, or a fix to how one is detected goes through `tokenize`/`tokenize_with_options` — not `starts_with('-')`, not `args.iter().any(|a| a == "--flag")`. Those miss exactly what this module exists for: a flag's own value (`git log --grep -p` searches for the string "-p"), an attached value (`--flag=v`, `/bl:x`), a short cluster (`-rn`), and everything past `--`. Every bug the migration fixed was one of those four.
+
+Four rules, each of which cost a real bug before it was written down:
+
+- **One grammar per tool and subcommand.** Never reuse a sibling's predicate wholesale because it looks close enough — `-u` means `-p` in `git log` but `--include-untracked` in `git stash show`, and `-T` is `--initial-tab` in grep but `--type-not` in rg. Transcribe from the tool's own `--help` and verify against the real binary; grep and rg share 13 of ~50 value-taking flags, so one merged table is wrong for both.
+- **Scope the lookup to the region the tool parses.** Everything past `--` is a pathspec or an argument forwarded to another program — `before_dashdash` gives the tool's own tokens. `Dialect::Msbuild` keeps classifying past the boundary (it forwards rather than ending option parsing), which makes this explicit slice mandatory there, not optional.
+- **Inject before the boundary.** RTK's own flags go at `injection_point`, never appended: dotnet parks anything after `--` in UnparsedTokens and git reads it as a pathspec, so an appended `--verify-no-changes` silently does nothing.
+- **Detect and act with one rule.** Strip or inject using the detected token's `source_index`; re-matching the text lets the two disagree, which deleted a pathspec named `--no-compact` and swallowed a forwarded `--write`.
 
 `TokenizeOptions` (passed to `tokenize_with_options`) is where a subcommand's grammar exceptions live: `dialect`, `takes_separate_value`, `claims_literal_dash_dash` (does a value-taking flag consume a literal `--` as its value, or is `--` the end-of-options boundary — this is a per-tool split). All default to the common case.
 
