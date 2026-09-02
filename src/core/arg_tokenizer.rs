@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn dash_p_after_double_dash_is_positional_not_a_flag() {
         // Regression: `git log -- -p` must not misread the pathspec "-p" as the patch flag
-        // (rtk commits 40e4f3a, f8d636d).
+        //.
         let args = owned(&["--", "-p"]);
         let tokens = tokenize(&args, &no_values);
 
@@ -553,7 +553,7 @@ mod tests {
     #[test]
     fn value_taking_long_flag_consumes_and_links_next_token() {
         // Regression: `--grep -p` must treat "-p" as --grep's value, not the patch flag
-        // (rtk commits 9bbf55c, 3cc80b2).
+        //.
         let args = owned(&["--grep", "-p"]);
         let tokens = tokenize(&args, &|kind, name| {
             kind == TokenKind::Long && name == "grep"
@@ -647,7 +647,7 @@ mod tests {
     #[test]
     fn optional_value_long_flags_do_not_consume_next_token() {
         // Regression: -U / --unified / --expand-tabs / --max-parents only take an *attached*
-        // value; a following bare token is not theirs (rtk commits 705a2f8, 1a1b306).
+        // value; a following bare token is not theirs.
         for flag in ["unified", "expand-tabs", "max-parents"] {
             let args = owned(&[&format!("--{flag}"), "-p"]);
             let tokens = tokenize(&args, &no_values);

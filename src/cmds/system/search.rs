@@ -126,9 +126,9 @@ fn rg_takes_value(kind: TokenKind, name: &str) -> bool {
     }
 }
 
-/// rg accepts `-A=1`/`-e=PAT` and strips the `=` itself; GNU grep does not ("invalid context
-/// length argument"), so only rg's value is unwrapped -- re-emitting `=1` as its own argument
-/// broke rg's parse, and keeping it in a pattern made the search match nothing.
+/// rg accepts the attached spellings `-A=1`/`-e=PAT` and strips the `=` itself; GNU grep does
+/// not ("invalid context length argument"), so only rg's is unwrapped. Attached only: a
+/// separate-token value is the user's own text, and `rg -e '=='` must search for `==`.
 fn unwrap_attached_value(engine: Engine, value: &str) -> &str {
     match engine {
         Engine::Rg => value.strip_prefix('=').unwrap_or(value),
@@ -199,6 +199,7 @@ fn extract_pattern_path<T: AsRef<str>>(
     // `None` until the user says either way; the last spelling wins, as both engines do.
     let mut show_file_flag: Option<bool> = None;
     let mut show_line_flag: Option<bool> = None;
+    let mut recursive = false;
     let mut context = false;
     let mut i = 0;
 
@@ -217,8 +218,11 @@ fn extract_pattern_path<T: AsRef<str>>(
                 if is_format_flag_token(engine, t.kind, t.text) {
                     has_format_flag = true;
                 }
-                if is_show_file_token(engine, t.kind, t.text) {
+                if is_show_file_token(t.kind, t.text) {
                     show_file_flag = Some(true);
+                }
+                if is_recursive_token(engine, t.kind, t.text) {
+                    recursive = true;
                 }
                 if is_show_line_on_token(t.kind, t.text) {
                     show_line_flag = Some(true);
@@ -226,12 +230,12 @@ fn extract_pattern_path<T: AsRef<str>>(
                 // Neither negation is forwarded: RTK forces `-nH` so it can parse the output,
                 // and the user's `--no-filename`/`--no-line-number` would win as the later
                 // flag, leaving nothing parseable and forcing a second run of the whole search.
-                if is_show_file_off_token(t.kind, t.text) {
+                if is_show_file_off_token(engine, t.kind, t.text) {
                     show_file_flag = Some(false);
                     i += 1;
                     continue;
                 }
-                if is_show_line_off_token(t.kind, t.text) {
+                if is_show_line_off_token(engine, t.kind, t.text) {
                     show_line_flag = Some(false);
                     i += 1;
                     continue;
@@ -275,15 +279,18 @@ fn extract_pattern_path<T: AsRef<str>>(
                 // Letter by letter, so `-hH` and `-Hh` land where the engine lands them: the
                 // later spelling wins.
                 for c in cluster {
-                    if is_show_file_token(engine, c.kind, c.text) {
+                    if is_show_file_token(c.kind, c.text) {
                         show_file_flag = Some(true);
-                    } else if is_show_file_off_token(c.kind, c.text) {
+                    } else if is_show_file_off_token(engine, c.kind, c.text) {
                         show_file_flag = Some(false);
                     }
                     if is_show_line_on_token(c.kind, c.text) {
                         show_line_flag = Some(true);
-                    } else if is_show_line_off_token(c.kind, c.text) {
+                    } else if is_show_line_off_token(engine, c.kind, c.text) {
                         show_line_flag = Some(false);
+                    }
+                    if is_recursive_token(engine, c.kind, c.text) {
+                        recursive = true;
                     }
                 }
                 if cluster.iter().any(|c| is_context_token(engine, c.kind, c.text)) {
@@ -303,8 +310,8 @@ fn extract_pattern_path<T: AsRef<str>>(
                 let glued: String = bool_chars
                     .iter()
                     .filter(|c| {
-                        !is_show_file_off_token(c.kind, c.text)
-                            && !is_show_line_off_token(c.kind, c.text)
+                        !is_show_file_off_token(engine, c.kind, c.text)
+                            && !is_show_line_off_token(engine, c.kind, c.text)
                     })
                     .map(|c| c.text)
                     .collect();
@@ -313,12 +320,13 @@ fn extract_pattern_path<T: AsRef<str>>(
                 }
 
                 if let Some(vt) = value_char {
-                    let value = vt.value(&tokens);
+                    let value = match vt.attached {
+                        Some(attached) => Some(unwrap_attached_value(engine, attached)),
+                        None => vt.value(&tokens),
+                    };
                     if vt.text == "e" {
                         match value {
-                            // `-e=PAT` is rg's own spelling for `-e PAT`; keeping the `=` made
-                            // it part of the pattern and the search silently matched nothing.
-                            Some(v) => e_patterns.push(unwrap_attached_value(engine, v).to_string()),
+                            Some(v) => e_patterns.push(v.to_string()),
                             None => flags.push("-e".to_string()),
                         }
                     } else {
@@ -327,7 +335,7 @@ fn extract_pattern_path<T: AsRef<str>>(
                         }
                         flags.push(format!("-{}", vt.text));
                         if let Some(v) = value {
-                            flags.push(unwrap_attached_value(engine, v).to_string());
+                            flags.push(v.to_string());
                         }
                     }
                 }
@@ -353,6 +361,7 @@ fn extract_pattern_path<T: AsRef<str>>(
     let detected = DetectedFlags {
         show_file: show_file_flag,
         show_line: show_line_flag.unwrap_or(false),
+        recursive,
         context,
     };
 
@@ -514,7 +523,7 @@ fn run_streaming_search(
     let filter = SearchStreamFilter {
         show_file: detected_flags
             .show_file
-            .unwrap_or_else(|| wants_show_file(paths, false)),
+            .unwrap_or_else(|| wants_show_file(paths, detected_flags.recursive)),
         show_line: detected_flags.show_line,
         max_results,
         shown: 0,
@@ -714,7 +723,7 @@ pub fn run(
     // so the same reasoning does not carry over.
     let walks_cwd = engine == Engine::Rg && paths.is_empty();
     let show_file = detected_flags.show_file.unwrap_or_else(|| {
-        by_file.len() > 1 || walks_cwd || wants_show_file(&paths, false)
+        by_file.len() > 1 || walks_cwd || wants_show_file(&paths, detected_flags.recursive)
     });
     let show_line = detected_flags.show_line;
 
@@ -878,21 +887,27 @@ fn is_format_flag_token(engine: Engine, kind: TokenKind, text: &str) -> bool {
     }
 }
 
-/// True for a token requesting "show which file each match came from" -- `-H`/`--with-filename`
-/// (same meaning for both engines); `-r`/`--recursive` (grep-only: recursive descent implies
-/// multiple files, so the filename is shown -- ripgrep's `-r` is `--replace`, an unrelated
-/// value-taking flag, see [`rg_takes_value`]); `-R` (grep's `--dereference-recursive`;
-/// ripgrep has no `-R` at all, so gating by engine is precise but not load-bearing).
-fn is_show_file_token(engine: Engine, kind: TokenKind, text: &str) -> bool {
+/// True for `-H`/`--with-filename`, an explicit request for the filename prefix (same meaning
+/// for both engines).
+fn is_show_file_token(kind: TokenKind, text: &str) -> bool {
     match kind {
-        TokenKind::Long => matches!(text, "recursive" | "with-filename"),
-        TokenKind::Short => match text {
-            "H" => true,
-            "R" | "r" => engine == Engine::Grep,
-            _ => false,
-        },
+        TokenKind::Long => text == "with-filename",
+        TokenKind::Short => text == "H",
         _ => false,
     }
+}
+
+/// True for grep's `-r`/`-R`/`--recursive`. Recursion is not a filename request: it only makes
+/// the search span several files, so grep shows the prefix by default -- an explicit `-h` still
+/// wins whichever side of it the recursion flag is typed on. ripgrep has none of these
+/// spellings (`-r` is `--replace`, a value-taking flag, see [`rg_takes_value`]).
+fn is_recursive_token(engine: Engine, kind: TokenKind, text: &str) -> bool {
+    engine == Engine::Grep
+        && match kind {
+            TokenKind::Long => text == "recursive",
+            TokenKind::Short => matches!(text, "R" | "r"),
+            _ => false,
+        }
 }
 
 /// True for `-n`/`--line-number` (identical meaning for both engines).
@@ -907,21 +922,30 @@ fn is_show_line_on_token(kind: TokenKind, text: &str) -> bool {
 /// True for `-h`/`--no-filename` (negates [`is_show_file_token`]). RTK forces `-H` so it can
 /// parse the output, so the user's request has to be honoured at display time instead --
 /// leaving it in the engine command would defeat RTK's own parse and force a second run.
-fn is_show_file_off_token(kind: TokenKind, text: &str) -> bool {
+fn is_show_file_off_token(engine: Engine, kind: TokenKind, text: &str) -> bool {
     match kind {
         TokenKind::Long => text == "no-filename",
-        TokenKind::Short => text == "h",
+        // Divergent both ways: grep's `-h` is --no-filename where rg's is --help, and rg's
+        // `-I` is --no-filename where grep's is --binary-files=without-match.
+        TokenKind::Short => match text {
+            "h" => engine == Engine::Grep,
+            "I" => engine == Engine::Rg,
+            _ => false,
+        },
         _ => false,
     }
 }
 
-/// True for `-N`/`--no-line-number` (negates [`is_show_line_on_token`]).
-fn is_show_line_off_token(kind: TokenKind, text: &str) -> bool {
-    match kind {
-        TokenKind::Long => text == "no-line-number",
-        TokenKind::Short => text == "N",
-        _ => false,
-    }
+/// True for `-N`/`--no-line-number` (negates [`is_show_line_on_token`]). ripgrep-only: GNU grep
+/// has neither spelling and exits 2 on both, so recognising them there would swallow a flag the
+/// engine itself refuses.
+fn is_show_line_off_token(engine: Engine, kind: TokenKind, text: &str) -> bool {
+    engine == Engine::Rg
+        && match kind {
+            TokenKind::Long => text == "no-line-number",
+            TokenKind::Short => text == "N",
+            _ => false,
+        }
 }
 
 /// True for a context-window flag: `-A`/`-B`/`-C`, their long forms, or -- grep only -- the
@@ -945,13 +969,16 @@ fn is_context_token(engine: Engine, kind: TokenKind, text: &str) -> bool {
 /// pushed into `flags` as a bare string, could otherwise be misread as one of these).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct DetectedFlags {
-    /// What the user asked for with `-H`/`-r`/`-R`/`--with-filename` (`Some(true)`) or
+    /// What the user asked for with `-H`/`--with-filename` (`Some(true)`) or
     /// `-h`/`--no-filename` (`Some(false)`), last spelling winning as both engines do; `None`
-    /// when they said neither, leaving the decision to the paths (multiple paths, a directory
-    /// among them), which the call sites check against `paths` themselves.
+    /// when they said neither, leaving the decision to `recursive` and to the paths (multiple
+    /// paths, a directory among them), which the call sites check against `paths` themselves.
     show_file: Option<bool>,
     /// `-n`/`--line-number`, unless negated by `-N`/`--no-line-number`.
     show_line: bool,
+    /// grep's `-r`/`-R`/`--recursive`: not a filename request, only a reason for the engine to
+    /// show one by default, so it feeds `show_file`'s fallback rather than overriding it.
+    recursive: bool,
     /// `-A`/`-B`/`-C` or their long forms.
     context: bool,
 }
@@ -1784,9 +1811,13 @@ mod tests {
     /// What production computes for these args, so a change to the real detector shows up here
     /// rather than only in a test-only twin of it.
     fn detected(args: &[&str]) -> DetectedFlags {
+        detected_for(Engine::Grep, args)
+    }
+
+    fn detected_for(engine: Engine, args: &[&str]) -> DetectedFlags {
         let mut with_pattern = vec!["pattern"];
         with_pattern.extend_from_slice(args);
-        extract_pattern_path(&with_pattern, Engine::Grep).4
+        extract_pattern_path(&with_pattern, engine).4
     }
 
     #[test]
@@ -1808,9 +1839,43 @@ mod tests {
     #[test]
     fn show_line_is_off_when_explicitly_negated() {
         // `-n` has to be present, or the assertion holds whether or not the negation works.
-        assert!(detected(&["-n"]).show_line);
-        assert!(!detected(&["-n", "-N"]).show_line);
-        assert!(!detected(&["-n", "--no-line-number"]).show_line);
+        assert!(detected_for(Engine::Rg, &["-n"]).show_line);
+        assert!(!detected_for(Engine::Rg, &["-n", "-N"]).show_line);
+        assert!(!detected_for(Engine::Rg, &["-n", "--no-line-number"]).show_line);
+    }
+
+    #[test]
+    fn grep_does_not_claim_ripgrep_only_line_number_negations() {
+        // Real grep 3.12 exits 2 on both spellings; swallowing them would report a match for a
+        // command the engine refuses to run.
+        for negation in ["-N", "--no-line-number"] {
+            let (_, _, flags, _, detected) =
+                extract_pattern_path(&["pattern", "-n", negation], Engine::Grep);
+            assert!(detected.show_line, "{negation} is not grep's, so -n still stands");
+            assert!(flags.iter().any(|f| f == negation), "{negation} must reach grep");
+        }
+    }
+
+    #[test]
+    fn recursion_does_not_outrank_an_explicit_no_filename() {
+        // Real grep: `-hr` and `-rh` both drop the prefix -- `-r` only makes the search span
+        // several files, it is not the counterpart of `-h` the way `-H` is.
+        assert_eq!(detected(&["-rh"]).show_file, Some(false));
+        assert_eq!(detected(&["-hr"]).show_file, Some(false));
+        assert_eq!(detected(&["-h", "-r"]).show_file, Some(false));
+        assert_eq!(detected(&["-rH"]).show_file, Some(true));
+        assert_eq!(detected(&["-Hr"]).show_file, Some(true));
+    }
+
+    #[test]
+    fn recursion_alone_still_asks_for_the_filename() {
+        for args in [&["-r"][..], &["-R"][..], &["--recursive"][..]] {
+            let d = detected(args);
+            assert_eq!(d.show_file, None, "{args:?} is not an explicit request");
+            assert!(d.recursive, "{args:?} must feed show_file's fallback");
+        }
+        // ripgrep's `-r` is `--replace`, so its value must not be read as recursion.
+        assert!(!detected_for(Engine::Rg, &["-r", "X"]).recursive);
     }
 
     #[test]

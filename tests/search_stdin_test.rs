@@ -75,7 +75,10 @@ fn both_engines_read_a_redirected_file_on_stdin() {
     // than the cwd's.
     let dir = tempfile::tempdir().expect("test setup");
     std::fs::write(dir.path().join("a.txt"), "foo from the cwd\n").expect("test setup");
-    let piped = dir.path().join("piped.log");
+    // The fixture lives outside the searched directory: inside it, an engine that ignored
+    // stdin and walked the cwd would still print "foo from stdin" and the test would pass.
+    let elsewhere = tempfile::tempdir().expect("test setup");
+    let piped = elsewhere.path().join("piped.log");
     std::fs::write(&piped, "foo from stdin\n").expect("test setup");
 
     for engine in ["grep", "rg"] {
@@ -93,6 +96,10 @@ fn both_engines_read_a_redirected_file_on_stdin() {
         assert!(
             stdout.contains("foo from stdin"),
             "{engine} did not read stdin: {stdout}"
+        );
+        assert!(
+            !stdout.contains("foo from the cwd"),
+            "{engine} walked the cwd instead of reading stdin: {stdout}"
         );
     }
 }

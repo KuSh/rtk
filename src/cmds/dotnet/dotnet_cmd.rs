@@ -869,8 +869,8 @@ fn has_nologo_arg(tokens: &[Token<'_>]) -> bool {
 fn has_trx_logger_arg(tokens: &[Token<'_>]) -> bool {
     // --logger can legitimately repeat (e.g. `--logger "console;verbosity=normal" --logger
     // trx`), so every occurrence must be checked, not just the first. `-l` is dotnet's own
-    // alias for it; MSBuild's `/l:` is an unrelated logger-assembly switch, so the slash
-    // spelling is excluded.
+    // alias for it, single-dash only: MSBuild's `/l:` is an unrelated logger-assembly switch,
+    // and `--l` is not a dotnet spelling at all (System.CommandLine does no abbreviation).
     //
     // Scoped to dotnet's own region, unlike the results-directory lookups below: `dotnet test
     // --help` says the arguments after `--` go "to the application that is being run", so a
@@ -880,7 +880,10 @@ fn has_trx_logger_arg(tokens: &[Token<'_>]) -> bool {
         .chain(
             own.iter()
                 .filter(|t| {
-                    t.kind == TokenKind::Long && !t.slash && t.text.eq_ignore_ascii_case("l")
+                    t.kind == TokenKind::Long
+                        && !t.slash
+                        && !t.double_dash
+                        && t.text.eq_ignore_ascii_case("l")
                 })
                 // `own`, not `tokens`: Token::value resolves `linked` as an index into the
                 // slice it is handed, so mixing the two reads a different token's text.
@@ -936,8 +939,9 @@ fn has_verify_no_changes_arg(tokens: &[Token<'_>]) -> bool {
 
 /// The `--write` tokens RTK owns: its own pseudo-flag, stripped before forwarding to real
 /// dotnet (which has no `--write`). Detection and stripping both go through here so they
-/// cannot drift -- an attached `--write=true` is not RTK's flag and must pass through, and one
-/// past `--` belongs to whatever dotnet forwards to.
+/// cannot drift -- an attached `--write=true` is not RTK's flag and must pass through, while
+/// one past `--` is still RTK's, since no dotnet option of that name exists for the boundary
+/// to be forwarding it to.
 fn write_override_tokens<'t, 'a>(
     tokens: &'t [Token<'a>],
 ) -> impl Iterator<Item = &'t Token<'a>> + 't {
