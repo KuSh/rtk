@@ -210,7 +210,7 @@ fn extract_pattern_path<T: AsRef<str>>(
                 if is_show_line_off_token(t.kind, t.text) {
                     show_line_off = true;
                 }
-                if is_context_token(t.kind, t.text) {
+                if is_context_token(engine, t.kind, t.text) {
                     context = true;
                 }
                 match t.attached {
@@ -264,7 +264,7 @@ fn extract_pattern_path<T: AsRef<str>>(
                 {
                     show_line_off = true;
                 }
-                if cluster.iter().any(|c| is_context_token(c.kind, c.text)) {
+                if cluster.iter().any(|c| is_context_token(engine, c.kind, c.text)) {
                     context = true;
                 }
                 let (bool_chars, value_char) = match cluster.split_last() {
@@ -871,13 +871,16 @@ fn is_show_line_off_token(kind: TokenKind, text: &str) -> bool {
     }
 }
 
-/// True for a context-window flag: `-A`/`-B`/`-C`, their long forms, or grep's `-NUM`
-/// shorthand for `--context=NUM` (the tokenizer keeps that digit run as one `Short` token).
-fn is_context_token(kind: TokenKind, text: &str) -> bool {
+/// True for a context-window flag: `-A`/`-B`/`-C`, their long forms, or -- grep only -- the
+/// `-NUM` shorthand for `--context=NUM` (the tokenizer keeps that digit run as one `Short`
+/// token). ripgrep has no `-NUM`; its `-0` is `--null`, so reading a digit as context there
+/// changes the output shape for a flag that has nothing to do with context.
+fn is_context_token(engine: Engine, kind: TokenKind, text: &str) -> bool {
     match kind {
         TokenKind::Long => matches!(text, "after-context" | "before-context" | "context"),
         TokenKind::Short => {
-            matches!(text, "A" | "B" | "C") || arg_tokenizer::is_digit_run(text)
+            matches!(text, "A" | "B" | "C")
+                || (engine == Engine::Grep && arg_tokenizer::is_digit_run(text))
         }
         _ => false,
     }
@@ -1102,11 +1105,11 @@ mod tests {
     fn test_context_detection_covers_greps_numeric_shorthand() {
         // grep's `-1` is `--context=1`. Missing it dropped the `--` separators between
         // non-contiguous context blocks, so two far-apart hunks read as one run.
-        assert!(is_context_token(TokenKind::Short, "1"));
-        assert!(is_context_token(TokenKind::Short, "12"));
-        assert!(is_context_token(TokenKind::Short, "C"));
-        assert!(is_context_token(TokenKind::Long, "context"));
-        assert!(!is_context_token(TokenKind::Short, "n"));
+        assert!(is_context_token(Engine::Grep, TokenKind::Short, "1"));
+        assert!(is_context_token(Engine::Grep, TokenKind::Short, "12"));
+        assert!(is_context_token(Engine::Grep, TokenKind::Short, "C"));
+        assert!(is_context_token(Engine::Grep, TokenKind::Long, "context"));
+        assert!(!is_context_token(Engine::Grep, TokenKind::Short, "n"));
 
         let (_, _, _, _, detected) = extract_pattern_path(&["-1", "TODO", "f.txt"], Engine::Grep);
         assert!(detected.context);

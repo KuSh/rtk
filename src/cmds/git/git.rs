@@ -143,6 +143,32 @@ fn split_stash_region(region: &[String]) -> (Option<String>, Vec<String>) {
     }
 }
 
+/// `-s`/`--no-patch` ask `git diff` for no body at all, so there is nothing to compact and
+/// RTK's own `--stat` header would answer a question the user did not ask. On `git show` the
+/// same flags ask for the commit summary, which is exactly what the compact form prints, so
+/// this is deliberately not part of [`requests_diff_show_raw_shape`].
+fn suppresses_diff_body(token: &Token<'_>) -> bool {
+    matches!(
+        (token.kind, token.text),
+        (TokenKind::Long, "no-patch") | (TokenKind::Short, "s")
+    )
+}
+
+/// Indices of the args that ask git for patch output, so a stat-only header can drop them:
+/// `-p`/`-u`/`--patch`, and the context-width flags that imply a patch (`-U3`, `--unified=3`,
+/// `-W`/`--function-context`).
+fn patch_shape_args(tokens: &[Token<'_>]) -> Vec<usize> {
+    tokens
+        .iter()
+        .filter(|t| match t.kind {
+            TokenKind::Long => matches!(t.text, "patch" | "unified" | "function-context"),
+            TokenKind::Short => matches!(t.text, "p" | "u" | "U" | "W"),
+            _ => false,
+        })
+        .map(|t| t.source_index)
+        .collect()
+}
+
 /// Where git still reads an option: before the user's `--` and before the first non-option
 /// argument, since git refuses an option that follows one ("option '--no-patch' must come
 /// before non-option arguments"). Stricter than [`arg_tokenizer::injection_point`], which only
@@ -163,15 +189,19 @@ fn run_diff(
 ) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
-    let tokens = tokenize_git_log_args(args);
-    let wants_stat = tokens.iter().any(requests_diff_show_raw_shape);
+    let tokens = tokenize_git_diff_args(args);
+    let wants_stat = tokens
+        .iter()
+        .any(|t| requests_diff_show_raw_shape(t) || suppresses_diff_body(t));
 
     // Compact diff is the default RTK behavior; --no-compact is RTK's own pseudo-flag. The
     // strip below removes the arg this token came from, so detection and removal can't
     // disagree -- re-matching the string dropped a pathspec of the same name past `--`.
+    // Any spelling counts, attached value or not: `--no-compact` is RTK's own, so git would
+    // only answer `error: invalid option` if a value form leaked through.
     let no_compact: Vec<usize> = tokens
         .iter()
-        .filter(|t| t.kind == TokenKind::Long && t.attached.is_none() && t.text == "no-compact")
+        .filter(|t| t.kind == TokenKind::Long && t.text == "no-compact")
         .map(|t| t.source_index)
         .collect();
     let wants_compact = no_compact.is_empty() && !emits_word_diff(&tokens);
@@ -190,10 +220,9 @@ fn run_diff(
         let result = exec_capture(&mut cmd).context("Failed to run git diff")?;
 
         // A non-zero exit does not mean there was nothing to say: `git diff --check` reports
-        // every whitespace error on stdout and *then* exits 2.
-        if !result.stdout.trim().is_empty() {
-            println!("{}", result.stdout.trim());
-        }
+        // every whitespace error on stdout and *then* exits 2. Printed verbatim, since the
+        // report's payload *is* trailing whitespace and `--stat` has a leading column space.
+        print!("{}", result.stdout);
 
         if !result.success() {
             if !result.stderr.trim().is_empty() {
@@ -225,11 +254,17 @@ fn run_diff(
     let mut cmd = git_cmd(global_args);
     cmd.arg("diff");
     let stat_at = git_option_insert_point(&tokens, args.len());
+    let shape_args = patch_shape_args(&tokens);
     for (index, arg) in args.iter().enumerate() {
         if index == stat_at {
             cmd.args(["--no-patch", "--stat"]);
         }
-        cmd.arg(arg);
+        // Dropped, not just outranked: git takes the last shape flag, and it accepts options
+        // after a revision (`git diff HEAD~1 -p`), where RTK's header flags can no longer be
+        // placed in front of them.
+        if !shape_args.contains(&index) {
+            cmd.arg(arg);
+        }
     }
     if stat_at == args.len() {
         cmd.args(["--no-patch", "--stat"]);
@@ -316,7 +351,7 @@ fn run_show(
 ) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
-    let tokens = tokenize_git_log_args(args);
+    let tokens = tokenize_git_diff_args(args);
     let wants_stat_only = tokens.iter().any(requests_diff_show_raw_shape);
 
     let wants_format = tokens
@@ -338,14 +373,14 @@ fn run_show(
             cmd.arg(arg);
         }
         let result = exec_capture(&mut cmd).context("Failed to run git show")?;
+        // Verbatim, and before the exit check: `git show --check` reports on stdout and then
+        // exits 2, so returning early on failure threw the whole report away.
+        print!("{}", result.stdout);
         if !result.success() {
-            eprintln!("{}", result.stderr);
+            if !result.stderr.trim().is_empty() {
+                eprintln!("{}", result.stderr.trim());
+            }
             return Ok(result.exit_code);
-        }
-        if wants_blob_show {
-            print!("{}", result.stdout);
-        } else {
-            println!("{}", result.stdout.trim());
         }
 
         timer.track(
@@ -397,7 +432,9 @@ fn run_show(
     }
 
     // Step 3: compacted diff
-    let mut diff_cmd = show_cmd(global_args, args, &tokens, &["--patch", "--pretty=format:"]);
+    // No `--patch` here: a patch is `show`'s default, and forcing it would override a user
+    // `-s`/`--no-patch`, whose whole point is that there is no body to print.
+    let mut diff_cmd = show_cmd(global_args, args, &tokens, &["--pretty=format:"]);
     let diff_result = exec_capture(&mut diff_cmd).context("Failed to run git show (diff)")?;
     let diff_text = diff_result.stdout.trim();
 
@@ -1013,12 +1050,23 @@ fn run_log(
     Ok(0)
 }
 
-/// `-n`/`-l` accept a separate-token value only when solo (`-cn 2` fails as "ambiguous
-/// argument"); `-M`/`-U`/`-C`/`-B` never do, solo or clustered.
+/// `-n`/`-l` accept a separate-token value only when solo (`git log -cn 2` and `-cl 2` both
+/// fail as "ambiguous argument"); `-M`/`-U`/`-C`/`-B` never do, solo or clustered.
 fn log_takes_separate_value(name: &str, is_solo: bool) -> bool {
     match name {
         "B" | "C" | "M" | "U" => false,
         "l" | "n" => is_solo,
+        _ => true,
+    }
+}
+
+/// Same, for `diff`/`show`, whose `-l` is the rename limit and *does* cluster: `git diff -wl
+/// 100` works where `git log -cl 2` does not. Sharing log's predicate here made RTK read the
+/// 100 as a pathspec and splice its own flags in front of it.
+fn diff_takes_separate_value(name: &str, is_solo: bool) -> bool {
+    match name {
+        "B" | "C" | "M" | "U" => false,
+        "n" => is_solo,
         _ => true,
     }
 }
@@ -1048,6 +1096,7 @@ fn log_takes_value(kind: TokenKind, name: &str) -> bool {
                 | "glob"
                 | "grep"
                 | "grep-reflog"
+                | "ignore-matching-lines"
                 | "inter-hunk-context"
                 | "line-prefix"
                 | "max-count"
@@ -1063,6 +1112,7 @@ fn log_takes_value(kind: TokenKind, name: &str) -> bool {
                 | "skip-to"
                 | "src-prefix"
                 | "stat-count"
+                | "stat-graph-width"
                 | "stat-name-width"
                 | "stat-width"
                 | "until"
@@ -1079,6 +1129,17 @@ fn log_takes_value(kind: TokenKind, name: &str) -> bool {
 }
 
 /// Shared git log/diff/show tokenization (log_takes_value/log_takes_separate_value).
+fn tokenize_git_diff_args(args: &[String]) -> Vec<Token<'_>> {
+    arg_tokenizer::tokenize_with_options(
+        args,
+        &log_takes_value,
+        arg_tokenizer::TokenizeOptions {
+            takes_separate_value: &diff_takes_separate_value,
+            ..Default::default()
+        },
+    )
+}
+
 fn tokenize_git_log_args(args: &[String]) -> Vec<Token<'_>> {
     arg_tokenizer::tokenize_with_options(
         args,
@@ -1129,12 +1190,8 @@ fn requests_raw_diff_shape(token: &Token<'_>) -> bool {
 /// rather than a request for a shape RTK can't produce. Delegates rather than repeating the
 /// Long-flag list, so the two can't silently drift apart.
 fn requests_diff_show_raw_shape(token: &Token<'_>) -> bool {
-    // Flags that suppress or replace the diff body: RTK's own `--no-patch --stat` header would
-    // override them, turning `--check`'s whitespace report (exit 2) into a diffstat (exit 0).
-    if matches!(
-        (token.kind, token.text),
-        (TokenKind::Long, "check" | "no-patch") | (TokenKind::Short, "s")
-    ) {
+    // `--check` replaces the body with a whitespace report and exits 2; nothing to compact.
+    if matches!((token.kind, token.text), (TokenKind::Long, "check")) {
         return true;
     }
     if token.kind == TokenKind::Short || (token.kind == TokenKind::Long && token.text == "patch") {
@@ -1602,6 +1659,11 @@ fn run_add(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32> 
 
         if !compact.is_empty() {
             println!("{}", compact);
+        } else if !result.stderr.trim().is_empty() {
+            // Nothing staged, but git had something to say about why (`git add --` answers
+            // "Nothing specified, nothing added" with a hint). Printing neither the count nor
+            // git's own explanation leaves the agent unable to tell that from a crash.
+            eprintln!("{}", result.stderr.trim());
         }
 
         timer.track(
@@ -1721,9 +1783,10 @@ fn run_checkout(args: &[String], verbose: u8, global_args: &[String]) -> Result<
         eprintln!("git checkout");
     }
 
-    // format_checkout_success reads git's own "Switched to branch ..." phrasing, so the child
-    // has to speak it: in any other locale the scan missed and RTK reported the raw argument.
-    let mut cmd = git_cmd_c_locale(global_args);
+    // The user's locale, per git_cmd_c_locale's own contract: this child's stderr is shown
+    // verbatim on failure. When the English "Switched to branch ..." scan misses, the
+    // args-based fallback below still names the branch.
+    let mut cmd = git_cmd(global_args);
     cmd.arg("checkout");
     for arg in args {
         cmd.arg(arg);
@@ -2405,7 +2468,7 @@ fn run_stash(
             );
         }
         Some("show") => {
-            let patch_mode = stash_show_wants_patch(args);
+            let asked_for_patch = stash_show_wants_patch(args);
 
             let mut cmd = git_cmd(global_args);
             cmd.args(["stash", "show"]);
@@ -2421,6 +2484,15 @@ fn run_stash(
                 timer.track("git stash show", "rtk git stash show", &result.stdout, "");
                 return Ok(result.exit_code);
             }
+
+            // What git actually produced settles it, not what the flags predicted: `git stash
+            // show --` (or any other extra argument) flips git to diff output, and running the
+            // stat filter over patch text yields nothing at all.
+            let patch_mode = asked_for_patch
+                || result
+                    .stdout
+                    .lines()
+                    .any(|line| line.starts_with("diff --git ") || line.starts_with("diff --cc "));
 
             // Log's grammar, unlike `stash_show_wants_patch`'s: `stash show` parses `-p`/`-u`
             // itself, but hands the rest to the revision machinery, which does consume a
@@ -2622,23 +2694,45 @@ fn run_worktree(args: &[String], verbose: u8, global_args: &[String]) -> Result<
         eprintln!("git worktree list");
     }
 
-    // A write action is the subcommand -- the first positional -- not any arg that happens to
-    // spell one (a worktree path named "move", say).
+    // The subcommand is the first positional, not any arg that happens to spell one (a
+    // worktree path named "move", say).
     let tokens = arg_tokenizer::tokenize(args, &|_, _| false);
-    let first_positional = arg_tokenizer::before_dashdash(&tokens)
+    let subcommand = arg_tokenizer::before_dashdash(&tokens)
         .iter()
-        .find(|t| t.is_free_positional());
-    let has_action = match first_positional {
-        Some(t) => matches!(
-            t.text,
-            "add" | "remove" | "prune" | "lock" | "unlock" | "move"
-        ),
-        // No subcommand before `--` at all: real git errors ("subcommand required") rather
-        // than listing, so RTK must not answer with a list of its own.
-        None => arg_tokenizer::has_dashdash(&tokens),
-    };
+        .find(|t| t.is_free_positional())
+        .map(|t| t.text);
 
-    if has_action {
+    // Only a bare listing is RTK's to compact. A write action gets the terse "ok"; everything
+    // else -- `list` with flags of its own like `--porcelain`, a subcommand git grows later,
+    // or a `--` with no subcommand, which real git rejects -- passes through verbatim, since
+    // RTK cannot know what its output means.
+    let compact_list = tokens.is_empty() || (subcommand == Some("list") && tokens.len() == 1);
+    let write_action = matches!(
+        subcommand,
+        Some("add" | "remove" | "prune" | "lock" | "unlock" | "move" | "repair")
+    );
+
+    if !compact_list && !write_action {
+        let mut cmd = git_cmd(global_args);
+        cmd.arg("worktree");
+        for arg in args {
+            cmd.arg(arg);
+        }
+        let result = exec_capture(&mut cmd).context("Failed to run git worktree")?;
+        print!("{}", result.stdout);
+        if !result.stderr.trim().is_empty() {
+            eprintln!("{}", result.stderr.trim());
+        }
+        timer.track(
+            &format!("git worktree {}", args.join(" ")),
+            &format!("rtk git worktree {} (passthrough)", args.join(" ")),
+            &result.stdout,
+            &result.stdout,
+        );
+        return Ok(result.exit_code);
+    }
+
+    if write_action {
         let mut cmd = git_cmd(global_args);
         cmd.arg("worktree");
         for arg in args {
@@ -4210,6 +4304,64 @@ A  added.rs
         // The bare, standalone form must still work as documented.
         let args = vec!["-n".to_string(), "2".to_string()];
         assert_eq!(parse_user_limit(&args), Some(2));
+    }
+
+    #[test]
+    fn test_diff_grammar_differs_from_logs_where_git_does() {
+        // `git diff -wl 100` clusters (rename limit); `git log -cl 2` does not. Sharing log's
+        // predicate made RTK read the 100 as a pathspec and splice its own flags before it.
+        let args = vec!["-wl".to_string(), "100".to_string()];
+        let tokens = tokenize_git_diff_args(&args);
+        assert_eq!(tokens[1].text, "l");
+        assert_eq!(tokens[1].value(&tokens), Some("100"));
+
+        // Both options git's own completion helper lists as value-taking and RTK missed; their
+        // values were read as pathspecs, and RTK then spliced flags between flag and value.
+        for opt in ["ignore-matching-lines", "stat-graph-width"] {
+            let args = vec![format!("--{opt}"), "x".to_string(), "HEAD".to_string()];
+            let tokens = tokenize_git_diff_args(&args);
+            assert_eq!(tokens[0].value(&tokens), Some("x"), "--{opt}");
+            assert_eq!(git_option_insert_point(&tokens, args.len()), 2, "--{opt}");
+        }
+    }
+
+    #[test]
+    fn test_diff_header_drops_the_users_patch_flags() {
+        // git takes the last shape flag and accepts options after a revision, so a `-p`
+        // written there outranks RTK's header flags wherever they are placed -- the header
+        // then carried the whole patch and RTK printed it again, compacted.
+        let args = vec!["HEAD~1".to_string(), "-p".to_string()];
+        let tokens = tokenize_git_diff_args(&args);
+        assert_eq!(patch_shape_args(&tokens), vec![1]);
+
+        for flag in ["-p", "-u", "--patch", "-U5", "-W", "--function-context"] {
+            let args = vec![flag.to_string()];
+            let tokens = tokenize_git_diff_args(&args);
+            assert_eq!(patch_shape_args(&tokens), vec![0], "{flag}");
+        }
+        // A flag that only tunes the diff must survive into the header.
+        let args = vec!["-w".to_string()];
+        let tokens = tokenize_git_diff_args(&args);
+        assert!(patch_shape_args(&tokens).is_empty());
+    }
+
+    #[test]
+    fn test_suppression_flags_are_raw_for_diff_but_compact_for_show() {
+        // `-s` asks diff for no body (nothing to compact) but asks show for the commit
+        // summary, which is exactly what the compact form prints.
+        for flag in ["-s", "--no-patch"] {
+            let args = vec![flag.to_string()];
+            let tokens = tokenize_git_diff_args(&args);
+            assert!(tokens.iter().any(suppresses_diff_body), "{flag}");
+            assert!(
+                !tokens.iter().any(requests_diff_show_raw_shape),
+                "{flag} must stay on show's compact path"
+            );
+        }
+        // --check replaces the body with a whitespace report in both.
+        let args = vec!["--check".to_string()];
+        let tokens = tokenize_git_diff_args(&args);
+        assert!(tokens.iter().any(requests_diff_show_raw_shape));
     }
 
     #[test]

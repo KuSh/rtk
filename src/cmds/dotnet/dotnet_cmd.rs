@@ -581,7 +581,9 @@ fn build_effective_dotnet_args(
 }
 
 fn has_binlog_arg(tokens: &[Token<'_>]) -> bool {
-    dotnet_has_loose_flag(tokens, "bl")
+    // Unscoped: wherever the user put `-bl`, that is the binlog that gets written, and RTK
+    // adding its own would give MSBuild two binary loggers and parse the wrong one.
+    arg_tokenizer::has_flag(tokens, Dialect::Msbuild, "bl")
 }
 
 fn has_verbosity_arg(tokens: &[Token<'_>]) -> bool {
@@ -881,7 +883,9 @@ fn has_trx_logger_arg(tokens: &[Token<'_>]) -> bool {
 }
 
 fn has_results_directory_arg(tokens: &[Token<'_>]) -> bool {
-    dotnet_has_flag(tokens, "results-directory")
+    // Unscoped for the same reason as the extraction below: in MTP bridge mode the runner's
+    // own `--results-directory` past `--` is where the TRX actually lands.
+    arg_tokenizer::has_double_dash_flag(tokens, Dialect::Msbuild, "results-directory")
 }
 
 fn has_report_arg(tokens: &[Token<'_>]) -> bool {
@@ -927,7 +931,10 @@ fn has_verify_no_changes_arg(tokens: &[Token<'_>]) -> bool {
 fn write_override_tokens<'t, 'a>(
     tokens: &'t [Token<'a>],
 ) -> impl Iterator<Item = &'t Token<'a>> + 't {
-    dotnet_own_tokens(tokens).iter().filter(|t| {
+    // Unscoped: `--write` is RTK's own pseudo-flag, so it has no dotnet counterpart that the
+    // `--` boundary could be forwarding it to -- past the boundary it would be neither
+    // honored nor stripped, and real dotnet would choke on it.
+    tokens.iter().filter(|t| {
         t.kind == TokenKind::Long
             && t.double_dash
             && t.attached.is_none()
@@ -940,7 +947,10 @@ fn has_write_mode_override(tokens: &[Token<'_>]) -> bool {
 }
 
 fn extract_results_directory_arg(tokens: &[Token<'_>]) -> Option<PathBuf> {
-    dotnet_double_dash_flag_value(tokens, "results-directory").map(PathBuf::from)
+    // Unscoped: in MTP bridge mode the runner reads its own `--results-directory` from past
+    // the `--`, and that is the directory RTK has to scan for the TRX afterwards.
+    arg_tokenizer::double_dash_flag_value(tokens, Dialect::Msbuild, "results-directory")
+        .map(PathBuf::from)
 }
 
 fn normalize_build_summary(
