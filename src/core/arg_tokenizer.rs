@@ -56,6 +56,10 @@ pub struct Token<'a> {
     /// [`has_double_dash_flag`]). Always `true` for `Long` under [`Dialect::Posix`] (its `Long`
     /// is always `--`); always `false` for `Short`/`Positional`/`DashDash`.
     pub double_dash: bool,
+    /// True for the `/flag` spelling under [`Dialect::Msbuild`], which is MSBuild's own switch
+    /// syntax rather than dotnet's CLI syntax -- `/l:` is MSBuild's logger-assembly switch, not
+    /// dotnet's `-l`/`--logger`. Always `false` otherwise.
+    pub slash: bool,
 }
 
 impl<'a> Token<'a> {
@@ -98,6 +102,26 @@ fn flag_name_matches(text: &str, name: &str, dialect: Dialect) -> bool {
 /// needs to insert/compare against raw arg indices rather than the token vec's own index.
 pub fn dashdash_index(tokens: &[Token<'_>]) -> Option<usize> {
     tokens.iter().position(|t| t.kind == TokenKind::DashDash)
+}
+
+/// The tokens before the `--` boundary, or all of them when there is none. Under
+/// [`Dialect::Msbuild`] classification continues past `--` (it forwards arguments rather than
+/// ending option parsing), so a lookup for the tool's *own* flags has to slice here first --
+/// otherwise it reads what the user forwarded to the test runner as if dotnet had seen it.
+pub fn before_dashdash<'t, 'a>(tokens: &'t [Token<'a>]) -> &'t [Token<'a>] {
+    match dashdash_index(tokens) {
+        Some(index) => &tokens[..index],
+        None => tokens,
+    }
+}
+
+/// Where RTK's own flags have to be spliced into `args`: before the user's `--`, since
+/// anything past the boundary is a pathspec or an argument forwarded to another program, not
+/// an option the tool will read. `args_len` when there is no boundary.
+pub fn injection_point(tokens: &[Token<'_>], args_len: usize) -> usize {
+    dashdash_index(tokens)
+        .map(|index| tokens[index].source_index)
+        .unwrap_or(args_len)
 }
 
 /// True if `tokens` has a `--` boundary at all.
@@ -254,22 +278,22 @@ struct Scanner<'a, 'p, T> {
 impl<'a, 'p, T: AsRef<str>> Scanner<'a, 'p, T> {
     /// Pushes one atomic (non-clustering) flag token — used for `--flag` in both dialects, and
     /// for `-flag`/`/flag` in [`Dialect::Msbuild`]. `rest` is the flag text with its prefix
-    /// already stripped; `double_dash` records which prefix that was. `separate_value` is false
-    /// for the `/flag` spelling: an MSBuild switch attaches its value with `:` (`/bl:x.binlog`)
-    /// and never consumes the next argument, so `/r` (MSBuild's `restore`) must not swallow the
-    /// token after it the way dotnet's own `-r <rid>` does.
-    fn push_atomic_flag(&mut self, rest: &'a str, double_dash: bool, separate_value: bool) {
+    /// already stripped; `prefix` records which one it was. Only the `/flag` spelling is barred
+    /// from consuming a separate value: an MSBuild switch attaches its value with `:`
+    /// (`/bl:x.binlog`), so `/r` (MSBuild's `restore`) must not swallow the token after it the
+    /// way dotnet's own `-r <rid>` does.
+    fn push_atomic_flag(&mut self, rest: &'a str, prefix: FlagPrefix) {
         let (name, attached) = split_attached(rest, self.dialect);
         let flag_index = self.tokens.len();
         let source_index = self.i;
         self.tokens.push(Token {
             attached,
-            ..token(TokenKind::Long, name, source_index, double_dash)
+            ..token(TokenKind::Long, name, source_index, prefix)
         });
         self.i += 1;
 
         if attached.is_none()
-            && separate_value
+            && prefix != FlagPrefix::Slash
             && (self.takes_value)(TokenKind::Long, name)
             && self.link_next_value(flag_index, self.i)
         {
@@ -341,7 +365,7 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
             } else {
                 scanner
                     .tokens
-                    .push(token(TokenKind::DashDash, "", scanner.i, false));
+                    .push(token(TokenKind::DashDash, "", scanner.i, FlagPrefix::Dash));
                 scanner.emitted_dash_dash = true;
             }
             scanner.i += 1;
@@ -349,7 +373,7 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
         }
 
         if let Some(rest) = arg.strip_prefix("--") {
-            scanner.push_atomic_flag(rest, true, true);
+            scanner.push_atomic_flag(rest, FlagPrefix::DashDash);
             continue;
         }
 
@@ -363,21 +387,24 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
                 // only the loose flag lookup ([`has_flag`]) is affected.
                 let name_part = rest.split(['=', ':']).next().unwrap_or(rest);
                 if !rest.is_empty() && !name_part.contains('/') {
-                    scanner.push_atomic_flag(rest, false, false);
+                    scanner.push_atomic_flag(rest, FlagPrefix::Slash);
                     continue;
                 }
             }
             if arg.len() > 1 && arg.starts_with('-') {
-                scanner.push_atomic_flag(&arg[1..], false, true);
+                scanner.push_atomic_flag(&arg[1..], FlagPrefix::Dash);
                 continue;
             }
         } else if arg.len() > 1 && arg.starts_with('-') {
             let cluster = &arg[1..];
 
             if is_digit_run(cluster) {
-                scanner
-                    .tokens
-                    .push(token(TokenKind::Short, cluster, scanner.i, false));
+                scanner.tokens.push(token(
+                    TokenKind::Short,
+                    cluster,
+                    scanner.i,
+                    FlagPrefix::Dash,
+                ));
                 scanner.i += 1;
                 continue;
             }
@@ -389,9 +416,12 @@ fn tokenize_dialect_ex<'a, T: AsRef<str>>(
                 let char_len = ch.len_utf8();
                 let char_text = &cluster[offset..offset + char_len];
                 let flag_index = scanner.tokens.len();
-                scanner
-                    .tokens
-                    .push(token(TokenKind::Short, char_text, source_index, false));
+                scanner.tokens.push(token(
+                    TokenKind::Short,
+                    char_text,
+                    source_index,
+                    FlagPrefix::Dash,
+                ));
 
                 if (scanner.takes_value)(TokenKind::Short, char_text) {
                     let remainder = &cluster[offset + char_len..];
@@ -437,19 +467,30 @@ fn split_attached(s: &str, dialect: Dialect) -> (&str, Option<&str>) {
 
 /// Base constructor for a freshly-scanned token: `attached`/`linked` default to `None`. Every
 /// token-construction site builds on this via struct-update syntax instead of a full literal.
-fn token(kind: TokenKind, text: &str, source_index: usize, double_dash: bool) -> Token<'_> {
+fn token(kind: TokenKind, text: &str, source_index: usize, prefix: FlagPrefix) -> Token<'_> {
     Token {
         kind,
         text,
         attached: None,
         linked: None,
         source_index,
-        double_dash,
+        double_dash: prefix == FlagPrefix::DashDash,
+        slash: prefix == FlagPrefix::Slash,
     }
 }
 
+/// How a flag was spelled. Under [`Dialect::Msbuild`] all three tokenize as `Long`, but they
+/// are not interchangeable: MSBuild's `/flag` attaches its value with `:` and never consumes
+/// the next argument, while dotnet's own `-flag`/`--flag` do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlagPrefix {
+    DashDash,
+    Dash,
+    Slash,
+}
+
 fn positional(text: &str, source_index: usize) -> Token<'_> {
-    token(TokenKind::Positional, text, source_index, false)
+    token(TokenKind::Positional, text, source_index, FlagPrefix::Dash)
 }
 
 #[cfg(test)]

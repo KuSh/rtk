@@ -54,16 +54,18 @@ fn git_cmd_c_locale(global_args: &[String]) -> Command {
 }
 
 fn uses_compact_status_path(args: &[String]) -> bool {
-    if args.is_empty() {
+    let tokens = arg_tokenizer::tokenize(args, &|_, _| false);
+
+    // A `--` with no pathspec after it selects nothing, so `git status --` is `git status`.
+    if tokens.iter().all(|t| t.kind == TokenKind::DashDash) {
         return true;
     }
 
     let mut saw_branch = false;
-    for arg in args {
-        match arg.as_str() {
-            "-b" | "--branch" => saw_branch = true,
-            "-sb" | "-bs" => return true,
-            "-s" | "--short" => {}
+    for token in &tokens {
+        match (token.kind, token.text) {
+            (TokenKind::Short, "b") | (TokenKind::Long, "branch") => saw_branch = true,
+            (TokenKind::Short, "s") | (TokenKind::Long, "short") => {}
             _ => return false,
         }
     }
@@ -89,8 +91,21 @@ pub fn run(
     verbose: u8,
     global_args: &[String],
 ) -> Result<i32> {
-    // Centralized here, once, rather than ad hoc per handler.
-    let args = &args_utils::restore_double_dash(args);
+    // Centralized here, once, rather than ad hoc per handler. `stash` needs the region put
+    // back together first: clap carves its subcommand positional out of the same trailing args,
+    // and restore_double_dash requires the whole region (fed only the remainder it slices one
+    // token short, which turned `git stash -- -p` into an interactive `stash push -p`).
+    let (cmd, args) = match cmd {
+        GitCommand::Stash { subcommand } => {
+            let mut region: Vec<String> = subcommand.into_iter().collect();
+            region.extend_from_slice(args);
+            let region = args_utils::restore_double_dash(&region);
+            let (subcommand, rest) = split_stash_region(&region);
+            (GitCommand::Stash { subcommand }, rest)
+        }
+        other => (other, args_utils::restore_double_dash(args)),
+    };
+    let args = &args;
     match cmd {
         GitCommand::Diff => run_diff(args, max_lines, verbose, global_args),
         GitCommand::Log => run_log(args, max_lines, verbose, global_args),
@@ -110,6 +125,18 @@ pub fn run(
     }
 }
 
+/// Splits a restored `stash` region back into subcommand and remainder, the way clap did
+/// before the `--` came back: a leading token that is neither a flag nor the boundary.
+fn split_stash_region(region: &[String]) -> (Option<String>, Vec<String>) {
+    let tokens = arg_tokenizer::tokenize(region, &|_, _| false);
+    match tokens.first() {
+        Some(token) if token.kind == TokenKind::Positional => {
+            (Some(region[0].clone()), region[1..].to_vec())
+        }
+        _ => (None, region.to_vec()),
+    }
+}
+
 fn run_diff(
     args: &[String],
     max_lines: Option<usize>,
@@ -121,18 +148,21 @@ fn run_diff(
     let tokens = tokenize_git_log_args(args);
     let wants_stat = tokens.iter().any(requests_diff_show_raw_shape);
 
-    // Compact diff is the default RTK behavior; --no-compact is RTK's own pseudo-flag.
-    let wants_compact = !tokens
+    // Compact diff is the default RTK behavior; --no-compact is RTK's own pseudo-flag. The
+    // strip below removes the arg this token came from, so detection and removal can't
+    // disagree -- re-matching the string dropped a pathspec of the same name past `--`.
+    let no_compact = tokens
         .iter()
-        .any(|t| t.kind == TokenKind::Long && t.attached.is_none() && t.text == "no-compact")
-        && !emits_word_diff(&tokens);
+        .find(|t| t.kind == TokenKind::Long && t.attached.is_none() && t.text == "no-compact")
+        .map(|t| t.source_index);
+    let wants_compact = no_compact.is_none() && !emits_word_diff(&tokens);
 
     if wants_stat || !wants_compact {
         // User wants stat or explicitly no compacting - pass through directly
         let mut cmd = git_cmd(global_args);
         cmd.arg("diff");
-        for arg in args {
-            if arg == "--no-compact" {
+        for (index, arg) in args.iter().enumerate() {
+            if Some(index) == no_compact {
                 continue; // RTK flag, not a git flag
             }
             cmd.arg(arg);
@@ -157,12 +187,21 @@ fn run_diff(
         return Ok(0);
     }
 
-    // Default RTK behavior: stat first, then compacted diff
+    // Default RTK behavior: stat first, then compacted diff. `--no-patch --stat` forces the
+    // header to be stat-only whatever the user asked for -- `git diff --stat -p` (or -U3, -W,
+    // ...) emits the patch too, and RTK then printed it again, compacted, for 2.4x the raw
+    // output. The flags go before the user's own `--`, where git still reads them as options.
     let mut cmd = git_cmd(global_args);
-    cmd.arg("diff").arg("--stat");
-
-    for arg in args {
+    cmd.arg("diff");
+    let stat_at = arg_tokenizer::injection_point(&tokens, args.len());
+    for (index, arg) in args.iter().enumerate() {
+        if index == stat_at {
+            cmd.args(["--no-patch", "--stat"]);
+        }
         cmd.arg(arg);
+    }
+    if stat_at == args.len() {
+        cmd.args(["--no-patch", "--stat"]);
     }
 
     let result = exec_capture(&mut cmd).context("Failed to run git diff")?;
@@ -229,9 +268,13 @@ fn run_show(
         .iter()
         .any(|t| t.kind == TokenKind::Long && matches!(t.text, "format" | "pretty"));
 
-    // `git show rev:path` prints a blob, not a commit diff. In this mode we should
-    // pass through directly to avoid duplicated output from compact-show steps.
-    let wants_blob_show = args.iter().any(|arg| is_blob_show_arg(arg));
+    // `git show rev:path` prints a blob, not a commit diff, so it passes through rather than
+    // going through the compact-show steps. Only a free positional before `--` can be one: a
+    // flag's value (`--author 'a:b'`) and a pathspec past the boundary both contain colons
+    // without naming a blob.
+    let wants_blob_show = arg_tokenizer::before_dashdash(&tokens)
+        .iter()
+        .any(|t| t.is_free_positional() && is_blob_show_arg(t.text));
 
     if wants_stat_only || wants_format || wants_blob_show || emits_word_diff(&tokens) {
         let mut cmd = git_cmd(global_args);
@@ -2509,10 +2552,18 @@ fn run_worktree(args: &[String], verbose: u8, global_args: &[String]) -> Result<
         eprintln!("git worktree list");
     }
 
-    // If args contain "add", "remove", "prune" etc., pass through
-    let has_action = args.iter().any(|a| {
-        a == "add" || a == "remove" || a == "prune" || a == "lock" || a == "unlock" || a == "move"
-    });
+    // A write action is the subcommand -- the first positional -- not any arg that happens to
+    // spell one (a worktree path named "move", say).
+    let tokens = arg_tokenizer::tokenize(args, &|_, _| false);
+    let has_action = arg_tokenizer::before_dashdash(&tokens)
+        .iter()
+        .find(|t| t.is_free_positional())
+        .is_some_and(|t| {
+            matches!(
+                t.text,
+                "add" | "remove" | "prune" | "lock" | "unlock" | "move"
+            )
+        });
 
     if has_action {
         let mut cmd = git_cmd(global_args);
@@ -4086,6 +4137,76 @@ A  added.rs
         // The bare, standalone form must still work as documented.
         let args = vec!["-n".to_string(), "2".to_string()];
         assert_eq!(parse_user_limit(&args), Some(2));
+    }
+
+    #[test]
+    fn test_stat_header_flags_land_before_the_users_pathspec_boundary() {
+        // `--no-patch --stat` after the user's `--` would be pathspecs, not options.
+        let args = vec!["--".to_string(), "src/".to_string()];
+        let tokens = tokenize_git_log_args(&args);
+        assert_eq!(arg_tokenizer::injection_point(&tokens, args.len()), 0);
+
+        let args = vec!["-p".to_string()];
+        let tokens = tokenize_git_log_args(&args);
+        assert_eq!(arg_tokenizer::injection_point(&tokens, args.len()), 1);
+    }
+
+    #[test]
+    fn test_blob_show_detection_ignores_flag_values_and_pathspecs() {
+        // Only a free positional before `--` can name a blob: `--author 'a:b'` is that flag's
+        // value and `-- a:b` is a pathspec, and neither should force raw passthrough.
+        let blob = |args: &[&str]| -> bool {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let tokens = tokenize_git_log_args(&args);
+            arg_tokenizer::before_dashdash(&tokens)
+                .iter()
+                .any(|t| t.is_free_positional() && is_blob_show_arg(t.text))
+        };
+
+        assert!(blob(&["HEAD:src/main.rs"]));
+        assert!(!blob(&["--author", "a:b", "HEAD"]));
+        assert!(!blob(&["--", "a:b"]));
+        assert!(!blob(&["--pretty=format:%h"]));
+    }
+
+    #[test]
+    fn test_status_compact_path_survives_a_bare_double_dash() {
+        // `git status --` selects no pathspec, so it is `git status` -- and must keep the
+        // compact porcelain path rather than falling through to git's prose output.
+        assert!(uses_compact_status_path(&[]));
+        assert!(uses_compact_status_path(&["--".to_string()]));
+        assert!(uses_compact_status_path(&["-sb".to_string()]));
+        assert!(uses_compact_status_path(&["-b".to_string()]));
+        // A real pathspec still passes through.
+        assert!(!uses_compact_status_path(&[
+            "--".to_string(),
+            "f.txt".to_string()
+        ]));
+    }
+
+    #[test]
+    fn test_split_stash_region_keeps_the_boundary_out_of_the_subcommand() {
+        // `git stash -- -p` is a pathspec, not interactive patch mode: the restored region
+        // starts at the boundary, so nothing is taken as the subcommand.
+        let owned = |args: &[&str]| -> Vec<String> {
+            args.iter().map(|a| a.to_string()).collect()
+        };
+
+        let (subcommand, rest) = split_stash_region(&owned(&["--", "-p"]));
+        assert_eq!(subcommand, None);
+        assert_eq!(rest, owned(&["--", "-p"]));
+
+        let (subcommand, rest) = split_stash_region(&owned(&["show", "-p"]));
+        assert_eq!(subcommand.as_deref(), Some("show"));
+        assert_eq!(rest, owned(&["-p"]));
+
+        let (subcommand, rest) = split_stash_region(&owned(&["push", "--", "file.txt"]));
+        assert_eq!(subcommand.as_deref(), Some("push"));
+        assert_eq!(rest, owned(&["--", "file.txt"]));
+
+        let (subcommand, rest) = split_stash_region(&owned(&["-p"]));
+        assert_eq!(subcommand, None);
+        assert_eq!(rest, owned(&["-p"]));
     }
 
     #[test]

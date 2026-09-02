@@ -315,23 +315,33 @@ fn build_effective_dotnet_format_args(
     tokens: &[Token<'_>],
     report_path: Option<&Path>,
 ) -> Vec<String> {
-    let mut effective: Vec<String> = args
-        .iter()
-        .filter(|arg| !arg.eq_ignore_ascii_case("--write"))
-        .cloned()
-        .collect();
     let force_write_mode = has_write_mode_override(tokens);
-
+    let mut injected: Vec<String> = Vec::new();
     if !force_write_mode && !has_verify_no_changes_arg(tokens) {
-        effective.push("--verify-no-changes".to_string());
+        injected.push("--verify-no-changes".to_string());
     }
-
     if !has_report_arg(tokens) {
         if let Some(path) = report_path {
-            effective.push("--report".to_string());
-            effective.push(path.display().to_string());
+            injected.push("--report".to_string());
+            injected.push(path.display().to_string());
         }
     }
+
+    // Injected flags go before the user's own `--`: dotnet parks everything past it in
+    // UnparsedTokens, so a `--verify-no-changes` after the boundary never applies and format
+    // rewrites the tree while RTK still reports check mode.
+    let boundary = arg_tokenizer::injection_point(tokens, args.len());
+    let write_args: Vec<usize> = write_override_tokens(tokens).map(|t| t.source_index).collect();
+    let mut effective: Vec<String> = Vec::with_capacity(args.len() + injected.len());
+    for (index, arg) in args.iter().enumerate() {
+        if index == boundary {
+            effective.append(&mut injected);
+        }
+        if !write_args.contains(&index) {
+            effective.push(arg.clone());
+        }
+    }
+    effective.append(&mut injected);
 
     effective
 }
@@ -698,17 +708,28 @@ fn detect_test_runner_mode_in_dir(tokens: &[Token<'_>], scan_dir: &Path) -> Test
     let project_extensions = ["csproj", "fsproj", "vbproj"];
 
     // Candidate project paths: unconsumed positionals before the user's own `--` (tokens past it
-    // are forwarded to the test runner, not to dotnet) ending in one of these extensions.
+    // are forwarded to the test runner, not to dotnet) ending in one of these extensions. A
+    // single-segment absolute path (`/Other.csproj`) tokenizes as a slash *flag* -- structure
+    // alone can't tell it from a switch, and this tokenizer does no I/O -- so the extension is
+    // what settles it: no MSBuild switch is named `.csproj`.
     let boundary = arg_tokenizer::dashdash_index(tokens).map(|i| tokens[i].source_index);
-    let explicit_projects: Vec<&str> = tokens
+    let is_project = |name: &str| {
+        let lower = name.to_ascii_lowercase();
+        project_extensions
+            .iter()
+            .any(|ext| lower.ends_with(&format!(".{ext}")))
+    };
+    let explicit_projects: Vec<String> = tokens
         .iter()
-        .filter(|t| t.is_free_positional() && boundary.is_none_or(|b| t.source_index < b))
-        .map(|t| t.text)
-        .filter(|a| {
-            let lower = a.to_ascii_lowercase();
-            project_extensions
-                .iter()
-                .any(|ext| lower.ends_with(&format!(".{ext}")))
+        .filter(|t| boundary.is_none_or(|b| t.source_index < b))
+        .filter_map(|t| {
+            if t.is_free_positional() && is_project(t.text) {
+                Some(t.text.to_string())
+            } else if t.slash && is_project(t.text) {
+                Some(format!("/{}", t.text))
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -792,32 +813,40 @@ fn tokenize_dotnet_args(args: &[String]) -> Vec<Token<'_>> {
     )
 }
 
+/// The tokens dotnet itself parses: everything the user put after `--` is forwarded to the
+/// test runner, so a lookup for dotnet's own flags must not see it. The Msbuild dialect keeps
+/// classifying past the boundary, which is what makes this slice necessary.
+fn dotnet_own_tokens<'t, 'a>(tokens: &'t [Token<'a>]) -> &'t [Token<'a>] {
+    arg_tokenizer::before_dashdash(tokens)
+}
+
 /// Strict lookup (prefer this): only a literal `--flag` matches. A single-dash or slash spelling
 /// of a modern option doesn't get rejected, it gets silently misparsed as an unrelated MSBuild
 /// switch (`MSB100x` errors) -- except the legacy passthrough switches in `dotnet_has_loose_flag`.
 fn dotnet_double_dash_flag_value<'a>(tokens: &[Token<'a>], name: &str) -> Option<&'a str> {
-    arg_tokenizer::double_dash_flag_value(tokens, Dialect::Msbuild, name)
+    arg_tokenizer::double_dash_flag_value(dotnet_own_tokens(tokens), Dialect::Msbuild, name)
 }
 
 fn dotnet_has_flag(tokens: &[Token<'_>], name: &str) -> bool {
-    arg_tokenizer::has_double_dash_flag(tokens, Dialect::Msbuild, name)
+    arg_tokenizer::has_double_dash_flag(dotnet_own_tokens(tokens), Dialect::Msbuild, name)
 }
 
 /// Loose lookup: `-flag`/`--flag`/`/flag` all match. Only correct for genuine legacy MSBuild.exe
 /// passthrough switches (`nologo`, `bl`, `v`/`verbosity`) -- see [`dotnet_double_dash_flag_value`].
 fn dotnet_has_loose_flag(tokens: &[Token<'_>], name: &str) -> bool {
-    arg_tokenizer::has_flag(tokens, Dialect::Msbuild, name)
+    arg_tokenizer::has_flag(dotnet_own_tokens(tokens), Dialect::Msbuild, name)
 }
 
 /// Loose match, but only when the flag is bare (no attached value) -- a boolean switch's broken
 /// attached-value spelling (e.g. `-nologo:true`) would otherwise be misread as "already present".
 fn dotnet_has_bare_loose_flag(tokens: &[Token<'_>], name: &str) -> bool {
-    tokens.iter().any(|t| {
+    dotnet_own_tokens(tokens).iter().any(|t| {
         t.kind == TokenKind::Long && t.attached.is_none() && t.text.eq_ignore_ascii_case(name)
     })
 }
 
-fn dotnet_has_bare_double_dash_flag(tokens: &[Token<'_>], name: &str) -> bool {
+
+fn bare_double_dash_flag(tokens: &[Token<'_>], name: &str) -> bool {
     tokens.iter().any(|t| {
         t.kind == TokenKind::Long
             && t.double_dash
@@ -834,13 +863,15 @@ fn has_nologo_arg(tokens: &[Token<'_>]) -> bool {
 fn has_trx_logger_arg(tokens: &[Token<'_>]) -> bool {
     // --logger can legitimately repeat (e.g. `--logger "console;verbosity=normal" --logger
     // trx`), so every occurrence must be checked, not just the first. `-l` is dotnet's own
-    // alias for it -- MSBuild's unrelated `/l` tokenizes the same but never takes a separate
-    // value, so only its attached form could collide, and only with an assembly named "trx".
-    arg_tokenizer::double_dash_flag_values(tokens, Dialect::Msbuild, "logger")
+    // alias for it; MSBuild's `/l:` is an unrelated logger-assembly switch, so the slash
+    // spelling is excluded.
+    let own = dotnet_own_tokens(tokens);
+    arg_tokenizer::double_dash_flag_values(own, Dialect::Msbuild, "logger")
         .chain(
-            tokens
-                .iter()
-                .filter(|t| t.kind == TokenKind::Long && t.text.eq_ignore_ascii_case("l"))
+            own.iter()
+                .filter(|t| {
+                    t.kind == TokenKind::Long && !t.slash && t.text.eq_ignore_ascii_case("l")
+                })
                 .filter_map(|t| t.value(tokens)),
         )
         .any(|value| {
@@ -858,8 +889,11 @@ fn has_report_arg(tokens: &[Token<'_>]) -> bool {
 }
 
 fn has_report_trx_arg(tokens: &[Token<'_>]) -> bool {
-    // Bare-only: an attached spelling like "--report-trx:true" must not count as present.
-    dotnet_has_bare_double_dash_flag(tokens, "report-trx")
+    // Deliberately unscoped, unlike dotnet's own flags: --report-trx is a direct dotnet flag
+    // in MTP-native mode and the runner's flag past `--` in the VSTest bridge, so either
+    // region is a legitimate place for the user to have written it. Bare-only, so an attached
+    // spelling like "--report-trx:true" doesn't count as present.
+    bare_double_dash_flag(tokens, "report-trx")
 }
 
 /// Injects `--report-trx` after the `--` separator in `args`.
@@ -886,10 +920,23 @@ fn has_verify_no_changes_arg(tokens: &[Token<'_>]) -> bool {
     dotnet_has_flag(tokens, "verify-no-changes")
 }
 
+/// The `--write` tokens RTK owns: its own pseudo-flag, stripped before forwarding to real
+/// dotnet (which has no `--write`). Detection and stripping both go through here so they
+/// cannot drift -- an attached `--write=true` is not RTK's flag and must pass through, and one
+/// past `--` belongs to whatever dotnet forwards to.
+fn write_override_tokens<'t, 'a>(
+    tokens: &'t [Token<'a>],
+) -> impl Iterator<Item = &'t Token<'a>> + 't {
+    dotnet_own_tokens(tokens).iter().filter(|t| {
+        t.kind == TokenKind::Long
+            && t.double_dash
+            && t.attached.is_none()
+            && t.text.eq_ignore_ascii_case("write")
+    })
+}
+
 fn has_write_mode_override(tokens: &[Token<'_>]) -> bool {
-    // --write is RTK's own pseudo-flag, stripped before forwarding to real dotnet (which has no
-    // --write option); must be bare, since an attached form wouldn't get stripped.
-    dotnet_has_bare_double_dash_flag(tokens, "write")
+    write_override_tokens(tokens).next().is_some()
 }
 
 fn extract_results_directory_arg(tokens: &[Token<'_>]) -> Option<PathBuf> {
@@ -2152,16 +2199,81 @@ mod tests {
     }
 
     #[test]
+    fn test_single_segment_absolute_project_is_a_path_not_a_switch() {
+        // `/Other.csproj` tokenizes as a slash flag (structure alone can't tell it from an
+        // MSBuild switch), and being missed from the explicit projects made RTK scan the cwd
+        // and adopt an unrelated project's runner mode.
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        fs::write(
+            temp_dir.path().join("Root.csproj"),
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
+  </PropertyGroup>
+</Project>"#,
+        )
+        .expect("write csproj");
+
+        let args = vec!["/Other.csproj".to_string()];
+        let tokens = tokenize_dotnet_args(&args);
+        assert_eq!(
+            detect_test_runner_mode_in_dir(&tokens, temp_dir.path()),
+            TestRunnerMode::Classic,
+            "an explicit project must not fall back to scanning the cwd"
+        );
+
+        // With no project named at all, scanning the directory is still right.
+        let tokens = tokenize_dotnet_args(&[]);
+        assert_eq!(
+            detect_test_runner_mode_in_dir(&tokens, temp_dir.path()),
+            TestRunnerMode::MtpVsTestBridge
+        );
+    }
+
+    #[test]
+    fn test_forwarded_args_do_not_suppress_injection() {
+        // Everything past `--` goes to the test runner, not to dotnet, so a `--logger` there
+        // is not the user asking dotnet for a logger -- RTK still has to inject its own.
+        let args = vec![
+            "--".to_string(),
+            "--logger".to_string(),
+            "trx".to_string(),
+        ];
+        let injected = build_dotnet_args_for_test("test", &args, true);
+        let boundary = injected.iter().position(|a| a == "--").expect("boundary");
+        let logger = injected
+            .windows(2)
+            .position(|w| w == ["--logger", "trx"])
+            .expect("RTK's own logger");
+        assert!(logger < boundary, "{injected:?}");
+
+        let args = vec!["--".to_string(), "--nologo".to_string()];
+        let injected = build_dotnet_args_for_test("test", &args, true);
+        let boundary = injected.iter().position(|a| a == "--").expect("boundary");
+        let nologo = injected.iter().position(|a| a == "-nologo").expect("nologo");
+        assert!(nologo < boundary, "{injected:?}");
+    }
+
+    #[test]
     fn test_short_logger_alias_does_not_duplicate() {
         // `-l trx` is dotnet's documented short form of `--logger trx`; missing it injected a
         // second trx logger on top of the user's own.
-        let args = vec!["-l".to_string(), "trx".to_string()];
+        for args in [vec!["-l", "trx"], vec!["-l:trx"]] {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let injected = build_dotnet_args_for_test("test", &args, true);
+            assert!(
+                !injected.windows(2).any(|w| w == ["--logger", "trx"]),
+                "must not inject a duplicate trx logger: {injected:?}"
+            );
+        }
 
+        // MSBuild's `/l:` attaches a logger *assembly*, not VSTest's trx logger, so RTK's own
+        // injection still has to happen.
+        let args = vec!["/l:trx".to_string()];
         let injected = build_dotnet_args_for_test("test", &args, true);
-        let trx_logger_count = injected.iter().filter(|a| *a == "trx").count();
-        assert_eq!(
-            trx_logger_count, 1,
-            "must not inject a duplicate trx logger: {injected:?}"
+        assert!(
+            injected.windows(2).any(|w| w == ["--logger", "trx"]),
+            "/l: is MSBuild's logger switch, not --logger: {injected:?}"
         );
     }
 
@@ -2877,6 +2989,27 @@ mod tests {
             effective.first().map(String::as_str),
             Some("src/App/App.csproj")
         );
+    }
+
+    #[test]
+    fn test_format_injects_before_the_users_double_dash() {
+        // dotnet parks everything past `--` in UnparsedTokens, so an injected
+        // `--verify-no-changes` after the boundary never applies -- format would rewrite the
+        // tree while RTK reported check mode.
+        let args = vec!["--".to_string(), "./src".to_string()];
+
+        let tokens = tokenize_dotnet_args(&args);
+        let effective =
+            build_effective_dotnet_format_args(&args, &tokens, Some(Path::new("/tmp/report.json")));
+
+        let boundary = effective.iter().position(|a| a == "--").expect("boundary");
+        let verify = effective
+            .iter()
+            .position(|a| a == "--verify-no-changes")
+            .expect("check mode");
+        let report = effective.iter().position(|a| a == "--report").expect("report");
+        assert!(verify < boundary, "{effective:?}");
+        assert!(report < boundary, "{effective:?}");
     }
 
     #[test]

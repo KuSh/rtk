@@ -176,6 +176,7 @@ fn extract_pattern_path<T: AsRef<str>>(
     );
 
     let mut e_patterns: Vec<String> = Vec::new();
+    let mut patterns_from_file = false;
     let mut positionals: Vec<String> = Vec::new();
     let mut flags: Vec<String> = Vec::new();
     let mut has_format_flag = false;
@@ -194,6 +195,9 @@ fn extract_pattern_path<T: AsRef<str>>(
                 }
             }
             TokenKind::Long => {
+                if t.text == "file" {
+                    patterns_from_file = true;
+                }
                 if is_format_flag_token(engine, t.kind, t.text) {
                     has_format_flag = true;
                 }
@@ -285,6 +289,9 @@ fn extract_pattern_path<T: AsRef<str>>(
                             None => flags.push("-e".to_string()),
                         }
                     } else {
+                        if vt.text == "f" {
+                            patterns_from_file = true;
+                        }
                         flags.push(format!("-{}", vt.text));
                         if let Some(v) = value {
                             flags.push(v.to_string());
@@ -299,9 +306,10 @@ fn extract_pattern_path<T: AsRef<str>>(
         i += 1;
     }
 
-    // If -e/--regexp was used: all positionals are paths.
-    // Otherwise: first positional is the pattern, rest are paths.
-    let (patterns, paths) = if !e_patterns.is_empty() {
+    // `-e`/`--regexp` and `-f`/`--file` both supply the patterns, so every positional is a
+    // path. Taking the first one as the pattern instead left `paths` empty, which made the
+    // engine read stdin (a hang under an agent harness) or walk the cwd.
+    let (patterns, paths) = if !e_patterns.is_empty() || patterns_from_file {
         (e_patterns, positionals)
     } else {
         let paths = positionals.iter().skip(1).cloned().collect();
@@ -459,15 +467,6 @@ fn wants_show_file(paths: &[String], flags_show_file: bool) -> bool {
     paths.len() > 1 || paths.iter().any(|p| std::path::Path::new(p).is_dir()) || flags_show_file
 }
 
-/// Test-only convenience wrapper; production uses `DetectedFlags::show_line` instead (see
-/// `has_short_flag`'s doc for the ambiguity that avoids).
-#[cfg(test)]
-fn show_line(extra_args: &[String]) -> bool {
-    (has_short_flag(extra_args, 'n') || extra_args.iter().any(|f| f == "--line-number"))
-        && !has_short_flag(extra_args, 'N')
-        && !extra_args.iter().any(|f| f == "--no-line-number")
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_streaming_search(
     timer: &tracking::TimedExecution,
@@ -536,31 +535,6 @@ fn passthrough<T: AsRef<str>>(
 
     timer.track_passthrough(real_cmd, &format!("rtk {} (passthrough)", real_cmd));
     Ok(exit_code)
-}
-
-/// Test-only: scans the reconstructed `flags` strings for a short flag.
-#[cfg(test)]
-fn has_short_flag(flags: &[String], ch: char) -> bool {
-    flags
-        .iter()
-        .any(|f| f.starts_with('-') && !f.starts_with("--") && f[1..].contains(ch))
-}
-
-/// Test-only convenience wrapper; production uses `DetectedFlags::context` instead (see
-/// `has_short_flag`'s doc for the ambiguity that avoids).
-#[cfg(test)]
-fn has_context_flag(flags: &[String]) -> bool {
-    has_short_flag(flags, 'A')
-        || has_short_flag(flags, 'B')
-        || has_short_flag(flags, 'C')
-        || flags.iter().any(|f| {
-            f == "--after-context"
-                || f == "--before-context"
-                || f == "--context"
-                || f.starts_with("--after-context=")
-                || f.starts_with("--before-context=")
-                || f.starts_with("--context=")
-        })
 }
 
 pub fn run(
@@ -687,7 +661,11 @@ pub fn run(
     // show one (multiple files, a directory, -r or -H), the line number only with
     // -n. We force -nH--null for robust parsing, then drop what the engine itself
     // would not have shown.
-    let show_file = by_file.len() > 1 || wants_show_file(&paths, detected_flags.show_file);
+    // No explicit path means the engine walked the cwd itself, and there the filename is the
+    // only way to tell matches apart -- real rg prints it even when a single file matched. This
+    // branch never sees piped stdin (that goes streaming), where a filename would be wrong.
+    let show_file =
+        by_file.len() > 1 || paths.is_empty() || wants_show_file(&paths, detected_flags.show_file);
     let show_line = detected_flags.show_line;
 
     // Faithful baseline: exactly what the real command prints, full content.
@@ -885,11 +863,14 @@ fn is_show_line_off_token(kind: TokenKind, text: &str) -> bool {
     }
 }
 
-/// True for a context-window flag: `-A`/`-B`/`-C` or their long forms.
+/// True for a context-window flag: `-A`/`-B`/`-C`, their long forms, or grep's `-NUM`
+/// shorthand for `--context=NUM` (the tokenizer keeps that digit run as one `Short` token).
 fn is_context_token(kind: TokenKind, text: &str) -> bool {
     match kind {
         TokenKind::Long => matches!(text, "after-context" | "before-context" | "context"),
-        TokenKind::Short => matches!(text, "A" | "B" | "C"),
+        TokenKind::Short => {
+            matches!(text, "A" | "B" | "C") || arg_tokenizer::is_digit_run(text)
+        }
         _ => false,
     }
 }
@@ -1010,67 +991,7 @@ mod tests {
         assert!(compact.len() <= 60);
     }
 
-    #[test]
-    #[ignore]
-    fn test_rg_z_shows_filenames_when_stdin_is_not_a_pipe() {
-        // `rtk rg -z foo < /dev/null` in a multi-file dir used to drop filenames: stdin being a
-        // non-terminal, non-pipe redirect was misread as "the engine reads stdin," routing into
-        // the streaming path, which can't discover "multiple files" the way the buffered path
-        // does. Real rg still searches the cwd here (confirmed empirically), not stdin.
-        let bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("debug")
-            .join("rtk");
-        assert!(bin.exists(), "Run `cargo build` first");
 
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "foo one\n").unwrap();
-        std::fs::write(dir.path().join("b.txt"), "foo two\n").unwrap();
-
-        let output = std::process::Command::new(&bin)
-            .args(["rg", "-z", "foo"])
-            .current_dir(dir.path())
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("failed to run rtk rg");
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("a.txt"), "filename missing: {stdout}");
-        assert!(stdout.contains("b.txt"), "filename missing: {stdout}");
-    }
-
-    #[test]
-    #[ignore]
-    fn test_grep_reads_stdin_when_it_is_a_redirected_file() {
-        // The other side of the same call: a regular file on stdin *is* read by both engines
-        // (rg's own is_readable_stdin counts files and sockets, not just FIFOs), so the search
-        // must return that file's match rather than the cwd's.
-        let bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("debug")
-            .join("rtk");
-        assert!(bin.exists(), "Run `cargo build` first");
-
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "foo from the cwd\n").unwrap();
-        let piped = dir.path().join("piped.log");
-        std::fs::write(&piped, "foo from stdin\n").unwrap();
-
-        for engine in ["grep", "rg"] {
-            let output = std::process::Command::new(&bin)
-                .args([engine, "foo"])
-                .current_dir(dir.path())
-                .stdin(std::fs::File::open(&piped).unwrap())
-                .output()
-                .expect("failed to run rtk");
-
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("foo from stdin"),
-                "{engine} did not read stdin: {stdout}"
-            );
-        }
-    }
 
     #[test]
     fn streaming_search_preserves_native_shape() {
@@ -1167,6 +1088,38 @@ mod tests {
             extract_pattern_path(&["--color", "never", "match", "a.txt"], Engine::Rg);
         assert_eq!(patterns, vec!["match"]);
         assert_eq!(paths, vec!["a.txt"]);
+    }
+
+    #[test]
+    fn test_context_detection_covers_greps_numeric_shorthand() {
+        // grep's `-1` is `--context=1`. Missing it dropped the `--` separators between
+        // non-contiguous context blocks, so two far-apart hunks read as one run.
+        assert!(is_context_token(TokenKind::Short, "1"));
+        assert!(is_context_token(TokenKind::Short, "12"));
+        assert!(is_context_token(TokenKind::Short, "C"));
+        assert!(is_context_token(TokenKind::Long, "context"));
+        assert!(!is_context_token(TokenKind::Short, "n"));
+
+        let (_, _, _, _, detected) = extract_pattern_path(&["-1", "TODO", "f.txt"], Engine::Grep);
+        assert!(detected.context);
+    }
+
+    #[test]
+    fn test_extract_patterns_from_file_leaves_every_positional_a_path() {
+        // `-f`/`--file` supplies the patterns like `-e` does. Taking the first positional as
+        // the pattern instead left no path at all, so the engine read stdin (a hang) or walked
+        // the cwd, and `rtk grep -f pats.txt a.txt` answered "no matches" for a file that had
+        // one.
+        for args in [
+            vec!["-f", "pats.txt", "a.txt"],
+            vec!["--file", "pats.txt", "a.txt"],
+            vec!["-fpats.txt", "a.txt"],
+            vec!["--file=pats.txt", "a.txt"],
+        ] {
+            let (patterns, paths, _, _, _) = extract_pattern_path(&args, Engine::Grep);
+            assert!(patterns.is_empty(), "{args:?} -> {patterns:?}");
+            assert_eq!(paths, vec!["a.txt"], "{args:?}");
+        }
     }
 
     #[test]
@@ -1703,30 +1656,36 @@ mod tests {
         assert!(!has_format_flag(Engine::Grep, &["-rin"]));
     }
 
-    fn flags(args: &[&str]) -> Vec<String> {
-        args.iter().map(|s| s.to_string()).collect()
+    /// What production computes for these args, so a change to the real detector shows up here
+    /// rather than only in a test-only twin of it.
+    fn detected(args: &[&str]) -> DetectedFlags {
+        let mut with_pattern = vec!["pattern"];
+        with_pattern.extend_from_slice(args);
+        extract_pattern_path(&with_pattern, Engine::Grep).4
     }
 
     #[test]
     fn show_line_is_off_without_an_explicit_request() {
-        assert!(!show_line(&flags(&[])));
-        assert!(!show_line(&flags(&["-i"])));
-        assert!(!show_line(&flags(&["-r"])));
-        assert!(!show_line(&flags(&["-A", "3"])));
+        assert!(!detected(&[]).show_line);
+        assert!(!detected(&["-i"]).show_line);
+        assert!(!detected(&["-r"]).show_line);
+        assert!(!detected(&["-A", "3"]).show_line);
     }
 
     #[test]
     fn show_line_honours_n_in_every_spelling() {
-        assert!(show_line(&flags(&["-n"])));
-        assert!(show_line(&flags(&["--line-number"])));
-        assert!(show_line(&flags(&["-rn"])));
-        assert!(show_line(&flags(&["-in"])));
+        assert!(detected(&["-n"]).show_line);
+        assert!(detected(&["--line-number"]).show_line);
+        assert!(detected(&["-rn"]).show_line);
+        assert!(detected(&["-in"]).show_line);
     }
 
     #[test]
     fn show_line_is_off_when_explicitly_negated() {
-        assert!(!show_line(&flags(&["-N"])));
-        assert!(!show_line(&flags(&["--no-line-number"])));
+        // `-n` has to be present, or the assertion holds whether or not the negation works.
+        assert!(detected(&["-n"]).show_line);
+        assert!(!detected(&["-n", "-N"]).show_line);
+        assert!(!detected(&["-n", "--no-line-number"]).show_line);
     }
 
     #[test]
@@ -1744,7 +1703,7 @@ mod tests {
 
     #[test]
     fn match_block_keeps_position_when_display_drops_it() {
-        assert!(!show_line(&flags(&[])));
+        assert!(!detected(&[]).show_line);
         let entries = vec![(42usize, true, "hit".to_string())];
         assert_eq!(match_block("f.txt", &entries), "f.txt:42:hit\n");
     }
@@ -1915,9 +1874,7 @@ mod tests {
 
     #[test]
     fn test_has_context_flag_short() {
-        let f = |args: &[&str]| -> bool {
-            has_context_flag(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-        };
+        let f = |args: &[&str]| -> bool { detected(args).context };
         assert!(f(&["-A", "3"]));
         assert!(f(&["-B", "2"]));
         assert!(f(&["-C", "1"]));
@@ -1927,9 +1884,7 @@ mod tests {
 
     #[test]
     fn test_has_context_flag_long() {
-        let f = |args: &[&str]| -> bool {
-            has_context_flag(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-        };
+        let f = |args: &[&str]| -> bool { detected(args).context };
         assert!(f(&["--after-context", "3"]));
         assert!(f(&["--before-context", "2"]));
         assert!(f(&["--context", "1"]));

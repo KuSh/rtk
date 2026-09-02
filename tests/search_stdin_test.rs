@@ -1,0 +1,79 @@
+#![cfg(unix)]
+//! Which stdin the engines actually read. These run in CI as integration tests rather than
+//! `#[ignore]`d unit tests: `CARGO_BIN_EXE_rtk` guarantees a built binary, so the fix they
+//! cover is exercised by `cargo test --all` instead of only by a flag nobody passes.
+
+use std::process::{Command, Stdio};
+
+fn rtk() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rtk"));
+    cmd.env("LC_ALL", "C");
+    cmd
+}
+
+#[test]
+fn rg_shows_filenames_when_stdin_is_not_a_pipe() {
+    // `rtk rg -z foo < /dev/null` in a multi-file dir used to drop filenames: stdin being a
+    // non-terminal, non-pipe redirect was misread as "the engine reads stdin," routing into the
+    // streaming path, which can't discover "multiple files" the way the buffered path does.
+    // Real rg searches the cwd here, not stdin.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "foo one\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "foo two\n").unwrap();
+
+    let output = rtk()
+        .args(["rg", "-z", "foo"])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run rtk rg");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("a.txt"), "filename missing: {stdout}");
+    assert!(stdout.contains("b.txt"), "filename missing: {stdout}");
+}
+
+#[test]
+fn a_single_matching_file_still_gets_its_name() {
+    // The engine walked the cwd itself, so the filename is the only way to place the match --
+    // real rg prints it even when exactly one file matched.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("only.txt"), "foo here\n").unwrap();
+    std::fs::write(dir.path().join("other.txt"), "nothing\n").unwrap();
+
+    let output = rtk()
+        .args(["rg", "foo"])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run rtk rg");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("only.txt"), "filename missing: {stdout}");
+}
+
+#[test]
+fn both_engines_read_a_redirected_file_on_stdin() {
+    // A regular file on stdin *is* read by both engines (rg's own is_readable_stdin counts
+    // files and sockets, not just FIFOs), so the search must return that file's match rather
+    // than the cwd's.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "foo from the cwd\n").unwrap();
+    let piped = dir.path().join("piped.log");
+    std::fs::write(&piped, "foo from stdin\n").unwrap();
+
+    for engine in ["grep", "rg"] {
+        let output = rtk()
+            .args([engine, "foo"])
+            .current_dir(dir.path())
+            .stdin(std::fs::File::open(&piped).unwrap())
+            .output()
+            .expect("failed to run rtk");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("foo from stdin"),
+            "{engine} did not read stdin: {stdout}"
+        );
+    }
+}
