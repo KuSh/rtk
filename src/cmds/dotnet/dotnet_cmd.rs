@@ -846,7 +846,7 @@ fn dotnet_has_bare_loose_flag(tokens: &[Token<'_>], name: &str) -> bool {
 }
 
 
-fn bare_double_dash_flag(tokens: &[Token<'_>], name: &str) -> bool {
+fn dotnet_has_bare_double_dash_flag(tokens: &[Token<'_>], name: &str) -> bool {
     tokens.iter().any(|t| {
         t.kind == TokenKind::Long
             && t.double_dash
@@ -904,7 +904,7 @@ fn has_report_trx_arg(tokens: &[Token<'_>]) -> bool {
     // in MTP-native mode and the runner's flag past `--` in the VSTest bridge, so either
     // region is a legitimate place for the user to have written it. Bare-only, so an attached
     // spelling like "--report-trx:true" doesn't count as present.
-    bare_double_dash_flag(tokens, "report-trx")
+    dotnet_has_bare_double_dash_flag(tokens, "report-trx")
 }
 
 /// Injects `--report-trx` after the `--` separator in `args`.

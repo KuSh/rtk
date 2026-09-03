@@ -12,7 +12,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::OsString;
 
-fn is_golangci_subcommand(name: &str) -> bool {
+fn is_subcommand(name: &str) -> bool {
     matches!(
         name,
         "cache"
@@ -29,9 +29,10 @@ fn is_golangci_subcommand(name: &str) -> bool {
     )
 }
 
-/// Value-taking flags accepted *before* the `run` subcommand. `-c` is `--config`'s shorthand;
-/// this list is wider than `--help`'s "Global Flags" section, which omits several of these.
-fn golangci_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
+/// golangci-lint's *global* grammar: the value-taking flags accepted before a subcommand. `-c`
+/// is `--config`'s shorthand; this list is wider than `--help`'s "Global Flags" section, which
+/// omits several of these.
+fn global_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
     match kind {
         TokenKind::Long => matches!(
             name,
@@ -43,14 +44,15 @@ fn golangci_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
     }
 }
 
-/// `run`'s own value-taking flags -- a wider list than [`golangci_takes_value`] (which is scoped
-/// to flags valid *before* `run`). Missing an entry here risks a value like `--path-prefix
-/// --out-format` tokenizing as its own flag and being misdetected by `has_output_flag`.
-fn golangci_run_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
+/// The `run` subcommand's grammar -- a wider list than [`global_takes_value`], which is scoped
+/// to the flags valid before a subcommand. Missing an entry here risks a value like
+/// `--path-prefix --out-format` tokenizing as its own flag and being misdetected by
+/// [`has_output_flag`].
+fn run_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
     // The one exception to one-grammar-per-command (`src/core/README.md`), earned by a strict
     // subset: every flag valid before `run` stays valid after it. Grammars that merely
     // intersect get a table each instead.
-    if let Some(spec) = golangci_takes_value(kind, name) {
+    if let Some(spec) = global_takes_value(kind, name) {
         return Some(spec);
     }
     if OUTPUT_PATH_FLAGS.contains(&name) && kind == TokenKind::Long {
@@ -247,7 +249,7 @@ fn classify_invocation(args: &[String]) -> Invocation {
 /// entirely at `--` or at a non-flag token that isn't a recognized subcommand — mirroring
 /// golangci-lint's own arg parsing just enough to locate `run`, not fully replicate it.
 fn find_subcommand_index(args: &[String]) -> Option<usize> {
-    let tokens = arg_tokenizer::tokenize_grammar(args, &golangci_takes_value, Dialect::Posix);
+    let tokens = arg_tokenizer::tokenize_grammar(args, &global_takes_value, Dialect::Posix);
 
     for token in &tokens {
         match token.kind {
@@ -256,7 +258,7 @@ fn find_subcommand_index(args: &[String]) -> Option<usize> {
             // condition -- keep scanning past it, same as any other unrecognized `-`-prefixed
             // token, instead of treating it as "no subcommand found."
             TokenKind::Positional if token.is_free_positional() && token.text != "-" => {
-                return is_golangci_subcommand(token.text).then_some(token.source_index);
+                return is_subcommand(token.text).then_some(token.source_index);
             }
             _ => {}
         }
@@ -305,7 +307,7 @@ const OUTPUT_PATH_FLAGS: &[&str] = &[
 /// other format takes nothing away from stdout, so RTK still injects there or it is left with
 /// nothing to parse.
 fn has_output_flag(args: &[String]) -> bool {
-    let tokens = arg_tokenizer::tokenize_grammar(args, &golangci_run_takes_value, Dialect::Posix);
+    let tokens = arg_tokenizer::tokenize_grammar(args, &run_takes_value, Dialect::Posix);
     tokens.iter().any(|t| {
         if t.kind != TokenKind::Long {
             return false;
@@ -760,7 +762,7 @@ mod tests {
         // --out-format is a v1-only legacy flag; its value must still link, not tokenize as an
         // unlinked Positional.
         let args = vec!["--out-format".to_string(), "json".to_string()];
-        let tokens = arg_tokenizer::tokenize_grammar(&args, &golangci_run_takes_value, Dialect::Posix);
+        let tokens = arg_tokenizer::tokenize_grammar(&args, &run_takes_value, Dialect::Posix);
         assert!(tokens[0].linked.is_some(), "\"json\" must link to --out-format");
     }
 
