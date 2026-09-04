@@ -122,8 +122,17 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
     let binlog_path = build_binlog_path(subcommand);
     let should_expect_binlog = subcommand != "test" || has_binlog_arg(&tokens);
 
+    // Once, not once per consumer: it walks the filesystem, and both the results-directory
+    // lookup and the injection below have to agree on the answer.
+    let runner_mode = if subcommand == "test" {
+        detect_test_runner_mode(&tokens)
+    } else {
+        TestRunnerMode::Classic
+    };
+
     // For test commands, prefer user-provided results directory; otherwise create isolated one.
-    let (trx_results_dir, cleanup_trx_results_dir) = resolve_trx_results_dir(subcommand, &tokens);
+    let (trx_results_dir, cleanup_trx_results_dir) =
+        resolve_trx_results_dir(subcommand, &tokens, runner_mode);
 
     let mut cmd = resolved_command("dotnet");
     cmd.env(DOTNET_CLI_UI_LANGUAGE, DOTNET_CLI_UI_LANGUAGE_VALUE);
@@ -135,6 +144,7 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
         &tokens,
         &binlog_path,
         trx_results_dir.as_deref(),
+        runner_mode,
     ) {
         cmd.arg(arg);
     }
@@ -286,12 +296,16 @@ fn unique_temp_suffix() -> String {
     format!("{:x}{:x}{:x}", ts, pid, seq)
 }
 
-fn resolve_trx_results_dir(subcommand: &str, tokens: &[Token<'_>]) -> (Option<PathBuf>, bool) {
+fn resolve_trx_results_dir(
+    subcommand: &str,
+    tokens: &[Token<'_>],
+    runner_mode: TestRunnerMode,
+) -> (Option<PathBuf>, bool) {
     if subcommand != "test" {
         return (None, false);
     }
 
-    if let Some(user_dir) = extract_results_directory_arg(tokens) {
+    if let Some(user_dir) = extract_results_directory_arg(tokens, runner_mode) {
         return (Some(user_dir), false);
     }
 
@@ -516,6 +530,7 @@ fn build_effective_dotnet_args(
     tokens: &[Token<'_>],
     binlog_path: &Path,
     trx_results_dir: Option<&Path>,
+    runner_mode: TestRunnerMode,
 ) -> Vec<String> {
     let mut effective = Vec::new();
 
@@ -526,12 +541,6 @@ fn build_effective_dotnet_args(
     if subcommand != "test" && !has_verbosity_arg(tokens) {
         effective.push("-v:minimal".to_string());
     }
-
-    let runner_mode = if subcommand == "test" {
-        detect_test_runner_mode(tokens)
-    } else {
-        TestRunnerMode::Classic
-    };
 
     // --nologo: skip for MtpNative — args pass directly to the MTP runtime which
     // does not understand MSBuild/VSTest flags.
@@ -546,7 +555,7 @@ fn build_effective_dotnet_args(
                     effective.push("--logger".to_string());
                     effective.push("trx".to_string());
                 }
-                if !has_results_directory_arg(tokens) {
+                if !has_results_directory_arg(tokens, runner_mode) {
                     if let Some(results_dir) = trx_results_dir {
                         effective.push("--results-directory".to_string());
                         effective.push(results_dir.display().to_string());
@@ -591,7 +600,7 @@ fn has_verbosity_arg(tokens: &[Token<'_>]) -> bool {
 }
 
 /// How the targeted test project(s) run tests — determines which TRX injection strategy to use.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TestRunnerMode {
     /// Classic VSTest runner. Inject `--logger trx --results-directory`.
     Classic,
@@ -889,10 +898,29 @@ fn has_trx_logger_arg(tokens: &[Token<'_>]) -> bool {
         })
 }
 
-fn has_results_directory_arg(tokens: &[Token<'_>]) -> bool {
-    // Unscoped for the same reason as the extraction below: in MTP bridge mode the runner's
-    // own `--results-directory` past `--` is where the TRX actually lands.
-    arg_tokenizer::has_double_dash_flag(tokens, Dialect::Msbuild, "results-directory")
+/// Where a `--results-directory` counts, which is not the same region in both runner modes.
+///
+/// In MTP bridge mode the runner reads its own copy from past the `--`, and that is where the
+/// TRX lands. In Classic/VSTest the flag is dotnet's own and must precede the `--`; one past it
+/// belongs to the test app, and dotnet writes to ./TestResults regardless -- verified against
+/// the real SDK 9. Both lookups below share this so they cannot disagree: reading the app's
+/// path as dotnet's would splice it into dotnet's own arguments.
+fn results_directory_scope<'t, 'a>(
+    tokens: &'t [Token<'a>],
+    runner_mode: TestRunnerMode,
+) -> &'t [Token<'a>] {
+    match runner_mode {
+        TestRunnerMode::MtpVsTestBridge => tokens,
+        TestRunnerMode::Classic | TestRunnerMode::MtpNative => dotnet_own_tokens(tokens),
+    }
+}
+
+fn has_results_directory_arg(tokens: &[Token<'_>], runner_mode: TestRunnerMode) -> bool {
+    arg_tokenizer::has_double_dash_flag(
+        results_directory_scope(tokens, runner_mode),
+        Dialect::Msbuild,
+        "results-directory",
+    )
 }
 
 fn has_report_arg(tokens: &[Token<'_>]) -> bool {
@@ -954,11 +982,16 @@ fn has_write_mode_override(tokens: &[Token<'_>]) -> bool {
     write_override_tokens(tokens).next().is_some()
 }
 
-fn extract_results_directory_arg(tokens: &[Token<'_>]) -> Option<PathBuf> {
-    // Unscoped: in MTP bridge mode the runner reads its own `--results-directory` from past
-    // the `--`, and that is the directory RTK has to scan for the TRX afterwards.
-    arg_tokenizer::double_dash_flag_value(tokens, Dialect::Msbuild, "results-directory")
-        .map(PathBuf::from)
+fn extract_results_directory_arg(
+    tokens: &[Token<'_>],
+    runner_mode: TestRunnerMode,
+) -> Option<PathBuf> {
+    arg_tokenizer::double_dash_flag_value(
+        results_directory_scope(tokens, runner_mode),
+        Dialect::Msbuild,
+        "results-directory",
+    )
+    .map(PathBuf::from)
 }
 
 fn normalize_build_summary(
@@ -1467,7 +1500,19 @@ mod tests {
         };
 
         let tokens = tokenize_dotnet_args(args);
-        build_effective_dotnet_args(subcommand, args, &tokens, binlog_path, trx_results_dir)
+        let runner_mode = if subcommand == "test" {
+            detect_test_runner_mode(&tokens)
+        } else {
+            TestRunnerMode::Classic
+        };
+        build_effective_dotnet_args(
+            subcommand,
+            args,
+            &tokens,
+            binlog_path,
+            trx_results_dir,
+            runner_mode,
+        )
     }
 
     fn trx_with_counts(total: usize, passed: usize, failed: usize) -> String {
@@ -1510,11 +1555,11 @@ mod tests {
     #[test]
     fn test_double_dash_only_flags_reject_single_dash_and_slash_spellings() {
         let args = vec!["-results-directory".to_string(), "/tmp/out".to_string()];
-        assert!(!has_results_directory_arg(&tokenize_dotnet_args(&args)));
-        assert_eq!(extract_results_directory_arg(&tokenize_dotnet_args(&args)), None);
+        assert!(!has_results_directory_arg(&tokenize_dotnet_args(&args), TestRunnerMode::Classic));
+        assert_eq!(extract_results_directory_arg(&tokenize_dotnet_args(&args), TestRunnerMode::Classic), None);
 
         let args = vec!["/results-directory".to_string(), "/tmp/out".to_string()];
-        assert!(!has_results_directory_arg(&tokenize_dotnet_args(&args)));
+        assert!(!has_results_directory_arg(&tokenize_dotnet_args(&args), TestRunnerMode::Classic));
 
         let args = vec!["-report".to_string(), "/tmp/r.json".to_string()];
         assert!(!has_report_arg(&tokenize_dotnet_args(&args)));
@@ -1531,7 +1576,7 @@ mod tests {
 
         // The canonical "--" forms still work.
         let args = vec!["--results-directory".to_string(), "/tmp/out".to_string()];
-        assert!(has_results_directory_arg(&tokenize_dotnet_args(&args)));
+        assert!(has_results_directory_arg(&tokenize_dotnet_args(&args), TestRunnerMode::Classic));
     }
 
     #[test]
@@ -2493,7 +2538,14 @@ mod tests {
         );
 
         let binlog_path = Path::new("/tmp/test.binlog");
-        let injected = build_effective_dotnet_args("test", &args, &tokens, binlog_path, None);
+        let injected = build_effective_dotnet_args(
+            "test",
+            &args,
+            &tokens,
+            binlog_path,
+            None,
+            detect_test_runner_mode(&tokens),
+        );
 
         // MTP VsTestBridge → --report-trx injected after --, no VSTest --logger trx
         assert!(!injected.contains(&"--logger".to_string()));
@@ -2523,7 +2575,14 @@ mod tests {
         );
 
         let binlog_path = Path::new("/tmp/test.binlog");
-        let injected = build_effective_dotnet_args("test", &args, &tokens, binlog_path, None);
+        let injected = build_effective_dotnet_args(
+            "test",
+            &args,
+            &tokens,
+            binlog_path,
+            None,
+            detect_test_runner_mode(&tokens),
+        );
 
         // --report-trx injected after --, --nologo supported in bridge mode
         assert!(!injected.contains(&"--logger".to_string()));
@@ -2567,7 +2626,14 @@ mod tests {
         );
 
         let binlog_path = Path::new("/tmp/test.binlog");
-        let injected = build_effective_dotnet_args("test", &args, &tokens, binlog_path, None);
+        let injected = build_effective_dotnet_args(
+            "test",
+            &args,
+            &tokens,
+            binlog_path,
+            None,
+            detect_test_runner_mode(&tokens),
+        );
 
         // VsTestBridge → inject -- --report-trx after user args
         assert!(injected.contains(&"--".to_string()));
@@ -2600,7 +2666,14 @@ mod tests {
         ];
         let binlog_path = Path::new("/tmp/test.binlog");
         let tokens = tokenize_dotnet_args(&args);
-        let injected = build_effective_dotnet_args("test", &args, &tokens, binlog_path, None);
+        let injected = build_effective_dotnet_args(
+            "test",
+            &args,
+            &tokens,
+            binlog_path,
+            None,
+            detect_test_runner_mode(&tokens),
+        );
 
         // --report-trx inserted right after existing --
         let sep_pos = injected.iter().position(|a| a == "--").unwrap();
@@ -2629,7 +2702,14 @@ mod tests {
         ];
         let binlog_path = Path::new("/tmp/test.binlog");
         let tokens = tokenize_dotnet_args(&args);
-        let injected = build_effective_dotnet_args("test", &args, &tokens, binlog_path, None);
+        let injected = build_effective_dotnet_args(
+            "test",
+            &args,
+            &tokens,
+            binlog_path,
+            None,
+            detect_test_runner_mode(&tokens),
+        );
 
         // Should not double-inject
         assert_eq!(injected.iter().filter(|a| *a == "--report-trx").count(), 1);
@@ -2656,7 +2736,14 @@ mod tests {
         let binlog_path = Path::new("/tmp/test.binlog");
         let trx_dir = Path::new("/tmp/test_results");
         let injected =
-            build_effective_dotnet_args("test", &args, &tokens, binlog_path, Some(trx_dir));
+            build_effective_dotnet_args(
+                "test",
+                &args,
+                &tokens,
+                binlog_path,
+                Some(trx_dir),
+                TestRunnerMode::Classic,
+            );
         assert!(injected.contains(&"--logger".to_string()));
         assert!(injected.contains(&"trx".to_string()));
     }
@@ -2936,26 +3023,26 @@ mod tests {
     #[test]
     fn test_has_results_directory_arg_detects_variants() {
         let args = vec!["--results-directory".to_string(), "/tmp/trx".to_string()];
-        assert!(has_results_directory_arg(&tokenize_dotnet_args(&args)));
+        assert!(has_results_directory_arg(&tokenize_dotnet_args(&args), TestRunnerMode::Classic));
 
         let args = vec!["--results-directory=/tmp/trx".to_string()];
-        assert!(has_results_directory_arg(&tokenize_dotnet_args(&args)));
+        assert!(has_results_directory_arg(&tokenize_dotnet_args(&args), TestRunnerMode::Classic));
 
         let args = vec!["--logger".to_string(), "trx".to_string()];
-        assert!(!has_results_directory_arg(&tokenize_dotnet_args(&args)));
+        assert!(!has_results_directory_arg(&tokenize_dotnet_args(&args), TestRunnerMode::Classic));
     }
 
     #[test]
     fn test_extract_results_directory_arg_detects_variants() {
         let args = vec!["--results-directory".to_string(), "/tmp/r1".to_string()];
         assert_eq!(
-            extract_results_directory_arg(&tokenize_dotnet_args(&args)),
+            extract_results_directory_arg(&tokenize_dotnet_args(&args), TestRunnerMode::Classic),
             Some(PathBuf::from("/tmp/r1"))
         );
 
         let args = vec!["--results-directory=/tmp/r2".to_string()];
         assert_eq!(
-            extract_results_directory_arg(&tokenize_dotnet_args(&args)),
+            extract_results_directory_arg(&tokenize_dotnet_args(&args), TestRunnerMode::Classic),
             Some(PathBuf::from("/tmp/r2"))
         );
     }
@@ -2967,16 +3054,56 @@ mod tests {
             "/custom/results".to_string(),
         ];
 
-        let (dir, cleanup) = resolve_trx_results_dir("test", &tokenize_dotnet_args(&args));
+        let (dir, cleanup) = resolve_trx_results_dir("test", &tokenize_dotnet_args(&args), TestRunnerMode::Classic);
         assert_eq!(dir, Some(PathBuf::from("/custom/results")));
         assert!(!cleanup);
+    }
+
+    #[test]
+    fn test_results_directory_past_the_boundary_is_the_apps_in_classic_mode() {
+        // Verified against the real SDK 9: with `dotnet test -- --results-directory X`, a
+        // Classic/VSTest run writes its TRX to ./TestResults and the flag reaches the test app
+        // instead. Reading it as dotnet's own suppressed RTK's injection and left that TRX
+        // behind in the user's project, unclaimed and never cleaned up.
+        let args = vec![
+            "--".to_string(),
+            "--results-directory".to_string(),
+            "/tmp/rd2".to_string(),
+        ];
+        let tokens = tokenize_dotnet_args(&args);
+
+        assert!(!has_results_directory_arg(&tokens, TestRunnerMode::Classic));
+        assert_eq!(
+            extract_results_directory_arg(&tokens, TestRunnerMode::Classic),
+            None
+        );
+        let (dir, cleanup) = resolve_trx_results_dir("test", &tokens, TestRunnerMode::Classic);
+        assert!(cleanup, "RTK's own temp dir, so RTK cleans it up");
+        assert_ne!(dir, Some(PathBuf::from("/tmp/rd2")));
+
+        // The bridge runner really does read its own copy from past the `--`.
+        assert!(has_results_directory_arg(
+            &tokens,
+            TestRunnerMode::MtpVsTestBridge
+        ));
+        assert_eq!(
+            extract_results_directory_arg(&tokens, TestRunnerMode::MtpVsTestBridge),
+            Some(PathBuf::from("/tmp/rd2"))
+        );
+
+        // Before the boundary it is dotnet's own flag in every mode.
+        let own = vec!["--results-directory".to_string(), "/tmp/rd1".to_string()];
+        let own = tokenize_dotnet_args(&own);
+        for mode in [TestRunnerMode::Classic, TestRunnerMode::MtpVsTestBridge] {
+            assert!(has_results_directory_arg(&own, mode), "{mode:?}");
+        }
     }
 
     #[test]
     fn test_resolve_trx_results_dir_generated_directory_is_marked_for_cleanup() {
         let args = Vec::<String>::new();
 
-        let (dir, cleanup) = resolve_trx_results_dir("test", &tokenize_dotnet_args(&args));
+        let (dir, cleanup) = resolve_trx_results_dir("test", &tokenize_dotnet_args(&args), TestRunnerMode::Classic);
         assert!(dir.is_some());
         assert!(cleanup);
     }

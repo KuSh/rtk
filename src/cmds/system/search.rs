@@ -873,11 +873,14 @@ fn is_format_flag_token(engine: Engine, kind: TokenKind, text: &str) -> bool {
         "vimgrep",
     ];
     match kind {
-        TokenKind::Long => LONG.contains(&text),
+        // grep's `--initial-tab` pads and tabs every match line, so RTK's own `-H --null -n`
+        // parse reads nothing back and leaked the injected flags into the output. ripgrep has
+        // no such flag, and its `-T` is `--type-not`, a value-taking flag (see rg_takes_value).
+        TokenKind::Long => LONG.contains(&text) || (engine == Engine::Grep && text == "initial-tab"),
         // -c count, -l/-L lists, -o only-matching, -q quiet, -b byte-offset, -Z NUL are shared;
-        // -L/-z mean something unrelated to output shape for rg specifically (see above).
+        // -L/-T/-z mean something unrelated to output shape for rg specifically (see above).
         TokenKind::Short => match text {
-            "L" | "z" => engine == Engine::Grep,
+            "L" | "T" | "z" => engine == Engine::Grep,
             "Z" | "b" | "c" | "l" | "o" | "q" => true,
             _ => false,
         },
@@ -1842,6 +1845,26 @@ mod tests {
         assert!(detected_for(Engine::Rg, &["-n"]).show_line);
         assert!(!detected_for(Engine::Rg, &["-n", "-N"]).show_line);
         assert!(!detected_for(Engine::Rg, &["-n", "--no-line-number"]).show_line);
+    }
+
+    #[test]
+    fn grep_initial_tab_is_a_shape_flag_in_both_spellings() {
+        // `-T` pads and tabs every match line, so RTK's forced `-H --null -n` parse reads
+        // nothing back and leaked the injected flags -- filename, a raw NUL and the line
+        // number -- straight into the output.
+        assert!(is_format_flag_token(Engine::Grep, TokenKind::Short, "T"));
+        // ripgrep's -T is --type-not, a value-taking flag, not a shape flag.
+        assert!(!is_format_flag_token(Engine::Rg, TokenKind::Short, "T"));
+        assert!(is_format_flag_token(
+            Engine::Grep,
+            TokenKind::Long,
+            "initial-tab"
+        ));
+        assert!(!is_format_flag_token(
+            Engine::Rg,
+            TokenKind::Long,
+            "initial-tab"
+        ));
     }
 
     #[test]

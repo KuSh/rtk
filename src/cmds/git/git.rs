@@ -303,6 +303,22 @@ fn run_diff(
 
     let diff_result = exec_capture(&mut diff_cmd).context("Failed to run git diff")?;
 
+    // git's verdict on the command as the user typed it. The stat probe above ran with the
+    // patch-shape flags stripped, so it succeeds on things git refuses -- `git diff -Uabc`
+    // exits 129 raw, and compacting the empty result reported success with a tidy diffstat.
+    if !diff_result.success() {
+        if !diff_result.stderr.trim().is_empty() {
+            eprint!("{}", diff_result.stderr);
+        }
+        timer.track(
+            &format!("git diff {}", args.join(" ")),
+            &format!("rtk git diff {}", args.join(" ")),
+            &diff_result.stdout,
+            &diff_result.stdout,
+        );
+        return Ok(diff_result.exit_code);
+    }
+
     let printed = if !diff_result.stdout.is_empty() {
         let compacted = compact_diff(&diff_result.stdout, max_lines.unwrap_or(500));
         format!("{}\n\nChanges:\n{}", result.stdout.trim(), compacted)
@@ -420,9 +436,23 @@ fn run_show(
     for arg in args {
         raw_cmd.arg(arg);
     }
-    let raw_output = exec_capture(&mut raw_cmd)
-        .map(|r| r.stdout)
-        .unwrap_or_default();
+    let raw_result = exec_capture(&mut raw_cmd).context("Failed to run git show")?;
+    // git's verdict on the command as the user typed it, before the steps below run it again
+    // with RTK's own flags -- the stat step strips the patch-shape flags, so it succeeds where
+    // git refused (`git show -pq HEAD` exits 128 raw) and the compaction looked like success.
+    if !raw_result.success() {
+        if !raw_result.stderr.trim().is_empty() {
+            eprint!("{}", raw_result.stderr);
+        }
+        timer.track(
+            &format!("git show {}", args.join(" ")),
+            &format!("rtk git show {}", args.join(" ")),
+            &raw_result.stdout,
+            &raw_result.stdout,
+        );
+        return Ok(raw_result.exit_code);
+    }
+    let raw_output = raw_result.stdout;
 
     // Step 1: one-line commit summary
     let mut summary_cmd = show_cmd(
@@ -1236,6 +1266,9 @@ fn log_wants_raw_shape(token: &Token<'_>, tokens: &[Token<'_>]) -> bool {
                 | "remerge-diff"
                 | "compact-summary"
                 | "dirstat"
+                // Prefixes every output line, including the `diff --git`/`@@` markers the
+                // compaction keys on, so nothing parses and the body came back empty.
+                | "line-prefix"
                 | "name-only"
                 | "name-status"
                 | "numstat"
@@ -1920,10 +1953,6 @@ fn format_checkout_success(args: &[String], raw: &str) -> String {
             pluralize(restored, "file restored", "files restored")
         );
     }
-    if let Some(branch) = checkout_reset_branch_arg(&tokens) {
-        return format!("ok {}", branch);
-    }
-
     for line in raw.lines().map(str::trim) {
         if let Some(branch) = quoted_suffix(line, "Switched to a new branch ") {
             return format!("ok {} (new)", branch);
@@ -1943,8 +1972,19 @@ fn format_checkout_success(args: &[String], raw: &str) -> String {
         }
     }
 
+    // Both of these are the fallback for when the scan above misses, never a short-circuit
+    // past it: `-B` creates *or* resets, and only git knows which happened, so claiming the
+    // name early cost `git checkout -Bfoo` its `(new)` marker.
+    //
+    // The scan is English-only and this child deliberately keeps the user's locale (see
+    // run_checkout), so under another locale `-B` reaches `ok <branch>` here even when it
+    // created the branch. That is a weaker answer, never a wrong one -- the marker is omitted
+    // rather than claimed falsely -- but it does mean `(new)` is not guaranteed.
     if let Some(branch) = checkout_new_branch_arg(&tokens) {
         return format!("ok {} (new)", branch);
+    }
+    if let Some(branch) = checkout_reset_branch_arg(&tokens) {
+        return format!("ok {}", branch);
     }
     if let Some(branch) = checkout_branch_arg(&tokens) {
         return format!("ok {}", branch);
@@ -4620,6 +4660,30 @@ A  added.rs
         // display flag turns the whole command into a raw passthrough.
         assert!(!gate(&["--oneline"]));
         assert!(!gate(&[]));
+    }
+
+    #[test]
+    fn test_line_prefix_takes_the_raw_route() {
+        // It prefixes every output line, `diff --git` and `@@` markers included, so the
+        // compaction parses nothing and printed a diffstat over an empty `Changes:` section.
+        for args in [
+            &["--line-prefix=XX"][..],
+            &["--line-prefix", "XX"][..],
+            // git takes the next token as the value, so a following flag is the prefix text.
+            &["--line-prefix", "--stat"][..],
+        ] {
+            let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let log = tokenize_git_log_args(&owned);
+            assert!(
+                log.iter().any(|t| log_wants_raw_shape(t, &log)),
+                "{args:?} on log"
+            );
+            let diff = tokenize_git_diff_args(&owned);
+            assert!(
+                diff.iter().any(|t| diff_wants_raw_shape(t, &diff)),
+                "{args:?} on diff"
+            );
+        }
     }
 
     #[test]

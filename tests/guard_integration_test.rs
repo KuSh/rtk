@@ -386,13 +386,39 @@ fn git_checkout_new_branch_emits_compact_ok() {
 }
 
 #[test]
-fn git_checkout_reset_branch_does_not_claim_new_branch() {
+fn git_checkout_dash_b_capital_reports_what_git_actually_did() {
     let dir = init_git_repo();
 
+    // `-B` creates *or* resets, and only git knows which. Reading the branch name out of the
+    // args and returning early claimed neither, so a created branch lost its `(new)` marker.
+    //
+    // rtk_output_in_dir pins LC_ALL=C, which is what makes the English scan land. Under
+    // another locale this degrades to the args fallback ("ok feature/test") rather than
+    // claiming a marker it cannot verify -- weaker, never wrong -- so `(new)` is asserted
+    // here only because the locale is pinned.
     let (out, code) = rtk_in_dir(dir.path(), &["git", "checkout", "-B", "feature/test"]);
-
     assert_eq!(code, Some(0));
-    assert_eq!(out.trim(), "ok feature/test");
+    assert_eq!(
+        out.trim(),
+        "ok feature/test (new)",
+        "git: Switched to a new branch"
+    );
+
+    // Reset of a branch that already exists: not new, and the args fallback names it.
+    git_in_dir(dir.path(), &["checkout", "-q", "main"]);
+    let (out, code) = rtk_in_dir(dir.path(), &["git", "checkout", "-B", "feature/test"]);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        out.trim(),
+        "ok feature/test",
+        "git: Switched to and reset branch -- matches no scan prefix, so the args name it"
+    );
+
+    // Glued spelling routes identically; the string scans it replaced could not read it.
+    git_in_dir(dir.path(), &["checkout", "-q", "main"]);
+    let (out, code) = rtk_in_dir(dir.path(), &["git", "checkout", "-Bfeature/glued"]);
+    assert_eq!(code, Some(0));
+    assert_eq!(out.trim(), "ok feature/glued (new)");
 }
 
 #[test]

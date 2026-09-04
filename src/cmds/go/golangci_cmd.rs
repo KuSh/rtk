@@ -32,6 +32,11 @@ fn is_subcommand(name: &str) -> bool {
 /// golangci-lint's *global* grammar: the value-taking flags accepted before a subcommand. `-c`
 /// is `--config`'s shorthand; this list is wider than `--help`'s "Global Flags" section, which
 /// omits several of these.
+///
+/// Solo-only, like every short flag here: Cobra does not let a value-taking shorthand sit
+/// inside a cluster (`golangci-lint -vc foo.yml run` is "unknown shorthand flag: 'c' in -c",
+/// verified against 2.13.1). Reading one as value-taking there swallowed the next token --
+/// `-Egosec run` lost `run`, and with it the subcommand detection this list exists for.
 fn global_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
     match kind {
         TokenKind::Long => matches!(
@@ -39,7 +44,7 @@ fn global_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
             "color" | "config" | "cpu-profile-path" | "mem-profile-path" | "trace-path"
         )
         .then(ValueSpec::value),
-        TokenKind::Short => (name == "c").then(ValueSpec::value),
+        TokenKind::Short => (name == "c").then(ValueSpec::solo_only),
         _ => None,
     }
 }
@@ -91,7 +96,7 @@ fn run_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
         )
         .then(ValueSpec::value),
         // `-e`/`-p` are 1.x's --exclude/--presets; 2.x rejects them outright either way.
-        TokenKind::Short => matches!(name, "D" | "E" | "e" | "j" | "p").then(ValueSpec::value),
+        TokenKind::Short => matches!(name, "D" | "E" | "e" | "j" | "p").then(ValueSpec::solo_only),
         _ => None,
     }
 }
@@ -755,6 +760,23 @@ mod tests {
             "errcheck".to_string(),
         ]));
         assert!(!has_output_flag(&["--timeout".to_string(), "30s".to_string()]));
+    }
+
+    #[test]
+    fn test_clustered_short_flag_does_not_swallow_the_subcommand() {
+        // Cobra rejects a value-taking shorthand inside a cluster ("unknown shorthand flag:
+        // 'c' in -c", golangci-lint 2.13.1), so reading `-Egosec`'s trailing `c` as --config
+        // and eating `run` lost the subcommand and with it all filtering.
+        let args: Vec<String> = ["-Egosec", "run"].iter().map(|a| a.to_string()).collect();
+        assert_eq!(find_subcommand_index(&args), Some(1));
+
+        // Solo, it still takes its value -- that spelling golangci-lint does accept.
+        let args: Vec<String> = ["-c", "cfg.yml", "run"].iter().map(|a| a.to_string()).collect();
+        assert_eq!(find_subcommand_index(&args), Some(2));
+
+        // And the attached spelling is untouched by the solo-only rule.
+        let args: Vec<String> = ["-cCfg.yml", "run"].iter().map(|a| a.to_string()).collect();
+        assert_eq!(find_subcommand_index(&args), Some(1));
     }
 
     #[test]
