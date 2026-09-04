@@ -999,14 +999,14 @@ fn log_arg_tokens(args: &[String]) -> Vec<LogArg<'_>> {
     let mut iter = args.iter().take_while(|arg| *arg != "--");
     while let Some(arg) = iter.next() {
         let arg_str = arg.as_str();
-        if arg_str == "--max-count" || consumes_next_token_as_value(arg_str) {
-            if let Some(value) = iter.next() {
-                tokens.push(LogArg::Value {
-                    flag: arg_str,
-                    value: value.as_str(),
-                });
-                continue;
-            }
+        if (arg_str == "--max-count" || consumes_next_token_as_value(arg_str))
+            && let Some(value) = iter.next()
+        {
+            tokens.push(LogArg::Value {
+                flag: arg_str,
+                value: value.as_str(),
+            });
+            continue;
         }
         tokens.push(LogArg::Flag(arg_str));
     }
@@ -1096,10 +1096,10 @@ fn parse_limit_from_tokens(tokens: &[LogArg<'_>]) -> Option<usize> {
             }
             // --max-count=20
             LogArg::Flag(flag) => {
-                if let Some(rest) = flag.strip_prefix("--max-count=") {
-                    if let Ok(n) = rest.parse::<usize>() {
-                        return Some(n);
-                    }
+                if let Some(rest) = flag.strip_prefix("--max-count=")
+                    && let Ok(n) = rest.parse::<usize>()
+                {
+                    return Some(n);
                 }
             }
             LogArg::Value { .. } => {}
@@ -1862,12 +1862,12 @@ impl LineHandler for GitPushLineHandler {
         if line.contains("Everything up-to-date") {
             self.up_to_date = true;
         }
-        if self.pushed_ref.is_none() {
-            if let Some(idx) = line.find(" -> ") {
-                let after = &line[idx + 4..];
-                if let Some(dest) = after.split_whitespace().next() {
-                    self.pushed_ref = Some(dest.to_string());
-                }
+        if self.pushed_ref.is_none()
+            && let Some(idx) = line.find(" -> ")
+        {
+            let after = &line[idx + 4..];
+            if let Some(dest) = after.split_whitespace().next() {
+                self.pushed_ref = Some(dest.to_string());
             }
         }
     }
@@ -2457,13 +2457,12 @@ fn compact_stash_stat(raw: &str) -> String {
     }
     let total = files.len();
     let mut out = join_with_overflow(&files[..total.min(CAP_LIST)], total, CAP_LIST, "files");
-    if total > CAP_LIST {
-        if let Some(hint) =
+    if total > CAP_LIST
+        && let Some(hint) =
             crate::core::tee::force_tee_tail_hint(&files.join("\n"), "git-stash-show", CAP_LIST + 1)
-        {
-            out.push(' ');
-            out.push_str(&hint);
-        }
+    {
+        out.push(' ');
+        out.push_str(&hint);
     }
     if !summary.is_empty() {
         out.push('\n');
