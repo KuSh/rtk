@@ -156,6 +156,22 @@ fn suppresses_diff_body(token: &Token<'_>) -> bool {
 
 /// True for a token asking git for patch output: `-p`/`-u`/`--patch`, and the context-width
 /// flags that imply a patch (`-U3`, `--unified=3`, `-W`/`--function-context`).
+/// Whether the body ends up suppressed once git's own arbitration is applied: `-s`,
+/// `--no-patch` and `--quiet` lose to a *later* `-p`/`--patch`/`-U<n>` and win over an earlier
+/// one (`git show -s -p` prints the diff, `git show -p -s` does not -- git 2.53). Taking the
+/// suppressors order-independently swallowed a patch the user had asked for last.
+fn body_is_suppressed<'t, 'a: 't>(tokens: impl Iterator<Item = &'t Token<'a>>) -> bool {
+    let mut suppressed = false;
+    for token in tokens {
+        if suppresses_diff_body(token) {
+            suppressed = true;
+        } else if requests_patch_output(token) {
+            suppressed = false;
+        }
+    }
+    suppressed
+}
+
 fn requests_patch_output(token: &Token<'_>) -> bool {
     match token.kind {
         TokenKind::Long => matches!(token.text, "patch" | "unified" | "function-context"),
@@ -168,6 +184,24 @@ fn requests_patch_output(token: &Token<'_>) -> bool {
 /// them wherever git would have read them. Rebuilt per token rather than per arg: every short
 /// flag in a `-xyz` cluster shares one `source_index`, so dropping the whole arg would take
 /// its siblings with it -- `-pl 100` lost the `-l` and left `100` behind as a bogus revision.
+/// `args` with any `--oneline` removed, by the token's own `source_index` so a pathspec of that
+/// name past `--` is left alone.
+fn args_without_oneline(args: &[String], tokens: &[Token<'_>]) -> Vec<String> {
+    let dropped: Vec<usize> = tokens
+        .iter()
+        .filter(|t| t.kind == TokenKind::Long && t.text == "oneline")
+        .map(|t| t.source_index)
+        .collect();
+    if dropped.is_empty() {
+        return args.to_vec();
+    }
+    args.iter()
+        .enumerate()
+        .filter(|(index, _)| !dropped.contains(index))
+        .map(|(_, arg)| arg.clone())
+        .collect()
+}
+
 fn args_without_patch_shape(args: &[String], tokens: &[Token<'_>]) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(args.len());
     for (index, arg) in args.iter().enumerate() {
@@ -351,10 +385,11 @@ fn run_diff(
 /// compact around -- its own `--pretty=format:` would be overridden by theirs.
 ///
 /// `--oneline` is deliberately absent, unlike `run_log`'s equivalent check: it does not replace
-/// the summary with something unparseable, it only means the user's one-line format wins over
-/// RTK's own one-line format. Routing the whole command raw over that cosmetic difference cost
-/// 3.7x the output on a real commit (116 KB against 31 KB), on the one metric this tool exists
-/// for.
+/// the summary with something unparseable, so routing the whole command raw over it cost 3.7x
+/// the output on a real commit (116 KB against 31 KB), on the one metric this tool exists for.
+/// It does outrank RTK's own `--pretty=format:`, which is passed before the user's args, so the
+/// stat step drops it from what it forwards (see `args_without_oneline`); otherwise the commit
+/// header that step suppresses comes back and the summary prints twice.
 fn show_wants_format(tokens: &[Token<'_>]) -> bool {
     tokens
         .iter()
@@ -469,7 +504,7 @@ fn run_show(
     }
     let mut printed = summary_result.stdout.trim().to_string();
 
-    if tokens.iter().any(suppresses_diff_body) {
+    if body_is_suppressed(tokens.iter()) {
         // `git show -s` is the commit summary and nothing else, so the stat and diff steps
         // below would print what the user explicitly suppressed.
         let shown = never_worse(&raw_output, &printed);
@@ -484,9 +519,14 @@ fn run_show(
     }
 
     // Step 2: --stat summary
+    // `--oneline` is dropped, not outranked: RTK's `--pretty=format:` suppresses the commit
+    // header this step must not repeat, and git resolves the two by last flag wins, so a user
+    // `--oneline` re-enabled it and the summary printed twice. Appending RTK's flag after the
+    // user's instead would put it past their `--`, where git reads it as a pathspec.
+    let stat_args = args_without_oneline(args, &tokens);
     let mut stat_cmd = show_cmd(
         global_args,
-        args,
+        &stat_args,
         &tokens,
         &["--no-patch", "--stat", "--pretty=format:"],
         true,
@@ -1022,6 +1062,7 @@ pub(crate) fn compact_diff(diff: &str, max_lines: usize) -> String {
 }
 
 /// RTK's default `git log` limit, applied whenever the user names none.
+const DEFAULT_LOG_LIMIT: usize = 10;
 const DEFAULT_LOG_LIMIT_ARG: &str = "-10";
 
 /// `git log <args>` for the raw passthrough, carrying RTK's default limit unless the user named
@@ -1036,11 +1077,29 @@ const DEFAULT_LOG_LIMIT_ARG: &str = "-10";
 /// whose entire purpose is the merge diff.
 fn raw_log_passthrough_args(args: &[String], tokens: &[Token<'_>]) -> Vec<OsString> {
     let mut out = vec![OsString::from("log")];
-    if !has_limit_flag(tokens) {
+    if !has_limit_flag(tokens) && !bounds_the_walk(tokens) {
+        // Say so. This streams straight to the terminal, so unlike the compacted path there is
+        // no footer and no tee to notice the missing commits from.
+        eprintln!("[rtk] showing {} commits; pass -n <count> for more", DEFAULT_LOG_LIMIT);
         out.push(OsString::from(DEFAULT_LOG_LIMIT_ARG));
     }
     out.extend(args.iter().map(OsString::from));
     out
+}
+
+/// True when the arguments already bound the walk, so RTK's default limit would only take away
+/// what the user explicitly asked for -- `git log -p HEAD~15..HEAD` means those 15 commits.
+///
+/// A revision range is the one bound that is exact; `--since` and friends narrow the walk but
+/// not to any particular size, so those still get the limit (and now the notice with it). A
+/// relative path is excluded because it is a pathspec, not a range.
+fn bounds_the_walk(tokens: &[Token<'_>]) -> bool {
+    arg_tokenizer::before_dashdash(tokens).iter().any(|t| {
+        t.is_free_positional()
+            && t.text.contains("..")
+            && !t.text.starts_with("./")
+            && !t.text.starts_with("../")
+    })
 }
 
 fn run_log(
@@ -4660,6 +4719,53 @@ A  added.rs
         // display flag turns the whole command into a raw passthrough.
         assert!(!gate(&["--oneline"]));
         assert!(!gate(&[]));
+    }
+
+    #[test]
+    fn test_body_suppression_follows_gits_last_flag_wins() {
+        // git 2.53: `git show -s -p` prints the diff, `git show -p -s` does not. Taking the
+        // suppressors order-independently swallowed a patch the user asked for last.
+        let cases: [(&[&str], bool); 6] = [
+            (&["-s"], true),
+            (&["--no-patch"], true),
+            (&["-s", "-p"], false),
+            (&["-p", "-s"], true),
+            (&["--no-patch", "--patch"], false),
+            (&["--patch", "--no-patch"], true),
+        ];
+        for (args, expected) in cases {
+            let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let tokens = tokenize_git_diff_args(&owned);
+            assert_eq!(
+                body_is_suppressed(tokens.iter()),
+                expected,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_raw_log_limit_leaves_an_explicitly_bounded_walk_alone() {
+        let built = |args: &[&str]| {
+            let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let tokens = tokenize_git_log_args(&owned);
+            raw_log_passthrough_args(&owned, &tokens)
+                .iter()
+                .any(|a| a == DEFAULT_LOG_LIMIT_ARG)
+        };
+        // A revision range is an exact bound the user chose; capping it takes away what they
+        // asked for -- `git log -p HEAD~15..HEAD` came back with 10 of the 15.
+        assert!(!built(&["-p", "HEAD~15..HEAD"]));
+        assert!(!built(&["-p", "HEAD~3...HEAD"]));
+        assert!(!built(&["-p", "origin/main..HEAD"]));
+        // Unbounded still gets the limit, or a patch request prints the whole history.
+        assert!(built(&["-p"]));
+        assert!(built(&["-p", "HEAD"]));
+        // A relative pathspec is not a range.
+        assert!(built(&["-p", "../sibling"]));
+        assert!(built(&["-p", "./a..b"]));
+        // And an explicit limit still wins over both.
+        assert!(!built(&["-p", "-5"]));
     }
 
     #[test]
