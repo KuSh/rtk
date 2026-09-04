@@ -4,14 +4,12 @@ use crate::core::args_utils;
 use crate::core::guard::never_worse;
 use crate::core::runner::{self, RunOptions};
 use crate::core::stream::{
-    self, exec_capture, exec_capture_stdin, CaptureResult, FilterMode, LineHandler,
-    LineStreamFilter, StdinMode,
+    self, CaptureResult, FilterMode, LineHandler, LineStreamFilter, StdinMode, exec_capture,
+    exec_capture_stdin,
 };
 use crate::core::tracking;
 use crate::core::truncate::{CAP_LIST, CAP_WARNINGS};
-use crate::core::utils::{
-    exit_code_from_status, join_with_overflow, resolved_command, strip_ansi,
-};
+use crate::core::utils::{exit_code_from_status, join_with_overflow, resolved_command, strip_ansi};
 use anyhow::{Context, Result};
 use std::ffi::OsString;
 use std::process::Command;
@@ -1787,11 +1785,7 @@ fn quoted_suffix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
-    if count == 1 {
-        singular
-    } else {
-        plural
-    }
+    if count == 1 { singular } else { plural }
 }
 
 fn filter_checkout_failure(raw: &str) -> String {
@@ -2825,7 +2819,11 @@ mod tests {
         let removed: Vec<&str> = result.lines().filter(|l| l.starts_with('-')).collect();
         let added: Vec<&str> = result.lines().filter(|l| l.starts_with('+')).collect();
 
-        assert_eq!(removed, vec!["-DELETED_A", "-DELETED_B"], "`^-` must anchor");
+        assert_eq!(
+            removed,
+            vec!["-DELETED_A", "-DELETED_B"],
+            "`^-` must anchor"
+        );
         assert_eq!(added, vec!["+ADDED"], "`^+` must anchor");
 
         // rtk's own tally stays indented so these same greps never count it as
@@ -2866,7 +2864,11 @@ mod tests {
             "added `++i;` must survive, got:\n{}",
             result
         );
-        assert!(result.contains("  +1 -1"), "tally must count both, got:\n{}", result);
+        assert!(
+            result.contains("  +1 -1"),
+            "tally must count both, got:\n{}",
+            result
+        );
     }
 
     #[test]
@@ -2885,7 +2887,11 @@ mod tests {
         let ctx = result.lines().filter(|l| l.starts_with(" ctx")).count();
         let dels = result.lines().filter(|l| l.starts_with("-del")).count();
         assert_eq!(ctx, 3, "leading context is capped, got:\n{}", result);
-        assert_eq!(dels, 100, "every change must still be shown, got:\n{}", result);
+        assert_eq!(
+            dels, 100,
+            "every change must still be shown, got:\n{}",
+            result
+        );
         assert!(
             !result.contains("truncated"),
             "no change was dropped, got:\n{}",
@@ -2989,7 +2995,11 @@ mod tests {
             "mbox envelope must stay out of the body, got:\n{}",
             result
         );
-        assert!(result.contains("  +1 -1"), "tally counts real changes only, got:\n{}", result);
+        assert!(
+            result.contains("  +1 -1"),
+            "tally counts real changes only, got:\n{}",
+            result
+        );
     }
 
     #[test]
@@ -3036,10 +3046,7 @@ mod tests {
             diff_header_path(r#"diff --git "a/Ã©tÃ©.txt" "b/Ã©tÃ©.txt""#),
             r"Ã©tÃ©.txt"
         );
-        assert_eq!(
-            diff_header_path(r#"diff --cc "Ã©tÃ©.txt""#),
-            r"Ã©tÃ©.txt"
-        );
+        assert_eq!(diff_header_path(r#"diff --cc "Ã©tÃ©.txt""#), r"Ã©tÃ©.txt");
         // A rename quotes each side on its own.
         assert_eq!(
             diff_header_path(r#"diff --git a/plain.txt "b/Ã©t.txt""#),
@@ -3142,7 +3149,10 @@ mod tests {
     fn test_compact_diff_extra_range_does_not_strand_a_hunk() {
         // With the third range untracked, `--x` left it at 1 forever, so the
         // hunk never closed and the mbox signature became its content.
-        let out = compact_diff("diff --cc f\n@@@ -1 -1 -1 +0,0 @@@\n--x\n-- \n2.40.0\n", 100);
+        let out = compact_diff(
+            "diff --cc f\n@@@ -1 -1 -1 +0,0 @@@\n--x\n-- \n2.40.0\n",
+            100,
+        );
         assert!(out.contains("--x"), "got:\n{}", out);
         assert!(!out.contains("2.40.0"), "got:\n{}", out);
         assert!(!out.contains("-- "), "got:\n{}", out);
@@ -3178,7 +3188,10 @@ mod tests {
         assert_eq!(diff_header_path("diff --git i/f.txt w/f.txt"), "f.txt");
         // A rename's halves disagree past their first component, so the ` b/`
         // split still names the destination.
-        assert_eq!(diff_header_path("diff --git a/old.txt b/new.txt"), "new.txt");
+        assert_eq!(
+            diff_header_path("diff --git a/old.txt b/new.txt"),
+            "new.txt"
+        );
     }
 
     #[test]
@@ -3193,7 +3206,10 @@ mod tests {
     #[test]
     fn test_parse_hunk_header_counts() {
         let h = parse_hunk_header("@@ -10,3 +10,4 @@ fn ctx() {").expect("unified header");
-        assert_eq!((h.parents.as_slice(), h.new, h.prefix_width), (&[3][..], 4, 1));
+        assert_eq!(
+            (h.parents.as_slice(), h.new, h.prefix_width),
+            (&[3][..], 4, 1)
+        );
 
         // Omitted counts mean one line.
         let h = parse_hunk_header("@@ -1 +1 @@").expect("single-line header");
@@ -3285,8 +3301,7 @@ mod tests {
             }
             diff
         };
-        let count_changes =
-            |out: &str| out.lines().filter(|l| l.starts_with("-del")).count();
+        let count_changes = |out: &str| out.lines().filter(|l| l.starts_with("-del")).count();
 
         let without = compact_diff(&build(false), 500);
         let with = compact_diff(&build(true), 500);
@@ -4021,7 +4036,11 @@ A  added.rs
 
     #[test]
     fn test_real_flag_args_keeps_genuine_flags() {
-        let args = vec!["--grep".to_string(), "fix".to_string(), "--oneline".to_string()];
+        let args = vec![
+            "--grep".to_string(),
+            "fix".to_string(),
+            "--oneline".to_string(),
+        ];
         assert_eq!(real_flag_args(&args), vec!["--grep", "--oneline"]);
     }
 
@@ -4031,9 +4050,8 @@ A  added.rs
         // string "-5"; it is not a request to limit output to 5 commits.
         let args = vec!["--grep".to_string(), "-5".to_string()];
         assert!(
-            !real_flag_args(&args)
-                .iter()
-                .any(|arg| arg.starts_with('-') && arg.chars().nth(1).is_some_and(|c| c.is_ascii_digit())),
+            !real_flag_args(&args).iter().any(|arg| arg.starts_with('-')
+                && arg.chars().nth(1).is_some_and(|c| c.is_ascii_digit())),
             "-5 as the value of --grep should not be seen as a limit flag"
         );
         assert_eq!(
@@ -4071,11 +4089,7 @@ A  added.rs
     fn test_parse_user_limit_skips_foreign_option_values() {
         // A real limit later in the args is still found after a
         // value-taking option's value is skipped.
-        let args = vec![
-            "--grep".to_string(),
-            "-5".to_string(),
-            "-20".to_string(),
-        ];
+        let args = vec!["--grep".to_string(), "-5".to_string(), "-20".to_string()];
         assert_eq!(parse_user_limit(&args), Some(20));
     }
 

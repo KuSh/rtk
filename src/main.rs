@@ -1816,11 +1816,7 @@ fn run_cli() -> Result<i32> {
                     had_error = true;
                 }
             }
-            if had_error {
-                1
-            } else {
-                0
-            }
+            if had_error { 1 } else { 0 }
         }
 
         Commands::Smart {
@@ -3797,7 +3793,10 @@ mod tests {
                 let warning = validate_pnpm_filters(&filter, &command).unwrap();
 
                 assert_eq!(filter, vec!["@app1", "@app2"]);
-                assert_eq!(warning, "[rtk] warning: --filter is not yet supported for pnpm tsc, filters preceding the subcommand will be ignored")
+                assert_eq!(
+                    warning,
+                    "[rtk] warning: --filter is not yet supported for pnpm tsc, filters preceding the subcommand will be ignored"
+                )
             }
             _ => panic!("Expected Pnpm Build command"),
         }

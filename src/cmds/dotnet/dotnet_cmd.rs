@@ -9,8 +9,8 @@ use crate::core::utils::{resolved_command, truncate};
 use crate::dotnet_format_report;
 use crate::dotnet_trx;
 use anyhow::{Context, Result};
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 use serde_json::Value;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -400,7 +400,10 @@ fn format_dotnet_format_output(
     }
 
     if changed_count > MAX_FORMAT_FILES {
-        output.push_str(&format!("\n… +{} more files", changed_count - MAX_FORMAT_FILES));
+        output.push_str(&format!(
+            "\n… +{} more files",
+            changed_count - MAX_FORMAT_FILES
+        ));
         let all_files = summary
             .files_with_changes
             .iter()
@@ -1267,7 +1270,12 @@ fn format_test_output(
 
     // Status line emitted last; see format_build_output (issue #1574).
     // Warnings before errors: errors survive `| tail -N` immediately above the verdict.
-    [failed_tests_section, warnings_section, errors_section, header]
+    [
+        failed_tests_section,
+        warnings_section,
+        errors_section,
+        header,
+    ]
     .into_iter()
     .filter(|s| !s.is_empty())
     .collect::<Vec<_>>()
@@ -1548,8 +1556,7 @@ mod tests {
         // The raw stdout contains the inline failure; the filtered section also
         // contains it. With needs_raw_fallback=false, the failure must appear once.
         let raw_stdout = "  failed MyTests.HasRestriction\n    Assert.True() Failure";
-        let filtered =
-            "Failed Tests:\n  MyTests.HasRestriction\n    Assert.True() Failure\n\nfail dotnet test: 717 passed, 5 failed";
+        let filtered = "Failed Tests:\n  MyTests.HasRestriction\n    Assert.True() Failure\n\nfail dotnet test: 717 passed, 5 failed";
         let output = compose_failure_output(false, false, raw_stdout, "", filtered);
 
         assert_eq!(output, filtered);
@@ -1938,9 +1945,11 @@ mod tests {
         assert_eq!(merged.skipped, 8);
         assert_eq!(merged.total, 948);
         assert_eq!(merged.failed_tests.len(), 1);
-        assert!(merged.failed_tests[0]
-            .name
-            .contains("CreateInstance_should_initialize"));
+        assert!(
+            merged.failed_tests[0]
+                .name
+                .contains("CreateInstance_should_initialize")
+        );
     }
 
     #[test]
@@ -2101,12 +2110,16 @@ mod tests {
         ];
 
         let injected = build_dotnet_args_for_test("test", &args, true);
-        assert!(!injected
-            .windows(2)
-            .any(|w| w[0] == "--results-directory" && w[1] == "/tmp/test results"));
-        assert!(injected
-            .windows(2)
-            .any(|w| w[0] == "--results-directory" && w[1] == "/custom/results"));
+        assert!(
+            !injected
+                .windows(2)
+                .any(|w| w[0] == "--results-directory" && w[1] == "/tmp/test results")
+        );
+        assert!(
+            injected
+                .windows(2)
+                .any(|w| w[0] == "--results-directory" && w[1] == "/custom/results")
+        );
     }
 
     #[test]

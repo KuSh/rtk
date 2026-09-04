@@ -94,7 +94,11 @@ pub(crate) fn parse_major_version(version_output: &str) -> u32 {
     // would send it `--out-format=json`, a flag v2 removed.
     for word in version_output.split_whitespace() {
         let version = word.strip_prefix('v').unwrap_or(word);
-        if let Some(major) = version.split('.').next().and_then(|s| s.parse::<u32>().ok()) {
+        if let Some(major) = version
+            .split('.')
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
             if version.contains('.') {
                 return major;
             }
@@ -462,7 +466,9 @@ mod tests {
     #[test]
     fn test_parse_version_v2_format() {
         assert_eq!(
-            parse_major_version("golangci-lint has version 2.10.0 built with go1.26.0 from 95dcb68a on 2026-02-17T13:05:51Z"),
+            parse_major_version(
+                "golangci-lint has version 2.10.0 built with go1.26.0 from 95dcb68a on 2026-02-17T13:05:51Z"
+            ),
             2
         );
     }
@@ -759,7 +765,11 @@ mod tests {
         let filtered_tokens = estimate_tokens(&filtered) as f64;
         let savings = 100.0 - (filtered_tokens / raw_tokens * 100.0);
 
-        assert!(savings >= 60.0, "expected >=60% savings, got {:.1}%", savings);
+        assert!(
+            savings >= 60.0,
+            "expected >=60% savings, got {:.1}%",
+            savings
+        );
     }
 
     /// The filter always has something to say about its input. Whether that is worth
