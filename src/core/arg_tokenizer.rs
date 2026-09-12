@@ -111,10 +111,11 @@ pub fn dashdash_index(tokens: &[Token<'_>]) -> Option<usize> {
     tokens.iter().position(|t| t.kind == TokenKind::DashDash)
 }
 
-/// The tokens before the `--` boundary, or all of them when there is none. Under
-/// [`DashDashRole::Forwards`] classification continues past `--`, so a lookup for the tool's
-/// *own* flags has to slice here first -- otherwise it reads what the user forwarded to the
-/// test runner as if dotnet had seen it.
+/// The tokens before the `--` boundary, or all of them when there is none. Every
+/// [`DashDashRole`] except `EndsOptions` keeps classifying past `--`, so a lookup for the flags
+/// the tool reads *globally* has to slice here first -- otherwise it reads what the user
+/// forwarded to the test runner, or typed as a gradle task option, as if the tool had seen it
+/// as a global flag.
 pub fn before_dashdash<'t, 'a>(tokens: &'t [Token<'a>]) -> &'t [Token<'a>] {
     match dashdash_index(tokens) {
         Some(index) => &tokens[..index],
@@ -230,6 +231,11 @@ pub enum DashDashRole {
     Forwards,
     /// Ends the tool's *global* option region only; tasks past it, and their own options, keep
     /// the same grammar. gradle.
+    ///
+    /// Tokenizes identically to `Forwards` — both keep classifying — and differs only in what
+    /// the tail belongs to, which decides what a caller may read from it: a `Forwards` tail is
+    /// another program's, so reading a flag out of it is always wrong, while this tail is still
+    /// the tool's own, just not its global region.
     #[allow(dead_code)] // No in-tree caller yet: gradlew still parses its args by hand.
     EndsGlobalOptions,
 }
@@ -486,7 +492,7 @@ fn tokenize_scan<'a, T: AsRef<str>>(
         if arg == "--" {
             if scanner.emitted_dash_dash {
                 // A second (or later) literal "--" is never itself the boundary — it's just
-                // ordinary text at this point, in both dialects.
+                // ordinary text at this point, under every dialect.
                 scanner.tokens.push(positional(arg, scanner.i));
             } else {
                 scanner
@@ -511,7 +517,7 @@ fn tokenize_scan<'a, T: AsRef<str>>(
                 // genuine switch by structure alone; this pure function has no I/O to resolve it
                 // the way real MSBuild does (a filesystem check), but the impact is narrow --
                 // only the loose flag lookup ([`has_flag`]) is affected.
-                let name_part = rest.split(['=', ':']).next().unwrap_or(rest);
+                let (name_part, _) = split_attached(rest, scanner.dialect);
                 if !rest.is_empty() && !name_part.contains('/') {
                     scanner.push_atomic_flag(rest, FlagPrefix::Slash);
                     continue;
@@ -1289,6 +1295,21 @@ mod tests {
     }
 
     // --- Dialect::Maven ---
+
+    #[test]
+    fn slash_flag_guard_follows_the_attach_axis_not_a_fixed_separator_set() {
+        // `slash_flags` and `attach` are independent, so a `/`-prefixed path must stay a path
+        // when `:` is not an attach separator -- splitting on a fixed `['=', ':']` would hide
+        // the second `/` and promote `/opt:a/b` to a flag.
+        let dialect = Dialect {
+            slash_flags: true,
+            ..Dialect::Posix
+        };
+        let args = owned(&["/opt:a/b"]);
+        let tokens = tokenize_grammar(&args, &|_, _| None, dialect);
+        assert!(tokens[0].is_free_positional());
+        assert_eq!(tokens[0].text, "/opt:a/b");
+    }
 
     #[test]
     fn maven_short_options_are_atomic_words_not_clusters() {
