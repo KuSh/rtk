@@ -274,10 +274,12 @@ fn split_identifier(
 }
 
 /// Check if user explicitly requested JSON/custom output format.
-/// When present, passthrough to avoid double JSON injection.
+/// When present, passthrough to avoid double JSON injection. `--jq` counts: its result is the
+/// user's own projection, and reformatting it as an MR would print a summary of fields the
+/// projection does not have.
 fn has_output_flag(args: &[String]) -> bool {
     args.iter()
-        .any(|a| a == "--output" || a == "-F" || a == "--json")
+        .any(|a| a == "--output" || a == "-F" || a == "--json" || a == "--jq")
 }
 
 /// Check if view subcommand should passthrough (--web, --comments, etc.).
@@ -325,6 +327,12 @@ pub fn run(
     region.extend_from_slice(args);
     let mut region = args_utils::restore_double_dash(&region);
 
+    // A `--` ahead of the subcommand ended rtk's own `-R`/`-g` parsing, not glab's: glab stops
+    // looking for a subcommand at the boundary and prints its root help. Drop it.
+    if region.first().is_some_and(|a| a == "--") {
+        region.remove(0);
+    }
+
     // glab reads everything past `--` as a positional, so -R/-g go in ahead of the boundary.
     let mut injected: Vec<String> = Vec::new();
     if let Some(r) = repo {
@@ -338,8 +346,7 @@ pub fn run(
         region.splice(at..at, injected);
     }
 
-    // A `--` ahead of the subcommand ends glab's own option parsing, leaving nothing to dispatch
-    // on: forward the region verbatim and let glab answer.
+    // Nothing to dispatch on — forward the region verbatim and let glab answer.
     let Some((subcommand, args)) = split_glab_region(&region) else {
         return run_passthrough_with_extra("glab", &[], &region);
     };
