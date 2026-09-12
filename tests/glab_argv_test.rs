@@ -49,6 +49,10 @@ fn run_with_stub(args: &[&str], stub_stdout: &str) -> (Vec<String>, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_rtk"))
         .env("PATH", path_with_stub)
         .env("LC_ALL", "C")
+        // Without these the run reads the developer's real config and writes to their real
+        // tracking DB, so the assertions depend on local machine state.
+        .env("HOME", dir.path())
+        .env("RTK_DB_PATH", dir.path().join("rtk.db"))
         .current_dir(dir.path())
         .args(args)
         .output()
@@ -124,9 +128,39 @@ fn glab_double_dash_before_subcommand_is_dropped() {
 }
 
 #[test]
-fn glab_double_dash_inside_trailing_region_is_preserved() {
+fn glab_double_dash_after_subcommand_is_dropped() {
+    // clap strips a `--` that immediately follows the subcommand too, and glab answers
+    // `glab mr -- view 42` with the `mr` help instead of dispatching to `view`.
+    let argv = glab_argv(&["glab", "mr", "--", "view", "42"]);
+    assert_eq!(argv, vec!["mr", "view", "42", "-F", "json"]);
+}
+
+#[test]
+fn glab_double_dash_after_subcommand_is_dropped_before_a_flag() {
+    // glab reads everything past `--` as a positional, so this spelling is `Accepts 1 arg(s),
+    // received 2` on glab 1.117 while `glab api projects/1 --paginate` works.
     let argv = glab_argv(&["glab", "api", "--", "projects/1", "--paginate"]);
-    assert_eq!(argv, vec!["api", "--", "projects/1", "--paginate"]);
+    assert_eq!(argv, vec!["api", "projects/1", "--paginate"]);
+}
+
+#[test]
+fn glab_double_dash_inside_trailing_region_is_preserved() {
+    // An interior `--` is the user's own: rtk forwards it and lets glab answer for it.
+    let argv = glab_argv(&["glab", "api", "projects/1", "--", "--paginate"]);
+    assert_eq!(argv, vec!["api", "projects/1", "--", "--paginate"]);
+}
+
+#[test]
+fn glab_escaped_flag_is_not_hoisted_into_flag_position() {
+    // `--web` sits behind the boundary the user typed; reading it as the MR number and
+    // re-emitting it ahead of the `--` would make rtk open a browser the user escaped.
+    let argv = glab_argv(&["glab", "mr", "view", "--", "--web", "42"]);
+    let web = argv.iter().position(|a| a == "--web").expect("--web sent");
+    let boundary = argv.iter().position(|a| a == "--").expect("-- forwarded");
+    assert!(
+        boundary < web,
+        "the escaped flag must stay behind the boundary: {argv:?}"
+    );
 }
 
 #[test]
