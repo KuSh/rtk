@@ -243,9 +243,18 @@ where
 }
 
 pub fn run(subcommand: &str, args: &[String], verbose: u8, ultra_compact: bool) -> Result<i32> {
-    // clap's trailing_var_arg eats the user's `--`; put it back before anything classifies the
-    // args or rebuilds the gh invocation.
-    let args = &args_utils::restore_double_dash(args);
+    // clap carves `subcommand` out of the same trailing region as `args`, so the stripped `--`
+    // has to be restored over the whole region — over `args` alone it lands one token off.
+    let mut region: Vec<String> = Vec::with_capacity(args.len() + 1);
+    region.push(subcommand.to_string());
+    region.extend_from_slice(args);
+    let region = args_utils::restore_double_dash(&region);
+
+    // A `--` ahead of the subcommand ends gh's own option parsing, leaving nothing to dispatch
+    // on: forward the region verbatim and let gh answer.
+    let Some((subcommand, args)) = split_gh_region(&region) else {
+        return run_passthrough_with_extra("gh", &[], &region);
+    };
 
     // When user explicitly passes --json, they want raw gh JSON output, not RTK filtering
     if has_json_flag(args) {
@@ -262,6 +271,18 @@ pub fn run(subcommand: &str, args: &[String], verbose: u8, ultra_compact: bool) 
             // Unknown subcommand, pass through
             run_passthrough("gh", subcommand, args)
         }
+    }
+}
+
+/// Splits a restored `gh` region back into subcommand and remainder, the way clap did before the
+/// `--` came back: a leading token that is neither a flag nor the boundary.
+fn split_gh_region(region: &[String]) -> Option<(&str, &[String])> {
+    let tokens = arg_tokenizer::tokenize(region);
+    match tokens.first() {
+        Some(token) if token.kind == TokenKind::Positional => {
+            Some((region[0].as_str(), &region[1..]))
+        }
+        _ => None,
     }
 }
 
