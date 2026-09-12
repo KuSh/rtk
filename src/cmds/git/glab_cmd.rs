@@ -254,13 +254,22 @@ fn mr_update_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
 
 /// Splits `args` into the MR/issue identifier — the first free positional under `takes_value` —
 /// and everything else, verbatim and in order. glab keeps reading positionals past `--`
-/// (`glab mr view 42 -- x` reports two arguments, not one), so the search spans the whole slice.
+/// (`glab mr view -- 42` views MR 42), so the search reaches past the boundary, but only while
+/// the boundary escapes a single token.
 fn split_identifier(
     args: &[String],
     takes_value: &dyn Fn(TokenKind, &str) -> Option<ValueSpec>,
 ) -> (Option<String>, Vec<String>) {
     let tokens = arg_tokenizer::tokenize_grammar(args, takes_value, Dialect::Posix);
-    let id_index = tokens
+
+    // Pulling the identifier out in front of the `--` unescapes whatever else trailed it, and
+    // glab takes at most one positional here anyway, so a crowded escaped region goes untouched.
+    let searchable = match arg_tokenizer::dashdash_index(&tokens) {
+        Some(index) if tokens.len() - index > 2 => &tokens[..index],
+        _ => &tokens[..],
+    };
+
+    let id_index = searchable
         .iter()
         .find(|t| t.is_free_positional())
         .map(|t| t.source_index);
@@ -327,10 +336,15 @@ pub fn run(
     region.extend_from_slice(args);
     let mut region = args_utils::restore_double_dash(&region);
 
-    // A `--` ahead of the subcommand ended rtk's own `-R`/`-g` parsing, not glab's: glab stops
-    // looking for a subcommand at the boundary and prints its root help. Drop it.
-    if region.first().is_some_and(|a| a == "--") {
-        region.remove(0);
+    // Only rtk's own terminator reaches the head of that region — trailing_var_arg keeps every
+    // later `--` — and glab never saw it: `glab mr -- view 42` prints the `mr` help instead of
+    // dispatching, and `glab api -- projects/1 --paginate` is `Accepts 1 arg(s), received 2`.
+    let rtk_terminator = arg_tokenizer::tokenize(&region)
+        .into_iter()
+        .find(|t| t.kind == TokenKind::DashDash && t.source_index <= 1)
+        .map(|t| t.source_index);
+    if let Some(index) = rtk_terminator {
+        region.remove(index);
     }
 
     // glab reads everything past `--` as a positional, so -R/-g go in ahead of the boundary.
