@@ -110,6 +110,16 @@ fn flags_without_a_task_do_not_route_to_the_build_filter() {
 }
 
 #[test]
+fn no_args_does_not_route_to_the_build_filter() {
+    let stub = Stub::new();
+    let (stdout, _) = stub.run(&[]);
+    assert!(
+        stdout.contains("Starting a Gradle Daemon"),
+        "bare gradlew runs the default task; that output is not build output:\n{stdout}"
+    );
+}
+
+#[test]
 fn short_info_flag_bypasses_filtering_like_its_long_spelling() {
     let stub = Stub::new();
     let (stdout, argv) = stub.run(&["build", "-i"]);
