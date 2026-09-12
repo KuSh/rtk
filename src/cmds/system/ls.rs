@@ -1,7 +1,7 @@
 //! Filters directory listings into a compact tree format.
 
 use super::constants::NOISE_DIRS;
-use crate::core::arg_tokenizer::{self, Dialect, Token, TokenKind, ValueSpec};
+use crate::core::arg_tokenizer::{self, Attachment, Dialect, Token, TokenKind, ValueSpec};
 use crate::core::args_utils;
 use crate::core::runner::{self, RunOptions};
 use crate::core::truncate::CAP_INVENTORY;
@@ -70,16 +70,34 @@ const LONG_FLAGS: &[&str] = &[
     "zero",
 ];
 
-/// The option `name` names, resolving a GNU-style abbreviation. `None` when it matches nothing
-/// or is ambiguous (`--ign` spans `--ignore` and `--ignore-backups`), both of which real ls
-/// rejects. An exact match wins outright, so `--ignore` is not ambiguous with itself.
-fn canonical_long(name: &str) -> Option<&'static str> {
-    if let Some(exact) = LONG_FLAGS.iter().find(|flag| **flag == name) {
+/// Every word GNU ls accepts for `--format=WORD`. ls resolves an unambiguous abbreviation of a
+/// *value* the same way it does an option name, so `--format=lon` is still a long listing.
+const FORMAT_WORDS: &[&str] = &[
+    "across",
+    "commas",
+    "horizontal",
+    "long",
+    "single-column",
+    "verbose",
+    "vertical",
+];
+
+/// The entry of `candidates` that `name` abbreviates. `None` when it matches nothing or is
+/// ambiguous (`--ign` spans `--ignore` and `--ignore-backups`, `--format=ver` spans `verbose`
+/// and `vertical`), both of which real ls rejects. An exact match wins outright, so `--ignore`
+/// is not ambiguous with itself.
+fn resolve_abbrev(candidates: &[&'static str], name: &str) -> Option<&'static str> {
+    if let Some(exact) = candidates.iter().find(|candidate| **candidate == name) {
         return Some(exact);
     }
-    let mut candidates = LONG_FLAGS.iter().filter(|flag| flag.starts_with(name));
-    let first = candidates.next()?;
-    candidates.next().is_none().then_some(*first)
+    let mut matches = candidates.iter().filter(|c| c.starts_with(name));
+    let first = matches.next()?;
+    matches.next().is_none().then_some(*first)
+}
+
+/// The option `name` names, resolving a GNU-style abbreviation.
+fn canonical_long(name: &str) -> Option<&'static str> {
+    resolve_abbrev(LONG_FLAGS, name)
 }
 
 /// The canonical long-option name `token` spells, or `None` for any other kind of token.
@@ -89,13 +107,38 @@ fn long_name(token: &Token<'_>) -> Option<&'static str> {
         .flatten()
 }
 
-/// GNU ls's option grammar, transcribed from its own `--help`.
+/// Which `ls` the child process will be. The two disagree on short-option grammar outright:
+/// GNU's `-I`/`-T`/`-w` take `--ignore`/`--tabsize`/`--width` values, while on BSD all three
+/// are booleans and only `-D` takes one (a strftime format). Reading a BSD operand as a value
+/// moves it ahead of the `--`, which BSD's non-permuting getopt then lists as a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flavor {
+    Gnu,
+    Bsd,
+}
+
+const HOST_FLAVOR: Flavor = if cfg!(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)) {
+    Flavor::Bsd
+} else {
+    Flavor::Gnu
+};
+
+/// `ls`'s option grammar, transcribed from GNU's `--help` and FreeBSD/macOS `ls(1)`.
 ///
 /// The `[=WHEN]` flags are attached-only: real `ls --color always` lists a file named `always`
 /// rather than reading it as the value. The mandatory-value ones do claim a literal `--` as
 /// their value, as `ls -I -- -al` does.
-fn ls_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
+fn ls_takes_value(kind: TokenKind, name: &str, flavor: Flavor) -> Option<ValueSpec> {
     match kind {
+        // BSD ls accepts no long option that takes a separate value, so the GNU table is
+        // harmless there: the flags it names are rejected by BSD ls either way.
         TokenKind::Long => match canonical_long(name)? {
             "color" | "classify" | "hyperlink" => Some(ValueSpec::attached_only()),
             "block-size" | "format" | "hide" | "ignore" | "indicator-style" | "quoting-style"
@@ -105,7 +148,11 @@ fn ls_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
             _ => None,
         },
         TokenKind::Short => {
-            matches!(name, "I" | "T" | "w").then(|| ValueSpec::value().claiming_dash_dash())
+            let takes_value = match flavor {
+                Flavor::Gnu => matches!(name, "I" | "T" | "w"),
+                Flavor::Bsd => name == "D",
+            };
+            takes_value.then(|| ValueSpec::value().claiming_dash_dash())
         }
         _ => None,
     }
@@ -136,7 +183,15 @@ struct LsPlan {
 }
 
 fn plan(args: &[String]) -> LsPlan {
-    let tokens = arg_tokenizer::tokenize_grammar(args, &ls_takes_value, Dialect::Posix);
+    plan_for(args, HOST_FLAVOR)
+}
+
+fn plan_for(args: &[String], flavor: Flavor) -> LsPlan {
+    let tokens = arg_tokenizer::tokenize_grammar(
+        args,
+        &|kind, name| ls_takes_value(kind, name, flavor),
+        Dialect::Posix,
+    );
 
     let show_all = shows_dotfiles(&tokens);
 
@@ -147,7 +202,11 @@ fn plan(args: &[String]) -> LsPlan {
         is_short_in(t, &['l', 'g', 'n', 'o'])
             || match long_name(t) {
                 Some("full-time") => true,
-                Some("format") => matches!(t.value(&tokens), Some("long") | Some("verbose")),
+                Some("format") => matches!(
+                    t.value(&tokens)
+                        .and_then(|word| resolve_abbrev(FORMAT_WORDS, word)),
+                    Some("long" | "verbose")
+                ),
                 _ => false,
             }
     });
@@ -155,31 +214,43 @@ fn plan(args: &[String]) -> LsPlan {
     LsPlan {
         show_all,
         show_long,
-        child_args: build_child_args(&tokens),
+        child_args: build_child_args(&tokens, flavor),
     }
+}
+
+/// The index of a trailing flag left without the value it requires, if any. Such a flag can only
+/// be the user's very last argument — anything after it would have been consumed as its value —
+/// so no positional before it can have been `--`-protected.
+fn dangling_value_flag(tokens: &[Token<'_>], flavor: Flavor) -> Option<usize> {
+    let index = tokens.len().checked_sub(1)?;
+    let last = tokens.get(index)?;
+    let spec = ls_takes_value(last.kind, last.text, flavor)?;
+    (spec.attachment != Attachment::AttachedOnly && last.value(tokens).is_none()).then_some(index)
 }
 
 /// Rebuilds the user's options as argv for the child `ls`, re-attaching every flag's value to
 /// the flag rather than letting it drift into the path list.
-fn build_child_args(tokens: &[Token<'_>]) -> Vec<String> {
+fn build_child_args(tokens: &[Token<'_>], flavor: Flavor) -> Vec<String> {
     // RTK asks for its own long listing, so `-l`/`-a`/`--all` from the user are redundant, and
-    // `-h` would pre-format the sizes RTK renders itself.
+    // the human-readable ones would pre-format the sizes RTK renders itself. Bare spellings
+    // only: `--all=x` is an error the child still has to report.
     let wants_all = tokens
         .iter()
         .any(|t| is_short_in(t, &['a']) || long_name(t) == Some("all"));
     let mut child_args = vec![if wants_all { "-la" } else { "-l" }.to_string()];
 
-    for token in tokens {
+    let dangling = dangling_value_flag(tokens, flavor);
+
+    for (index, token) in tokens.iter().enumerate() {
+        if Some(index) == dangling {
+            continue;
+        }
         match token.kind {
-            TokenKind::Long => {
-                if long_name(token) == Some("all") {
-                    continue;
-                }
-                match token.value(tokens) {
-                    Some(value) => child_args.push(format!("--{}={}", token.text, value)),
-                    None => child_args.push(format!("--{}", token.text)),
-                }
-            }
+            TokenKind::Long => match token.value(tokens) {
+                Some(value) => child_args.push(format!("--{}={}", token.text, value)),
+                None if matches!(long_name(token), Some("all" | "human-readable" | "si")) => {}
+                None => child_args.push(format!("--{}", token.text)),
+            },
             TokenKind::Short => match token.value(tokens) {
                 Some(value) => {
                     child_args.push(format!("-{}", token.text));
@@ -192,9 +263,13 @@ fn build_child_args(tokens: &[Token<'_>]) -> Vec<String> {
         }
     }
 
-    // Unconditional boundary: without it a path the user protected with their own `--`, or one
-    // that merely starts with a dash, is re-read by the child as flags.
-    child_args.push("--".to_string());
+    // The boundary protects a path the user wrote with their own `--`, or one that merely starts
+    // with a dash, from being re-read as flags. A flag still waiting for its value would eat it
+    // instead, so that flag goes last and the boundary is dropped — letting the child report the
+    // missing argument, which is what real ls does.
+    if dangling.is_none() {
+        child_args.push("--".to_string());
+    }
 
     let before = child_args.len();
     child_args.extend(
@@ -205,6 +280,11 @@ fn build_child_args(tokens: &[Token<'_>]) -> Vec<String> {
     );
     if child_args.len() == before {
         child_args.push(".".to_string());
+    }
+
+    if let Some(token) = dangling.and_then(|index| tokens.get(index)) {
+        let dashes = if token.kind == TokenKind::Long { "--" } else { "-" };
+        child_args.push(format!("{}{}", dashes, token.text));
     }
 
     child_args
@@ -616,8 +696,21 @@ mod tests {
         assert!(!plan_of(&["--author"]).show_all);
     }
 
+    /// Pins the GNU grammar regardless of the host, so these expectations describe one `ls`
+    /// rather than whichever one the test machine ships.
     fn plan_of(args: &[&str]) -> LsPlan {
-        plan(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+        plan_flavored(args, Flavor::Gnu)
+    }
+
+    fn plan_bsd(args: &[&str]) -> LsPlan {
+        plan_flavored(args, Flavor::Bsd)
+    }
+
+    fn plan_flavored(args: &[&str], flavor: Flavor) -> LsPlan {
+        plan_for(
+            &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            flavor,
+        )
     }
 
     #[test]
@@ -693,6 +786,93 @@ mod tests {
     #[test]
     fn test_plan_defaults_to_current_dir() {
         assert_eq!(plan_of(&[]).child_args, vec!["-l", "--", "."]);
+    }
+
+    #[test]
+    fn test_host_flavor_follows_the_target() {
+        let expected = if cfg!(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        )) {
+            Flavor::Bsd
+        } else {
+            Flavor::Gnu
+        };
+        assert_eq!(HOST_FLAVOR, expected);
+    }
+
+    #[test]
+    fn test_plan_bsd_boolean_short_flags_do_not_eat_the_path() {
+        // -I/-T/-w are booleans on BSD, so the path must stay behind the `--`; ahead of it,
+        // BSD's non-permuting getopt would list `--` and the current directory too.
+        assert_eq!(
+            plan_bsd(&["-lT", "/tmp"]).child_args,
+            vec!["-l", "-T", "--", "/tmp"]
+        );
+        assert_eq!(
+            plan_bsd(&["-lw", "/tmp"]).child_args,
+            vec!["-l", "-w", "--", "/tmp"]
+        );
+        assert_eq!(
+            plan_bsd(&["-lI", "/tmp"]).child_args,
+            vec!["-l", "-I", "--", "/tmp"]
+        );
+    }
+
+    #[test]
+    fn test_plan_bsd_date_format_flag_keeps_its_value() {
+        assert_eq!(
+            plan_bsd(&["-D", "%F", "/tmp"]).child_args,
+            vec!["-l", "-D", "%F", "--", "/tmp"]
+        );
+    }
+
+    #[test]
+    fn test_plan_long_flag_with_a_rejected_value_is_still_forwarded() {
+        // `--all=x` is an error real ls reports with exit 2; dropping it as if it were a bare
+        // `--all` would turn that into a successful listing.
+        assert_eq!(
+            plan_of(&["--all=x"]).child_args,
+            vec!["-la", "--all=x", "--", "."]
+        );
+        assert_eq!(plan_of(&["--all"]).child_args, vec!["-la", "--", "."]);
+    }
+
+    #[test]
+    fn test_plan_drops_human_readable_long_aliases() {
+        // They pre-format sizes RTK renders itself, leaving `200K` where a byte count belongs.
+        assert_eq!(
+            plan_of(&["--human-readable", "big.bin"]).child_args,
+            vec!["-l", "--", "big.bin"]
+        );
+        assert_eq!(plan_of(&["--si"]).child_args, vec!["-l", "--", "."]);
+        assert_eq!(plan_of(&["-h"]).child_args, vec!["-l", "--", "."]);
+    }
+
+    #[test]
+    fn test_plan_resolves_abbreviated_format_value() {
+        assert!(plan_of(&["--format=lon"]).show_long);
+        assert!(plan_of(&["--format", "verb"]).show_long);
+        assert!(!plan_of(&["--format=acr"]).show_long);
+        // `ver` spans verbose and vertical: ambiguous, as real ls reports.
+        assert!(!plan_of(&["--format=ver"]).show_long);
+    }
+
+    #[test]
+    fn test_plan_flag_awaiting_a_value_goes_last_instead_of_eating_the_boundary() {
+        // Ahead of the `--` these swallow it, so ls reports a bad argument value instead of the
+        // missing one; last, the child sees no value at all and says so.
+        assert_eq!(
+            plan_of(&["-a", "--indicator-style"]).child_args,
+            vec!["-la", ".", "--indicator-style"]
+        );
+        assert_eq!(plan_of(&["sub", "-I"]).child_args, vec!["-l", "sub", "-I"]);
+        // An optional-value flag is not waiting for anything.
+        assert_eq!(plan_of(&["--color"]).child_args, vec!["-l", "--color", "--", "."]);
     }
 
     #[test]
