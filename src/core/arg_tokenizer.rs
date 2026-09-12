@@ -123,9 +123,10 @@ pub fn before_dashdash<'t, 'a>(tokens: &'t [Token<'a>]) -> &'t [Token<'a>] {
     }
 }
 
-/// Where RTK's own flags have to be spliced into `args`: before the user's `--`, since
-/// anything past the boundary is a pathspec or an argument forwarded to another program, not
-/// an option the tool will read. `args_len` when there is no boundary.
+/// Where RTK's own flags have to be spliced into `args`: before the user's `--`, since no
+/// [`DashDashRole`] lets the tool read a *global* option past the boundary -- it is a pathspec,
+/// an argument forwarded to another program, or a task's own option. `args_len` when there is
+/// no boundary.
 ///
 /// Takes the **whole** token vec, never a slice: `dashdash_index` on a slice whose `--` was
 /// cut off reports "no boundary" and this returns `args_len`, which would splice RTK's flags
@@ -204,7 +205,9 @@ pub enum SingleDash {
     /// digits is exempt — see [`TokenKind::Short`]. git, cargo, rg, golangci-lint, gradle.
     Cluster,
     /// One atomic flag name, distinct from its `--` spelling. dotnet's legacy MSBuild switches,
-    /// maven's `-pl`/`-gs`/`-amd`.
+    /// maven's `-pl`/`-gs`/`-amd`. Tagged `TokenKind::Long` despite the single dash — these are
+    /// "short options" only in their own tool's vocabulary — so `takes_value` is asked about
+    /// them as `Long`, and `Short` is never produced under this value or the next.
     Atomic,
     /// One atomic flag name, and the same flag as its `--` spelling — the token carries
     /// `double_dash: true` whichever prefix was typed. Go's `flag` package.
@@ -289,6 +292,11 @@ impl Dialect {
 
     /// Apache commons-cli: POSIX, except that a short option is a whole multi-character word
     /// (`-pl`, `-am`, `-gs`, `-emp`), so `-abc` never clusters. Maven is the first consumer.
+    ///
+    /// Does **not** model commons-cli's Java-property options: `-DskipTests=true` tokenizes as
+    /// the flag `DskipTests`, not `D` with the value `skipTests=true`. A caller that reads `-D`
+    /// values has to split the name itself; one that only needs "this is not a positional" does
+    /// not care.
     #[allow(dead_code)] // No in-tree caller yet: mvn still parses its args by hand.
     pub const CommonsCli: Self = Self {
         single_dash: SingleDash::Atomic,
@@ -528,7 +536,7 @@ fn tokenize_scan<'a, T: AsRef<str>>(
                 // has to answer to `has_double_dash_flag` as well.
                 let prefix = match scanner.dialect.single_dash {
                     SingleDash::AtomicAliasingLong => FlagPrefix::DashDash,
-                    _ => FlagPrefix::Dash,
+                    SingleDash::Cluster | SingleDash::Atomic => FlagPrefix::Dash,
                 };
                 scanner.push_atomic_flag(&arg[1..], prefix);
                 continue;
@@ -1313,7 +1321,11 @@ mod tests {
         // `mvn -Bo validate` is an error against the real binary; `-pl` could not exist if
         // single-dash args clustered.
         let args = owned(&["-pl", "core", "test"]);
-        let takes = |_: TokenKind, name: &str| (name == "pl").then(ValueSpec::value);
+        // Asked about as `Long`, not `Short`: a predicate keyed on `Short` would never fire and
+        // `-pl` would silently stop claiming its value.
+        let takes = |kind: TokenKind, name: &str| {
+            (kind == TokenKind::Long && name == "pl").then(ValueSpec::value)
+        };
         let tokens = tokenize_grammar(&args, &takes, Dialect::CommonsCli);
 
         assert_eq!(tokens[0].kind, TokenKind::Long);
@@ -1321,6 +1333,22 @@ mod tests {
         assert_eq!(tokens[0].value(&tokens), Some("core"));
         assert_eq!(tokens[2].text, "test");
         assert!(tokens[2].is_free_positional());
+    }
+
+    #[test]
+    fn commons_cli_java_property_is_one_flag_name_not_a_d_with_a_value() {
+        // The documented limit of the preset: `-D` is a commons-cli Java-property option, which
+        // no axis models. Pinned so a caller reading `-D` values sees it must split the name.
+        let args = owned(&["-DskipTests=true", "test"]);
+        let takes = |_: TokenKind, name: &str| (name == "D").then(ValueSpec::value);
+        let tokens = tokenize_grammar(&args, &takes, Dialect::CommonsCli);
+
+        assert_eq!(tokens[0].text, "DskipTests");
+        assert_eq!(tokens[0].attached, Some("true"));
+        assert!(!has_flag(&tokens, Dialect::CommonsCli, "D"));
+        // Still not a positional, which is all goal/task detection needs.
+        assert!(!tokens[0].is_free_positional());
+        assert!(tokens[1].is_free_positional());
     }
 
     #[test]
