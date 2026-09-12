@@ -1,6 +1,8 @@
 //! Filters directory listings into a compact tree format.
 
 use super::constants::NOISE_DIRS;
+use crate::core::arg_tokenizer::{self, Dialect, Token, TokenKind, ValueSpec};
+use crate::core::args_utils;
 use crate::core::runner::{self, RunOptions};
 use crate::core::truncate::CAP_INVENTORY;
 use crate::core::utils::resolved_command;
@@ -18,77 +20,207 @@ static LS_DATE_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-fn is_short_flag(arg: &str) -> bool {
-    arg.starts_with('-') && !arg.starts_with("--")
+/// Every long option GNU ls accepts, transcribed from its own `--help`. Needed in full, not
+/// just the value-taking ones: ls resolves unambiguous abbreviations (`--sor time` sorts by
+/// time), and an abbreviation is only unambiguous against the whole set.
+const LONG_FLAGS: &[&str] = &[
+    "all",
+    "almost-all",
+    "author",
+    "block-size",
+    "classify",
+    "color",
+    "context",
+    "dereference",
+    "dereference-command-line",
+    "dereference-command-line-symlink-to-dir",
+    "directory",
+    "dired",
+    "escape",
+    "file-type",
+    "format",
+    "full-time",
+    "group-directories-first",
+    "help",
+    "hide",
+    "hide-control-chars",
+    "human-readable",
+    "hyperlink",
+    "ignore",
+    "ignore-backups",
+    "indicator-style",
+    "inode",
+    "kibibytes",
+    "literal",
+    "no-group",
+    "numeric-uid-gid",
+    "quote-name",
+    "quoting-style",
+    "recursive",
+    "reverse",
+    "show-control-chars",
+    "si",
+    "size",
+    "sort",
+    "tabsize",
+    "time",
+    "time-style",
+    "version",
+    "width",
+    "zero",
+];
+
+/// The option `name` names, resolving a GNU-style abbreviation. `None` when it matches nothing
+/// or is ambiguous (`--ign` spans `--ignore` and `--ignore-backups`), both of which real ls
+/// rejects. An exact match wins outright, so `--ignore` is not ambiguous with itself.
+fn canonical_long(name: &str) -> Option<&'static str> {
+    if let Some(exact) = LONG_FLAGS.iter().find(|flag| **flag == name) {
+        return Some(exact);
+    }
+    let mut candidates = LONG_FLAGS.iter().filter(|flag| flag.starts_with(name));
+    let first = candidates.next()?;
+    candidates.next().is_none().then_some(*first)
+}
+
+/// The canonical long-option name `token` spells, or `None` for any other kind of token.
+fn long_name(token: &Token<'_>) -> Option<&'static str> {
+    (token.kind == TokenKind::Long)
+        .then(|| canonical_long(token.text))
+        .flatten()
+}
+
+/// GNU ls's option grammar, transcribed from its own `--help`.
+///
+/// The `[=WHEN]` flags are attached-only: real `ls --color always` lists a file named `always`
+/// rather than reading it as the value. The mandatory-value ones do claim a literal `--` as
+/// their value, as `ls -I -- -al` does.
+fn ls_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
+    match kind {
+        TokenKind::Long => match canonical_long(name)? {
+            "color" | "classify" | "hyperlink" => Some(ValueSpec::attached_only()),
+            "block-size" | "format" | "hide" | "ignore" | "indicator-style" | "quoting-style"
+            | "sort" | "tabsize" | "time" | "time-style" | "width" => {
+                Some(ValueSpec::value().claiming_dash_dash())
+            }
+            _ => None,
+        },
+        TokenKind::Short => {
+            matches!(name, "I" | "T" | "w").then(|| ValueSpec::value().claiming_dash_dash())
+        }
+        _ => None,
+    }
+}
+
+/// True if `token` is a short flag spelled as exactly one of `letters` — never a digit run
+/// like `-20`, which is one token carrying the whole number.
+fn is_short_in(token: &Token<'_>, letters: &[char]) -> bool {
+    let mut chars = token.text.chars();
+    token.kind == TokenKind::Short
+        && matches!((chars.next(), chars.next()), (Some(c), None) if letters.contains(&c))
 }
 
 /// `-a`/`--all` and `-A`/`--almost-all` both make ls print dotfiles;
 /// in either case RTK must show everything the child listed.
-fn shows_dotfiles(args: &[String]) -> bool {
-    args.iter().any(|a| {
-        (is_short_flag(a) && a.chars().any(|c| matches!(c, 'a' | 'A')))
-            || a == "--all"
-            || a == "--almost-all"
-    })
+fn shows_dotfiles(tokens: &[Token<'_>]) -> bool {
+    tokens
+        .iter()
+        .any(|t| is_short_in(t, &['a', 'A']) || matches!(long_name(t), Some("all" | "almost-all")))
 }
 
-pub fn run(args: &[String], verbose: u8) -> Result<i32> {
-    let show_all = shows_dotfiles(args);
+/// What the user's arguments ask for: how to render the listing, and the argv to hand the
+/// child `ls`.
+struct LsPlan {
+    show_all: bool,
+    show_long: bool,
+    child_args: Vec<String>,
+}
+
+fn plan(args: &[String]) -> LsPlan {
+    let tokens = arg_tokenizer::tokenize_grammar(args, &ls_takes_value, Dialect::Posix);
+
+    let show_all = shows_dotfiles(&tokens);
 
     // Per `man ls`, the long listing is triggered by `-l` and also implied by
     // `-g`, `-n`, `-o`, `--full-time` or GNU `--format=long` and `--format=verbose`.
     // In any of those cases we preserve permission info as octal.
-    let show_long = args.iter().any(|a| {
-        if a == "--full-time" || a == "--format=long" || a == "--format=verbose" {
-            return true;
-        }
-        if a.starts_with('-') && !a.starts_with("--") {
-            return a.chars().any(|c| matches!(c, 'l' | 'g' | 'n' | 'o'));
-        }
-        false
+    let show_long = tokens.iter().any(|t| {
+        is_short_in(t, &['l', 'g', 'n', 'o'])
+            || match long_name(t) {
+                Some("full-time") => true,
+                Some("format") => matches!(t.value(&tokens), Some("long") | Some("verbose")),
+                _ => false,
+            }
     });
 
-    let flags: Vec<&str> = args
+    LsPlan {
+        show_all,
+        show_long,
+        child_args: build_child_args(&tokens),
+    }
+}
+
+/// Rebuilds the user's options as argv for the child `ls`, re-attaching every flag's value to
+/// the flag rather than letting it drift into the path list.
+fn build_child_args(tokens: &[Token<'_>]) -> Vec<String> {
+    // RTK asks for its own long listing, so `-l`/`-a`/`--all` from the user are redundant, and
+    // `-h` would pre-format the sizes RTK renders itself.
+    let wants_all = tokens
         .iter()
-        .filter(|a| a.starts_with('-'))
-        .map(|s| s.as_str())
-        .collect();
-    let paths: Vec<&str> = args
-        .iter()
-        .filter(|a| !a.starts_with('-'))
-        .map(|s| s.as_str())
-        .collect();
+        .any(|t| is_short_in(t, &['a']) || long_name(t) == Some("all"));
+    let mut child_args = vec![if wants_all { "-la" } else { "-l" }.to_string()];
+
+    for token in tokens {
+        match token.kind {
+            TokenKind::Long => {
+                if long_name(token) == Some("all") {
+                    continue;
+                }
+                match token.value(tokens) {
+                    Some(value) => child_args.push(format!("--{}={}", token.text, value)),
+                    None => child_args.push(format!("--{}", token.text)),
+                }
+            }
+            TokenKind::Short => match token.value(tokens) {
+                Some(value) => {
+                    child_args.push(format!("-{}", token.text));
+                    child_args.push(value.to_string());
+                }
+                None if is_short_in(token, &['l', 'a', 'h']) => {}
+                None => child_args.push(format!("-{}", token.text)),
+            },
+            _ => {}
+        }
+    }
+
+    // Unconditional boundary: without it a path the user protected with their own `--`, or one
+    // that merely starts with a dash, is re-read by the child as flags.
+    child_args.push("--".to_string());
+
+    let before = child_args.len();
+    child_args.extend(
+        tokens
+            .iter()
+            .filter(|t| t.is_free_positional())
+            .map(|t| t.text.to_string()),
+    );
+    if child_args.len() == before {
+        child_args.push(".".to_string());
+    }
+
+    child_args
+}
+
+pub fn run(args: &[String], verbose: u8) -> Result<i32> {
+    let args = &args_utils::restore_double_dash(args);
+    let LsPlan {
+        show_all,
+        show_long,
+        child_args,
+    } = plan(args);
 
     let mut cmd = resolved_command("ls");
     cmd.env("LC_ALL", "C");
-    let wants_all = args
-        .iter()
-        .any(|a| (is_short_flag(a) && a.contains('a')) || a == "--all");
-    cmd.arg(if wants_all { "-la" } else { "-l" });
-    for flag in &flags {
-        if flag.starts_with("--") {
-            if *flag != "--all" {
-                cmd.arg(flag);
-            }
-        } else {
-            let stripped = flag.trim_start_matches('-');
-            let extra: String = stripped
-                .chars()
-                .filter(|c| *c != 'l' && *c != 'a' && *c != 'h')
-                .collect();
-            if !extra.is_empty() {
-                cmd.arg(format!("-{}", extra));
-            }
-        }
-    }
-
-    if paths.is_empty() {
-        cmd.arg(".");
-    } else {
-        for p in &paths {
-            cmd.arg(p);
-        }
-    }
+    cmd.args(&child_args);
 
     let label = if args.is_empty() {
         ".".to_string()
@@ -475,14 +607,92 @@ mod tests {
 
     #[test]
     fn test_shows_dotfiles_flags() {
-        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        assert!(shows_dotfiles(&s(&["-a"])));
-        assert!(shows_dotfiles(&s(&["-A"])));
-        assert!(shows_dotfiles(&s(&["-lA", "."])));
-        assert!(shows_dotfiles(&s(&["--all"])));
-        assert!(shows_dotfiles(&s(&["--almost-all"])));
-        assert!(!shows_dotfiles(&s(&["-l", "."])));
-        assert!(!shows_dotfiles(&s(&["--author"])));
+        assert!(plan_of(&["-a"]).show_all);
+        assert!(plan_of(&["-A"]).show_all);
+        assert!(plan_of(&["-lA", "."]).show_all);
+        assert!(plan_of(&["--all"]).show_all);
+        assert!(plan_of(&["--almost-all"]).show_all);
+        assert!(!plan_of(&["-l", "."]).show_all);
+        assert!(!plan_of(&["--author"]).show_all);
+    }
+
+    fn plan_of(args: &[&str]) -> LsPlan {
+        plan(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn test_plan_double_dash_makes_following_arg_a_path() {
+        let p = plan_of(&["--", "-al"]);
+        assert_eq!(p.child_args, vec!["-l", "--", "-al"]);
+        assert!(!p.show_all);
+        assert!(!p.show_long);
+    }
+
+    #[test]
+    fn test_plan_keeps_flag_value_with_its_flag_when_a_path_comes_first() {
+        let p = plan_of(&["dir", "-I", "pattern"]);
+        assert_eq!(p.child_args, vec!["-l", "-I", "pattern", "--", "dir"]);
+    }
+
+    #[test]
+    fn test_plan_flag_value_looking_like_a_flag_is_not_read_as_one() {
+        let p = plan_of(&["-I", "-al"]);
+        assert_eq!(p.child_args, vec!["-l", "-I", "-al", "--", "."]);
+        assert!(!p.show_all);
+        assert!(!p.show_long);
+    }
+
+    #[test]
+    fn test_plan_separate_format_value_implies_long_listing() {
+        assert!(plan_of(&["--format", "long"]).show_long);
+        assert!(plan_of(&["--format=long"]).show_long);
+        assert!(plan_of(&["--format", "verbose"]).show_long);
+        assert!(!plan_of(&["--format", "across"]).show_long);
+    }
+
+    #[test]
+    fn test_plan_color_optional_value_leaves_next_arg_a_path() {
+        // `ls --color always` lists a file named `always`; the value only ever attaches.
+        let p = plan_of(&["--color", "always"]);
+        assert_eq!(p.child_args, vec!["-l", "--color", "--", "always"]);
+        assert_eq!(
+            plan_of(&["--color=always"]).child_args,
+            vec!["-l", "--color=always", "--", "."]
+        );
+    }
+
+    #[test]
+    fn test_plan_resolves_unambiguous_long_abbreviation() {
+        // Real `ls --sor time` sorts by time, so the value must not become a path.
+        let p = plan_of(&["--sor", "time", "dir"]);
+        assert_eq!(p.child_args, vec!["-l", "--sor=time", "--", "dir"]);
+        assert!(plan_of(&["--forma", "long"]).show_long);
+        assert!(plan_of(&["--alm"]).show_all);
+    }
+
+    #[test]
+    fn test_plan_leaves_ambiguous_abbreviation_for_ls_to_reject() {
+        // `--ign` spans --ignore and --ignore-backups; ls errors, so RTK must not guess.
+        let p = plan_of(&["--ign", "beta*"]);
+        assert_eq!(p.child_args, vec!["-l", "--ign", "--", "beta*"]);
+    }
+
+    #[test]
+    fn test_plan_short_cluster_still_expands() {
+        let p = plan_of(&["-la"]);
+        assert_eq!(p.child_args, vec!["-la", "--", "."]);
+        assert!(p.show_all);
+        assert!(p.show_long);
+        let almost = plan_of(&["-lA"]);
+        assert_eq!(almost.child_args, vec!["-l", "-A", "--", "."]);
+        assert!(almost.show_all);
+        // -h is dropped because RTK renders sizes itself; -1 is a flag, not a digit-run value.
+        assert_eq!(plan_of(&["-lh1"]).child_args, vec!["-l", "-1", "--", "."]);
+    }
+
+    #[test]
+    fn test_plan_defaults_to_current_dir() {
+        assert_eq!(plan_of(&[]).child_args, vec!["-l", "--", "."]);
     }
 
     #[test]
