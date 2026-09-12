@@ -256,16 +256,6 @@ fn mr_update_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
 /// and everything else, verbatim and in order. glab keeps reading positionals past `--`
 /// (`glab mr view -- 42` views MR 42), so the search reaches past the boundary, but only while
 /// the boundary escapes a lone token that is not itself flag-shaped.
-/// Whether `escaped`, the tokens behind a `--`, is a single argument that stays a positional
-/// once the boundary no longer shields it.
-fn escapes_a_bare_positional(args: &[String], escaped: &[arg_tokenizer::Token<'_>]) -> bool {
-    let [only] = escaped else { return false };
-    let i = only.source_index;
-    arg_tokenizer::tokenize(&args[i..=i])
-        .first()
-        .is_some_and(|t| t.kind == TokenKind::Positional)
-}
-
 fn split_identifier(
     args: &[String],
     takes_value: &dyn Fn(TokenKind, &str) -> Option<ValueSpec>,
@@ -291,6 +281,16 @@ fn split_identifier(
         .map(|(_, arg)| arg.clone())
         .collect();
     (id_index.map(|i| args[i].clone()), extra)
+}
+
+/// Whether `escaped`, the tokens behind a `--`, is a single argument that stays a positional
+/// once the boundary no longer shields it.
+fn escapes_a_bare_positional(args: &[String], escaped: &[arg_tokenizer::Token<'_>]) -> bool {
+    let [only] = escaped else { return false };
+    let i = only.source_index;
+    arg_tokenizer::tokenize(&args[i..=i])
+        .first()
+        .is_some_and(|t| t.kind == TokenKind::Positional)
 }
 
 /// Check if user explicitly requested JSON/custom output format.
