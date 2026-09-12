@@ -12,6 +12,15 @@ fn shell_quote(path: &std::path::Path) -> String {
 
 /// Runs `rtk <args>` against a `glab` stub and returns the argv the stub received.
 fn glab_argv(args: &[&str]) -> Vec<String> {
+    run_with_stub(args, "").0
+}
+
+/// Runs `rtk <args>` against a `glab` stub that prints `stub_stdout`, and returns rtk's stdout.
+fn glab_stdout(args: &[&str], stub_stdout: &str) -> String {
+    run_with_stub(args, stub_stdout).1
+}
+
+fn run_with_stub(args: &[&str], stub_stdout: &str) -> (Vec<String>, String) {
     let dir = tempfile::tempdir().expect("tempdir");
     let argv_file = dir.path().join("argv.txt");
     let stub_path = dir.path().join("glab");
@@ -19,8 +28,9 @@ fn glab_argv(args: &[&str]) -> Vec<String> {
     std::fs::write(
         &stub_path,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 0\n",
-            shell_quote(&argv_file)
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\ncat <<'STUB_EOF'\n{}\nSTUB_EOF\nexit 0\n",
+            shell_quote(&argv_file),
+            stub_stdout
         ),
     )
     .expect("write stub");
@@ -44,7 +54,7 @@ fn glab_argv(args: &[&str]) -> Vec<String> {
         .output()
         .expect("spawn rtk");
 
-    std::fs::read_to_string(&argv_file)
+    let argv = std::fs::read_to_string(&argv_file)
         .unwrap_or_else(|e| {
             panic!(
                 "read captured argv: {e}; rtk stdout={} stderr={}",
@@ -54,7 +64,8 @@ fn glab_argv(args: &[&str]) -> Vec<String> {
         })
         .lines()
         .map(str::to_string)
-        .collect()
+        .collect();
+    (argv, String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 // ── identifier extraction: a flag's value is never the MR/issue id ──────
@@ -69,8 +80,25 @@ fn mr_view_page_value_is_not_the_mr_id() {
 
 #[test]
 fn mr_view_jq_expression_is_not_the_mr_id() {
+    // `--jq` is a user-supplied projection, so rtk forwards the command untouched rather than
+    // injecting `-F json` and reformatting the result as an MR summary.
     let argv = glab_argv(&["glab", "mr", "view", "--jq", ".iid"]);
-    assert_eq!(argv, vec!["mr", "view", "-F", "json", "--jq", ".iid"]);
+    assert_eq!(argv, vec!["mr", "view", "--jq", ".iid"]);
+}
+
+#[test]
+fn mr_view_jq_output_reaches_the_user_verbatim() {
+    // Long enough that rtk's MR-shaped rendering of it would be the shorter output, so the
+    // never-worse guard does not rescue the projection by accident.
+    let payload = format!(
+        "[{}]",
+        (0..40)
+            .map(|i| format!("\"label-number-{i:02}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let out = glab_stdout(&["glab", "mr", "view", "--jq", ".labels"], &payload);
+    assert_eq!(out.trim(), payload);
 }
 
 #[test]
@@ -88,11 +116,11 @@ fn mr_view_keeps_an_explicit_id_ahead_of_a_valued_flag() {
 // ── `--` handling ──────────────────────────────────────────────────────
 
 #[test]
-fn glab_double_dash_before_subcommand_is_forwarded_verbatim() {
-    // clap eats a `--` sitting at the head of the trailing region. Restoring it over `args`
-    // alone lands one token off and duplicates the subcommand (`glab mr mr view 42`).
+fn glab_double_dash_before_subcommand_is_dropped() {
+    // That `--` ended rtk's own option parsing. Forwarding it makes glab stop looking for a
+    // subcommand and print its root help instead of the MR.
     let argv = glab_argv(&["glab", "--", "mr", "view", "42"]);
-    assert_eq!(argv, vec!["--", "mr", "view", "42"]);
+    assert_eq!(argv, vec!["mr", "view", "42", "-F", "json"]);
 }
 
 #[test]
