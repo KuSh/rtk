@@ -41,6 +41,10 @@ fn gh_argv(args: &[&str]) -> Vec<String> {
     let out = Command::new(env!("CARGO_BIN_EXE_rtk"))
         .env("PATH", path_with_stub)
         .env("LC_ALL", "C")
+        // Without these the run reads the developer's real config and writes to their real
+        // tracking DB, so the assertions depend on local machine state.
+        .env("HOME", dir.path())
+        .env("RTK_DB_PATH", dir.path().join("rtk.db"))
         .current_dir(dir.path())
         .args(args)
         .output()
@@ -89,6 +93,22 @@ fn gh_double_dash_after_subcommand_is_dropped_before_a_flag() {
 fn gh_double_dash_inside_trailing_region_is_preserved() {
     let argv = gh_argv(&["gh", "api", "repos/o/r", "--", "--jq", ".name"]);
     assert_eq!(argv, vec!["api", "repos/o/r", "--", "--jq", ".name"]);
+}
+
+#[test]
+fn gh_escaped_flag_is_not_hoisted_into_flag_position() {
+    // `--watch` sits behind the boundary the user typed; reading it as the PR number and
+    // re-emitting it ahead of the `--` would make rtk run a blocking watch the user escaped.
+    let argv = gh_argv(&["gh", "pr", "checks", "--", "--watch", "42"]);
+    let watch = argv
+        .iter()
+        .position(|a| a == "--watch")
+        .expect("--watch forwarded");
+    let boundary = argv.iter().position(|a| a == "--").expect("-- forwarded");
+    assert!(
+        boundary < watch,
+        "the escaped flag must stay behind the boundary: {argv:?}"
+    );
 }
 
 #[test]

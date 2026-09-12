@@ -204,14 +204,22 @@ fn pr_edit_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
 
 /// Splits `args` into the PR/issue/run identifier — the first free positional under
 /// `takes_value` — and everything else, verbatim and in order. `gh` keeps reading positionals
-/// past `--` (`gh pr view -- 42` views PR 42), so the search is not scoped to the region
-/// before the boundary.
+/// past `--` (`gh pr view -- 42` views PR 42), so the search reaches past the boundary, but only
+/// while the boundary escapes a single token.
 fn split_identifier(
     args: &[String],
     takes_value: &dyn Fn(TokenKind, &str) -> Option<ValueSpec>,
 ) -> (Option<String>, Vec<String>) {
     let tokens = arg_tokenizer::tokenize_grammar(args, takes_value, Dialect::Posix);
-    let id_index = tokens
+
+    // Pulling the identifier out in front of the `--` unescapes whatever else trailed it, and gh
+    // takes at most one positional here anyway, so a crowded escaped region goes to gh untouched.
+    let searchable = match arg_tokenizer::dashdash_index(&tokens) {
+        Some(index) if tokens.len() - index > 2 => &tokens[..index],
+        _ => &tokens[..],
+    };
+
+    let id_index = searchable
         .iter()
         .find(|t| t.is_free_positional())
         .map(|t| t.source_index);
