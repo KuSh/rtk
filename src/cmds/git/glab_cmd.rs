@@ -342,6 +342,8 @@ pub fn run(
         injected.extend(["-g".to_string(), g.to_string()]);
     }
     if !injected.is_empty() {
+        // Grammar-less: the sub-subcommand that picks a `takes_value` table is only known after
+        // the split below, so a `--` that is some flag's own value reads as the boundary here.
         let at = arg_tokenizer::injection_point(&arg_tokenizer::tokenize(&region), region.len());
         region.splice(at..at, injected);
     }
