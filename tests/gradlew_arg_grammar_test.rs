@@ -88,6 +88,17 @@ fn project_dir_value_does_not_misroute_the_task() {
 }
 
 #[test]
+fn group_value_does_not_misroute_the_task_listing() {
+    let stub = Stub::new();
+    let (stdout, argv) = stub.run(&["tasks", "--group", "build"]);
+    assert!(
+        stdout.contains("Starting a Gradle Daemon"),
+        "`tasks` has no filter; its listing must not be swallowed by the build filter:\n{stdout}"
+    );
+    assert_eq!(argv, ["tasks", "--group", "build"]);
+}
+
+#[test]
 fn short_info_flag_bypasses_filtering_like_its_long_spelling() {
     let stub = Stub::new();
     let (stdout, argv) = stub.run(&["build", "-i"]);

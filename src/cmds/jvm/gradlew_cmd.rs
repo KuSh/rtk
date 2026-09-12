@@ -63,8 +63,13 @@ fn gradlew_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
                 | "update-locks"
                 | "warning-mode"
                 | "write-verification-metadata"
-                // Task options: Test's --tests, dependencies' --configuration, help's --task.
+                // Task options. Plugins define these freely, so the list covers the built-in
+                // tasks rtk routes on rather than being exhaustive.
+                | "args"
                 | "configuration"
+                | "dependency"
+                | "group"
+                | "groups"
                 | "task"
                 | "tests"
         )
@@ -792,6 +797,12 @@ mod tests {
     fn test_detect_attached_project_prop_is_not_the_task() {
         let args = strings(&["-Pandroid.testInstrumentationRunnerArguments.class=Foo", "test"]);
         assert_eq!(detect_task(&args), GradlewTask::Test);
+    }
+
+    #[test]
+    fn test_detect_group_value_is_not_the_task() {
+        let args = strings(&["tasks", "--group", "build"]);
+        assert_eq!(detect_task(&args), GradlewTask::Other);
     }
 
     #[test]
