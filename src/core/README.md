@@ -143,13 +143,14 @@ Everything that is not per-flag is per-tool, and stays a parameter: `tokenize_gr
 | `name_case` | `Sensitive` / `Folded` | whether flag lookups fold ASCII case |
 | `slash_flags` | `bool` | whether `/flag` is a switch rather than a path |
 
-Use a preset, never an inline struct literal — a grammar is declared once per tool family:
+**Naming rule.** A preset names a grammar *family* that several tools can share — a parser library, or a real convention — so its name answers "can my tool reuse this?". `Dialect::CommonsCli` is checkable (`ls /usr/share/maven/lib/` ships `commons-cli-1.11.0.jar`); "is my tool Maven?" is not. A single tool's bespoke parser gets **no preset**: its caller composes the axes at its own call site. That rule is what stops this list growing one variant per tool.
 
 - `Dialect::Posix` — git, cargo, rg, golangci-lint. Cluster, `=`, `--` ends options, case-sensitive, no `/flag`.
 - `Dialect::Msbuild` — dotnet. Atomic, `=` or `:`, `--` forwards, case-folded, `/flag`.
-- `Dialect::Maven` — POSIX with `Atomic`: Maven's short options are multi-character words (`-pl`, `-gs`, `-emp`), so `-Bo` is an error, not a cluster.
-- `Dialect::Gradle` — POSIX with `EndsGlobalOptions`: gradle clusters (`-qi` works) and takes `solo_only` short values (`-qp /w` fails, `-p /w` works), but tasks and their own options keep parsing past `--`.
+- `Dialect::CommonsCli` — Apache commons-cli. POSIX with `Atomic`: the library's short options are whole multi-character words (`-pl`, `-am`, `-gs`, `-emp`), so `mvn -Bo` is an error, not a cluster. Maven is the first consumer.
 - `Dialect::GoFlag` — Go's `flag` package: atomic single-dash options, and `-run` is the same flag as `--run`.
+
+Gradle gets no preset: its parser is `org.gradle.cli` (`gradle:jdk21` ships `gradle-cli-*.jar` and no commons-cli), used by nothing else. It is `Posix` with `dash_dash: EndsGlobalOptions`, composed as a `const` in `gradlew_cmd.rs`. The axis value is shared infrastructure; the one-tool combination is not.
 
 `src/core/arg_tokenizer/frozen.rs` is the pre-axes implementation, kept as the oracle for the differential test in `differential.rs`: every arg vector up to four tokens over an alphabet covering each construct the scanner branches on, asserted token-for-token identical under `Posix` and `Msbuild`. Never edit `frozen.rs` to match new behaviour — a diff against it is the only proof the presets have not moved.
 

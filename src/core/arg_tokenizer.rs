@@ -249,9 +249,12 @@ pub enum NameCase {
     Folded,
 }
 
-/// One tool's flag grammar, as independent axes. Callers pass a preset ([`Dialect::Posix`] and
-/// friends) to [`tokenize_grammar`] rather than assembling one inline, so a grammar is declared
-/// once per tool family.
+/// One tool's flag grammar, as independent axes.
+///
+/// A preset ([`Dialect::Posix`] and friends) names a grammar *family* several tools can share —
+/// a parser library or a real convention — so the name answers "can my tool reuse this?". A
+/// single tool's bespoke parser composes its axes at the call site instead; that is what keeps
+/// this list from growing one preset per tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dialect {
     pub single_dash: SingleDash,
@@ -284,17 +287,11 @@ impl Dialect {
         slash_flags: true,
     };
 
-    /// Maven: atomic multi-character short options (`-pl`, `-gs`), POSIX on every other axis.
+    /// Apache commons-cli: POSIX, except that a short option is a whole multi-character word
+    /// (`-pl`, `-am`, `-gs`, `-emp`), so `-abc` never clusters. Maven is the first consumer.
     #[allow(dead_code)] // No in-tree caller yet: mvn still parses its args by hand.
-    pub const Maven: Self = Self {
+    pub const CommonsCli: Self = Self {
         single_dash: SingleDash::Atomic,
-        ..Self::Posix
-    };
-
-    /// Gradle: POSIX, except that `--` ends only the global option region.
-    #[allow(dead_code)] // No in-tree caller yet: gradlew still parses its args by hand.
-    pub const Gradle: Self = Self {
-        dash_dash: DashDashRole::EndsGlobalOptions,
         ..Self::Posix
     };
 
@@ -1294,7 +1291,7 @@ mod tests {
         assert_eq!(values, vec!["console;verbosity=normal", "trx"]);
     }
 
-    // --- Dialect::Maven ---
+    // --- Dialect::CommonsCli ---
 
     #[test]
     fn slash_flag_guard_follows_the_attach_axis_not_a_fixed_separator_set() {
@@ -1312,12 +1309,12 @@ mod tests {
     }
 
     #[test]
-    fn maven_short_options_are_atomic_words_not_clusters() {
+    fn commons_cli_short_options_are_atomic_words_not_clusters() {
         // `mvn -Bo validate` is an error against the real binary; `-pl` could not exist if
         // single-dash args clustered.
         let args = owned(&["-pl", "core", "test"]);
         let takes = |_: TokenKind, name: &str| (name == "pl").then(ValueSpec::value);
-        let tokens = tokenize_grammar(&args, &takes, Dialect::Maven);
+        let tokens = tokenize_grammar(&args, &takes, Dialect::CommonsCli);
 
         assert_eq!(tokens[0].kind, TokenKind::Long);
         assert_eq!(tokens[0].text, "pl");
@@ -1327,38 +1324,45 @@ mod tests {
     }
 
     #[test]
-    fn maven_flag_names_are_case_sensitive_unlike_msbuild() {
+    fn commons_cli_flag_names_are_case_sensitive_unlike_msbuild() {
         let args = owned(&["-B"]);
-        let tokens = tokenize_grammar(&args, &|_, _| None, Dialect::Maven);
-        assert!(has_flag(&tokens, Dialect::Maven, "B"));
-        assert!(!has_flag(&tokens, Dialect::Maven, "b"));
+        let tokens = tokenize_grammar(&args, &|_, _| None, Dialect::CommonsCli);
+        assert!(has_flag(&tokens, Dialect::CommonsCli, "B"));
+        assert!(!has_flag(&tokens, Dialect::CommonsCli, "b"));
     }
 
     #[test]
-    fn maven_dashdash_ends_option_parsing() {
+    fn commons_cli_dashdash_ends_option_parsing() {
         let args = owned(&["--", "-pl", "core"]);
         let takes = |_: TokenKind, name: &str| (name == "pl").then(ValueSpec::value);
-        let tokens = tokenize_grammar(&args, &takes, Dialect::Maven);
+        let tokens = tokenize_grammar(&args, &takes, Dialect::CommonsCli);
 
         assert_eq!(tokens[0].kind, TokenKind::DashDash);
         assert!(tokens[1..].iter().all(|t| t.is_free_positional()));
     }
 
     #[test]
-    fn maven_slash_prefixed_path_is_never_a_flag() {
+    fn commons_cli_slash_prefixed_path_is_never_a_flag() {
         let args = owned(&["/opt/build"]);
-        let tokens = tokenize_grammar(&args, &|_, _| None, Dialect::Maven);
+        let tokens = tokenize_grammar(&args, &|_, _| None, Dialect::CommonsCli);
         assert!(tokens[0].is_free_positional());
     }
 
-    // --- Dialect::Gradle ---
+    // --- DashDashRole::EndsGlobalOptions ---
+
+    /// Gradle's parser is `org.gradle.cli`, shared with nothing, so it gets no preset: a caller
+    /// composes it from `Posix` at its own call site. This is that composition.
+    const GRADLE: Dialect = Dialect {
+        dash_dash: DashDashRole::EndsGlobalOptions,
+        ..Dialect::Posix
+    };
 
     #[test]
-    fn gradle_clusters_short_flags_like_posix() {
+    fn ends_global_options_still_clusters_short_flags_like_posix() {
         // `gradle -qi tasks` is accepted; `gradle -qp /w` is not, hence solo_only on `p`.
         let args = owned(&["-qi", "tasks"]);
         let takes = |_: TokenKind, name: &str| (name == "p").then(ValueSpec::solo_only);
-        let tokens = tokenize_grammar(&args, &takes, Dialect::Gradle);
+        let tokens = tokenize_grammar(&args, &takes, GRADLE);
 
         assert_eq!(tokens[0].text, "q");
         assert_eq!(tokens[1].text, "i");
@@ -1367,12 +1371,12 @@ mod tests {
     }
 
     #[test]
-    fn gradle_dashdash_keeps_parsing_tasks_and_their_options() {
+    fn ends_global_options_keeps_parsing_tasks_and_their_options() {
         // Gradle's `--` ends the *global* option region only: `test --tests X` past it is still
         // a task plus its own value-taking option, not three bare positionals.
         let args = owned(&["--", "test", "--tests", "com.example.Foo"]);
         let takes = |_: TokenKind, name: &str| (name == "tests").then(ValueSpec::value);
-        let tokens = tokenize_grammar(&args, &takes, Dialect::Gradle);
+        let tokens = tokenize_grammar(&args, &takes, GRADLE);
 
         assert_eq!(tokens[1].text, "test");
         assert!(tokens[1].is_free_positional());
