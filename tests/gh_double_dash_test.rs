@@ -112,6 +112,32 @@ fn gh_escaped_flag_is_not_hoisted_into_flag_position() {
 }
 
 #[test]
+fn gh_lone_escaped_flag_is_not_hoisted_into_flag_position() {
+    // Nothing else trails the boundary, so counting escaped tokens cannot tell this apart from
+    // an escaped PR number, and hoisting it runs the blocking watch the user escaped.
+    let argv = gh_argv(&["gh", "pr", "checks", "--", "--watch"]);
+    assert_eq!(argv, vec!["pr", "checks", "--", "--watch"]);
+}
+
+#[test]
+fn gh_lone_escaped_flag_is_not_hoisted_on_the_run_grammar() {
+    let argv = gh_argv(&["gh", "run", "view", "--", "--log"]);
+    assert_eq!(argv, vec!["run", "view", "--", "--log"]);
+}
+
+#[test]
+fn gh_lone_escaped_identifier_is_still_hoisted() {
+    // Unescaping a token gh reads as a positional anyway is what lets rtk inject `--json`
+    // rather than pass the command through.
+    let argv = gh_argv(&["gh", "pr", "view", "--", "42"]);
+    assert_eq!(argv[..3], ["pr", "view", "42"]);
+    assert!(
+        argv.iter().any(|a| a == "--json"),
+        "the escaped identifier must still be hoisted: {argv:?}"
+    );
+}
+
+#[test]
 fn gh_double_dash_inside_a_filtered_subcommand_is_preserved() {
     let argv = gh_argv(&["gh", "pr", "list", "--", "--state", "open"]);
     assert_eq!(
