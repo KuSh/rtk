@@ -99,6 +99,17 @@ fn group_value_does_not_misroute_the_task_listing() {
 }
 
 #[test]
+fn flags_without_a_task_do_not_route_to_the_build_filter() {
+    let stub = Stub::new();
+    let (stdout, argv) = stub.run(&["-p", "../other"]);
+    assert!(
+        stdout.contains("Starting a Gradle Daemon"),
+        "gradle runs its default task here; that output is not build output:\n{stdout}"
+    );
+    assert_eq!(argv, ["-p", "../other"]);
+}
+
+#[test]
 fn short_info_flag_bypasses_filtering_like_its_long_spelling() {
     let stub = Stub::new();
     let (stdout, argv) = stub.run(&["build", "-i"]);
