@@ -42,8 +42,9 @@ fn gh_argv(args: &[&str]) -> Vec<String> {
         .env("PATH", path_with_stub)
         .env("LC_ALL", "C")
         // Without these the run reads the developer's real config and writes to their real
-        // tracking DB, so the assertions depend on local machine state.
+        // tracking DB. `XDG_CONFIG_HOME` too: `dirs::config_dir()` prefers it over `HOME`.
         .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .env("RTK_DB_PATH", dir.path().join("rtk.db"))
         .current_dir(dir.path())
         .args(args)
