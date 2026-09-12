@@ -1,5 +1,7 @@
 //! Matches shell commands against known RTK rewrite rules to decide how to handle them.
 
+// `discover` otherwise consumes only `core`. A tool's flag grammar lives with its filter, next
+// to the `run` grammar that is defined as its superset -- so the table is borrowed, not moved.
 use crate::cmds::go::golangci_cmd;
 use crate::core::arg_tokenizer::{self, Dialect, TokenKind as ArgTokenKind, ValueSpec};
 use crate::core::utils::composer_bin_dirs;
