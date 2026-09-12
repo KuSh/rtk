@@ -131,7 +131,27 @@ Four rules, each of which cost a real bug before it was written down:
 - `ValueSpec::solo_only()` — a `Short` flag takes a separate value only when it is the whole argument: `git log -n 2` does, `git log -pn 2` does not. No meaning for a `Long` flag.
 - `.claiming_dash_dash()` — lets a literal `--` be this flag's value. A per-tool split, not per-flag: grep and rg let any value-taking flag swallow it, git and cargo reject it whichever flag is asking.
 
-The dialect is the one axis that is not per-flag, so it stays a parameter: `tokenize_grammar(args, takes_value, Dialect::Msbuild)`.
+### Dialects
+
+Everything that is not per-flag is per-tool, and stays a parameter: `tokenize_grammar(args, takes_value, Dialect::Msbuild)`. `Dialect` is a `Copy` struct of five independent axes, because the tools measured want five different combinations of them:
+
+| axis | values | what differs |
+|---|---|---|
+| `single_dash` | `Cluster` / `Atomic` / `AtomicAliasingLong` | what `-abc` is: three short flags, one flag name, or one flag name that is also `--abc` |
+| `attach` | `Equals` / `EqualsOrColon` | which separator attaches a value (`--logger:trx`) |
+| `dash_dash` | `EndsOptions` / `Forwards` / `EndsGlobalOptions` | whether classification stops at `--`, continues because the tail is forwarded to another program, or continues because only the *global* option region ended |
+| `name_case` | `Sensitive` / `Folded` | whether flag lookups fold ASCII case |
+| `slash_flags` | `bool` | whether `/flag` is a switch rather than a path |
+
+Use a preset, never an inline struct literal — a grammar is declared once per tool family:
+
+- `Dialect::Posix` — git, cargo, rg, golangci-lint. Cluster, `=`, `--` ends options, case-sensitive, no `/flag`.
+- `Dialect::Msbuild` — dotnet. Atomic, `=` or `:`, `--` forwards, case-folded, `/flag`.
+- `Dialect::Maven` — POSIX with `Atomic`: Maven's short options are multi-character words (`-pl`, `-gs`, `-emp`), so `-Bo` is an error, not a cluster.
+- `Dialect::Gradle` — POSIX with `EndsGlobalOptions`: gradle clusters (`-qi` works) and takes `solo_only` short values (`-qp /w` fails, `-p /w` works), but tasks and their own options keep parsing past `--`.
+- `Dialect::GoFlag` — Go's `flag` package: atomic single-dash options, and `-run` is the same flag as `--run`.
+
+`src/core/arg_tokenizer/frozen.rs` is the pre-axes implementation, kept as the oracle for the differential test in `differential.rs`: every arg vector up to four tokens over an alphabet covering each construct the scanner branches on, asserted token-for-token identical under `Posix` and `Msbuild`. Never edit `frozen.rs` to match new behaviour — a diff against it is the only proof the presets have not moved.
 
 ## Consumer Contracts
 
