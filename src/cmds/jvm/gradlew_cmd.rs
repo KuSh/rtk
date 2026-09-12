@@ -68,10 +68,18 @@ fn gradlew_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
                 | "args"
                 | "configuration"
                 | "dependency"
+                | "dsl"
                 | "group"
                 | "groups"
+                | "insecure-protocol"
+                | "into"
+                | "java-version"
+                | "package"
+                | "project-name"
                 | "task"
+                | "test-framework"
                 | "tests"
+                | "type"
         )
         .then(ValueSpec::value),
         TokenKind::Short => {
@@ -112,10 +120,18 @@ fn free_positionals<'a>(tokens: &[Token<'a>]) -> Vec<&'a str> {
 }
 
 fn detect_task(args: &[String]) -> GradlewTask {
+    let names = task_names(args);
+
+    // Flags but no task (`gradlew -p ../other`): gradle runs the default task, whose output is
+    // not build output — the build filter would swallow it.
+    if names.is_empty() && !args.is_empty() {
+        return GradlewTask::Other;
+    }
+
     // Use the last non-flag, non-clean task to determine the filter.
     // Example: `clean assembleDebug` → Build (last non-clean task).
     // Note: for mixed-task invocations like `test assemble`, last wins.
-    let task = task_names(args)
+    let task = names
         .iter()
         .rev()
         .find(|name| !name.eq_ignore_ascii_case("clean"))
@@ -802,6 +818,18 @@ mod tests {
     #[test]
     fn test_detect_group_value_is_not_the_task() {
         let args = strings(&["tasks", "--group", "build"]);
+        assert_eq!(detect_task(&args), GradlewTask::Other);
+    }
+
+    #[test]
+    fn test_detect_init_test_framework_value_is_not_the_task() {
+        let args = strings(&["init", "--type", "java-library", "--test-framework", "testng"]);
+        assert_eq!(detect_task(&args), GradlewTask::Other);
+    }
+
+    #[test]
+    fn test_detect_flags_without_a_task_is_not_a_build() {
+        let args = strings(&["-p", "../other"]);
         assert_eq!(detect_task(&args), GradlewTask::Other);
     }
 
