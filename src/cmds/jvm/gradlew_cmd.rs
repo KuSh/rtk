@@ -122,9 +122,9 @@ fn free_positionals<'a>(tokens: &[Token<'a>]) -> Vec<&'a str> {
 fn detect_task(args: &[String]) -> GradlewTask {
     let names = task_names(args);
 
-    // Flags but no task (`gradlew -p ../other`): gradle runs the default task, whose output is
-    // not build output — the build filter would swallow it.
-    if names.is_empty() && !args.is_empty() {
+    // No task at all (`gradlew`, `gradlew -p ../other`): gradle runs its default task, whose
+    // output is not build output — the build filter would swallow it.
+    if names.is_empty() {
         return GradlewTask::Other;
     }
 
@@ -831,6 +831,11 @@ mod tests {
     fn test_detect_flags_without_a_task_is_not_a_build() {
         let args = strings(&["-p", "../other"]);
         assert_eq!(detect_task(&args), GradlewTask::Other);
+    }
+
+    #[test]
+    fn test_detect_no_args_is_not_a_build() {
+        assert_eq!(detect_task(&[]), GradlewTask::Other);
     }
 
     #[test]
