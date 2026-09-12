@@ -248,10 +248,20 @@ pub fn run(subcommand: &str, args: &[String], verbose: u8, ultra_compact: bool) 
     let mut region: Vec<String> = Vec::with_capacity(args.len() + 1);
     region.push(subcommand.to_string());
     region.extend_from_slice(args);
-    let region = args_utils::restore_double_dash(&region);
+    let mut region = args_utils::restore_double_dash(&region);
 
-    // A `--` ahead of the subcommand ends gh's own option parsing, leaving nothing to dispatch
-    // on: forward the region verbatim and let gh answer.
+    // Only rtk's own terminator reaches the head of that region — trailing_var_arg keeps every
+    // later `--` — and gh rejects one it never got: `gh -- pr view` and `gh api -- r --jq .n`.
+    let rtk_terminator = arg_tokenizer::tokenize(&region)
+        .into_iter()
+        .find(|t| t.kind == TokenKind::DashDash && t.source_index <= 1)
+        .map(|t| t.source_index);
+    if let Some(index) = rtk_terminator {
+        region.remove(index);
+    }
+
+    // A second `--` still ahead of the subcommand leaves nothing to dispatch on: forward the
+    // region verbatim and let gh answer.
     let Some((subcommand, args)) = split_gh_region(&region) else {
         return run_passthrough_with_extra("gh", &[], &region);
     };

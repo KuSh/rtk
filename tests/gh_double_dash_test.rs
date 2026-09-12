@@ -1,6 +1,8 @@
 //! `--` handling for `rtk gh`. clap carves the `subcommand` positional out of the same trailing
 //! region as `args`, so restoring the stripped `--` over `args` alone shifts the region one token
-//! and duplicates the subcommand. Stubs `gh` on PATH with a script that records its argv.
+//! and duplicates the subcommand. The one `--` clap strips is rtk's own option terminator —
+//! `trailing_var_arg` keeps every later one — so it must not reach gh. Stubs `gh` on PATH with a
+//! script that records its argv.
 
 #![cfg(unix)]
 
@@ -58,22 +60,43 @@ fn gh_argv(args: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn gh_double_dash_before_subcommand_is_forwarded_verbatim() {
+fn gh_double_dash_before_subcommand_is_dropped() {
+    // gh 2.46 and 2.100 both answer `gh -- pr view 42` with `unknown command "pr" for "gh"`,
+    // and the subcommand must reach gh once, not twice.
     let argv = gh_argv(&["gh", "--", "pr", "view", "42"]);
-    assert_eq!(
-        argv,
-        vec!["--", "pr", "view", "42"],
-        "a -- ahead of the subcommand ends gh's option parsing and must reach gh as-is, \
-         not shift the region into a duplicated subcommand"
+    assert_eq!(argv[..3], ["pr", "view", "42"]);
+    assert!(
+        !argv.iter().any(|a| a == "--"),
+        "rtk's own terminator must not reach gh: {argv:?}"
     );
 }
 
 #[test]
-fn gh_double_dash_inside_trailing_region_is_preserved() {
+fn gh_double_dash_after_subcommand_is_dropped() {
+    let argv = gh_argv(&["gh", "api", "--", "repos/o/r"]);
+    assert_eq!(argv, vec!["api", "repos/o/r"]);
+}
+
+#[test]
+fn gh_double_dash_after_subcommand_is_dropped_before_a_flag() {
+    // gh reads everything past `--` as a positional, so this spelling is `accepts 1 arg(s),
+    // received 3` on gh 2.46 and 2.100 while `gh api repos/o/r --jq .name` works.
     let argv = gh_argv(&["gh", "api", "--", "repos/o/r", "--jq", ".name"]);
+    assert_eq!(argv, vec!["api", "repos/o/r", "--jq", ".name"]);
+}
+
+#[test]
+fn gh_double_dash_inside_trailing_region_is_preserved() {
+    let argv = gh_argv(&["gh", "api", "repos/o/r", "--", "--jq", ".name"]);
+    assert_eq!(argv, vec!["api", "repos/o/r", "--", "--jq", ".name"]);
+}
+
+#[test]
+fn gh_double_dash_inside_a_filtered_subcommand_is_preserved() {
+    let argv = gh_argv(&["gh", "pr", "list", "--", "--state", "open"]);
     assert_eq!(
-        argv,
-        vec!["api", "--", "repos/o/r", "--jq", ".name"],
-        "reassembling the region must not disturb a -- clap already preserved"
+        argv[argv.len() - 3..],
+        ["--", "--state", "open"],
+        "an interior -- is the user's own and reaches gh: {argv:?}"
     );
 }
