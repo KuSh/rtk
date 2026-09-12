@@ -255,17 +255,28 @@ fn mr_update_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
 /// Splits `args` into the MR/issue identifier — the first free positional under `takes_value` —
 /// and everything else, verbatim and in order. glab keeps reading positionals past `--`
 /// (`glab mr view -- 42` views MR 42), so the search reaches past the boundary, but only while
-/// the boundary escapes a single token.
+/// the boundary escapes a lone token that is not itself flag-shaped.
+/// Whether `escaped`, the tokens behind a `--`, is a single argument that stays a positional
+/// once the boundary no longer shields it.
+fn escapes_a_bare_positional(args: &[String], escaped: &[arg_tokenizer::Token<'_>]) -> bool {
+    let [only] = escaped else { return false };
+    let i = only.source_index;
+    arg_tokenizer::tokenize(&args[i..=i])
+        .first()
+        .is_some_and(|t| t.kind == TokenKind::Positional)
+}
+
 fn split_identifier(
     args: &[String],
     takes_value: &dyn Fn(TokenKind, &str) -> Option<ValueSpec>,
 ) -> (Option<String>, Vec<String>) {
     let tokens = arg_tokenizer::tokenize_grammar(args, takes_value, Dialect::Posix);
 
-    // Pulling the identifier out in front of the `--` unescapes whatever else trailed it, and
-    // glab takes at most one positional here anyway, so a crowded escaped region goes untouched.
+    // Re-emitting the identifier in front of the `--` unescapes it along with whatever else
+    // trailed it, so reach past the boundary only where that is a no-op: one token, still read
+    // as a positional once unescaped. Anything else glab rejects on arity whatever rtk sends.
     let searchable = match arg_tokenizer::dashdash_index(&tokens) {
-        Some(index) if tokens.len() - index > 2 => &tokens[..index],
+        Some(index) if !escapes_a_bare_positional(args, &tokens[index + 1..]) => &tokens[..index],
         _ => &tokens[..],
     };
 

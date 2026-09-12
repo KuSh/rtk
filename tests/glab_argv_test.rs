@@ -164,6 +164,22 @@ fn glab_escaped_flag_is_not_hoisted_into_flag_position() {
 }
 
 #[test]
+fn glab_lone_escaped_flag_is_not_hoisted_into_flag_position() {
+    // Same hazard with nothing else behind the boundary: `--web` is the only escaped token, so
+    // reading it as the MR number leaves it in flag position with the `--` stranded behind it.
+    let argv = glab_argv(&["glab", "mr", "view", "--", "--web"]);
+    assert_eq!(argv, vec!["mr", "view", "--", "--web"]);
+}
+
+#[test]
+fn glab_lone_escaped_identifier_is_still_hoisted() {
+    // `glab mr view -- 42` views MR 42, so unescaping a token glab reads as a positional anyway
+    // is what lets rtk inject `-F json` instead of passing the command through.
+    let argv = glab_argv(&["glab", "mr", "view", "--", "42"]);
+    assert_eq!(argv, vec!["mr", "view", "42", "-F", "json", "--"]);
+}
+
+#[test]
 fn glab_repo_flag_is_injected_before_the_boundary() {
     // glab reads everything past `--` as a positional, so an appended `-R` would arrive as two
     // extra arguments rather than as the repo flag.
