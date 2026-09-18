@@ -1,6 +1,5 @@
 use crate::core::arg_tokenizer::{
-    self, Dialect, Token, TokenKind, ValueSpec, before_dashdash, dashdash_index,
-    has_double_dash_flag,
+    self, DashDashRole, Dialect, Token, TokenKind, ValueSpec, before_dashdash, has_double_dash_flag,
 };
 use crate::core::args_utils;
 use crate::core::runner::{self, RunOptions};
@@ -91,31 +90,23 @@ fn gradlew_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
     }
 }
 
+/// `org.gradle.cli` is gradle's own parser, shared with no other tool, so it gets no preset.
+const GRADLE: Dialect = Dialect {
+    dash_dash: DashDashRole::EndsGlobalOptions,
+    ..Dialect::Posix
+};
+
 fn tokenize_gradlew_args(args: &[String]) -> Vec<Token<'_>> {
-    arg_tokenizer::tokenize_grammar(args, &gradlew_takes_value, Dialect::Posix)
+    arg_tokenizer::tokenize_grammar(args, &gradlew_takes_value, GRADLE)
 }
 
-/// The task names in `args`, in order. Gradle's `--` ends *built-in* option parsing only —
-/// tasks and their options keep being parsed past it — so the tail gets the same grammar
-/// instead of degrading to bare positionals.
+/// The task names in `args`, in order. A repeated `--` terminates a task's own options rather
+/// than naming a task, so it is dropped: `gradle -- test --` runs `test`.
 fn task_names(args: &[String]) -> Vec<&str> {
     let tokens = tokenize_gradlew_args(args);
-    let mut names: Vec<&str> = free_positionals(before_dashdash(&tokens));
-
-    if let Some(index) = dashdash_index(&tokens) {
-        let tail_start = tokens[index].source_index + 1;
-        if let Some(tail) = args.get(tail_start..) {
-            names.extend(free_positionals(&tokenize_gradlew_args(tail)));
-        }
-    }
-
-    names
-}
-
-fn free_positionals<'a>(tokens: &[Token<'a>]) -> Vec<&'a str> {
     tokens
         .iter()
-        .filter(|t| t.is_free_positional())
+        .filter(|t| t.is_free_positional() && t.text != "--")
         .map(|t| t.text)
         .collect()
 }
@@ -225,7 +216,7 @@ fn wants_verbose_logging(args: &[String]) -> bool {
 
     ["stacktrace", "full-stacktrace", "info", "debug"]
         .iter()
-        .any(|name| has_double_dash_flag(builtin, Dialect::Posix, name))
+        .any(|name| has_double_dash_flag(builtin, GRADLE, name))
         || builtin
             .iter()
             .any(|t| t.kind == TokenKind::Short && matches!(t.text, "s" | "S" | "i" | "d"))
@@ -791,6 +782,14 @@ mod tests {
     #[test]
     fn test_detect_tests_filter_value_past_double_dash() {
         let args = strings(&["--", "test", "--tests", "com.example.Foo"]);
+        assert_eq!(detect_task(&args), GradlewTask::Test);
+    }
+
+    #[test]
+    fn test_detect_repeated_double_dash_is_not_a_task() {
+        // `gradle -- test --` runs `test` on 9.7.1; only the first `--` is the boundary the
+        // tokenizer marks, so the second arrives here as an ordinary positional.
+        let args = strings(&["--", "test", "--"]);
         assert_eq!(detect_task(&args), GradlewTask::Test);
     }
 
