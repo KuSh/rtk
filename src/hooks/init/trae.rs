@@ -12,9 +12,15 @@ use crate::hooks::constants::{
 /// opt-in: it is updated too only when the user already has a `~/.trae-cn`
 /// directory.
 fn trae_hook_paths_at(home: &Path) -> Vec<PathBuf> {
-    let mut paths = vec![home.join(TRAE_DIR).join(HOOKS_JSON)];
-    if home.join(TRAE_CN_DIR).is_dir() {
-        paths.push(home.join(TRAE_CN_DIR).join(HOOKS_JSON));
+    let trae = home.join(TRAE_DIR).join(HOOKS_JSON);
+    let trae_cn = home.join(TRAE_CN_DIR).join(HOOKS_JSON);
+    // A Trae CN config that links to the Trae one is the same file: patching it a
+    // second time would back up RTK's own write over the user's backup.
+    let separate_cn = home.join(TRAE_CN_DIR).is_dir()
+        && canonicalize_path_for_comparison(&trae_cn) != canonicalize_path_for_comparison(&trae);
+    let mut paths = vec![trae];
+    if separate_cn {
+        paths.push(trae_cn);
     }
     paths
 }
@@ -377,6 +383,20 @@ mod tests {
         ] {
             assert!(!is_trae_hook_command(command));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_trae_hook_paths_skip_a_trae_cn_dir_linked_to_trae() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        fs::create_dir(home.join(".trae")).unwrap();
+        std::os::unix::fs::symlink(".trae", home.join(".trae-cn")).unwrap();
+
+        assert_eq!(
+            trae_hook_paths_at(home),
+            vec![home.join(".trae").join("hooks.json")]
+        );
     }
 
     #[test]
