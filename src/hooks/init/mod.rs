@@ -678,11 +678,98 @@ pub(super) fn update_json_file(
     Ok(())
 }
 
+/// Copy `source` to `destination` without opening what sits at `destination`: the copy goes
+/// to a temp file renamed over it, so a `.bak` that is a symlink or a hard link -- which a
+/// cloned repository can ship -- is replaced rather than written through (#4157). The temp
+/// file is created with the source's permission bits, so the copy is never more readable than
+/// the file it saves. A `.bak` this user cannot write is refused, as a plain copy would refuse
+/// it.
+pub(super) fn copy_backup(source: &Path, destination: &Path) -> Result<()> {
+    if fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.is_file())
+        && let Err(error) = open_backup_like_a_copy(destination)
+        && error.kind() == std::io::ErrorKind::PermissionDenied
+    {
+        anyhow::bail!("{} is read-only", destination.display());
+    }
+    let dir = match destination.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let permissions = fs::metadata(source)?.permissions();
+    let mut temp_file = match backup_temp_file(dir, &permissions) {
+        Ok(temp_file) => temp_file,
+        // A directory that takes no new file still lets an existing backup be rewritten, as
+        // the plain copy RTK used to make did; opened without following a link.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                && fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.is_file())
+                && !shares_content(destination, source) =>
+        {
+            let mut backup = open_backup_like_a_copy(destination)?;
+            backup.set_len(0)?;
+            std::io::copy(&mut fs::File::open(source)?, &mut backup)?;
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    std::io::copy(&mut fs::File::open(source)?, temp_file.as_file_mut())?;
+    temp_file
+        .persist(destination)
+        .map_err(|error| error.error)?;
+    Ok(())
+}
+
+/// Whether rewriting `backup` in place would also change `source` or another file: it is a
+/// hard link to something.
+fn shares_content(backup: &Path, source: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let (Ok(backup), Ok(source)) = (fs::metadata(backup), fs::metadata(source)) else {
+            return false;
+        };
+        backup.nlink() > 1 || (backup.dev() == source.dev() && backup.ino() == source.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (backup, source);
+        false
+    }
+}
+
+/// Open an existing regular `.bak` for writing as a copy would, without truncating it or
+/// following a link, so the answer is the one the copy would have got.
+fn open_backup_like_a_copy(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    options.open(path)
+}
+
+#[cfg(unix)]
+fn backup_temp_file(dir: &Path, permissions: &fs::Permissions) -> std::io::Result<NamedTempFile> {
+    let temp_file = tempfile::Builder::new()
+        .permissions(permissions.clone())
+        .tempfile_in(dir)?;
+    // The umask may have narrowed the bits at creation; restore them.
+    temp_file.as_file().set_permissions(permissions.clone())?;
+    Ok(temp_file)
+}
+
+#[cfg(not(unix))]
+fn backup_temp_file(dir: &Path, _permissions: &fs::Permissions) -> std::io::Result<NamedTempFile> {
+    NamedTempFile::new_in(dir)
+}
+
 /// Back up an existing JSON file before replacing it atomically.
 fn backup_and_atomic_write(path: &Path, content: &str) -> Result<Option<PathBuf>> {
     let backup_path = if path.exists() {
         let backup_path = backup_path_for(path);
-        fs::copy(path, &backup_path).with_context(|| {
+        copy_backup(path, &backup_path).with_context(|| {
             format!(
                 "Failed to backup {} to {}",
                 path.display(),
@@ -2378,6 +2465,135 @@ mod tests {
 
         let read_error = read_json_file(temp.path()).unwrap_err();
         assert!(format!("{read_error:#}").contains(&temp.path().display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_and_atomic_write_replaces_a_symlinked_backup_instead_of_following_it() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("hooks.json");
+        let other = temp.path().join("CLAUDE.md");
+        fs::write(&path, "{}").unwrap();
+        fs::write(&other, "notes").unwrap();
+        std::os::unix::fs::symlink("CLAUDE.md", backup_path_for(&path)).unwrap();
+
+        backup_and_atomic_write(&path, "{\"new\":1}").unwrap();
+
+        assert_eq!(fs::read_to_string(&other).unwrap(), "notes");
+        let backup = backup_path_for(&path);
+        assert!(!fs::symlink_metadata(&backup).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(backup).unwrap(), "{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_and_atomic_write_does_not_create_a_dangling_backup_target() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("hooks.json");
+        fs::write(&path, "{}").unwrap();
+        std::os::unix::fs::symlink("outside.json", backup_path_for(&path)).unwrap();
+
+        backup_and_atomic_write(&path, "{}").unwrap();
+
+        assert!(!temp.path().join("outside.json").exists());
+    }
+
+    #[test]
+    fn test_backup_and_atomic_write_leaves_a_file_hard_linked_to_the_backup_alone() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("hooks.json");
+        let other = temp.path().join("notes.txt");
+        fs::write(&path, "{}").unwrap();
+        fs::write(&other, "notes").unwrap();
+        fs::hard_link(&other, backup_path_for(&path)).unwrap();
+
+        backup_and_atomic_write(&path, "{\"new\":1}").unwrap();
+
+        assert_eq!(fs::read_to_string(&other).unwrap(), "notes");
+        assert_eq!(fs::read_to_string(backup_path_for(&path)).unwrap(), "{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_keeps_the_source_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        for mode in [0o600, 0o644] {
+            let path = temp.path().join(format!("settings-{mode:o}.json"));
+            fs::write(&path, "{}").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+
+            backup_and_atomic_write(&path, "{\"new\":1}").unwrap();
+
+            let backup = fs::metadata(backup_path_for(&path)).unwrap();
+            assert_eq!(backup.permissions().mode() & 0o777, mode);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_and_atomic_write_refuses_a_backup_it_cannot_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("hooks.json");
+        fs::write(&path, "{}").unwrap();
+        fs::write(backup_path_for(&path), "kept").unwrap();
+        fs::set_permissions(backup_path_for(&path), fs::Permissions::from_mode(0o444)).unwrap();
+        // Root writes a read-only file, as a plain copy would.
+        let refused = fs::OpenOptions::new()
+            .write(true)
+            .open(backup_path_for(&path))
+            .is_err();
+
+        let result = backup_and_atomic_write(&path, "{\"new\":1}");
+
+        if refused {
+            assert!(result.is_err());
+            assert_eq!(fs::read_to_string(backup_path_for(&path)).unwrap(), "kept");
+        } else {
+            result.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_rewrites_an_existing_backup_when_the_directory_is_locked() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let locked = temp.path().join("claude");
+        fs::create_dir(&locked).unwrap();
+        let source = temp.path().join("settings.json");
+        fs::write(&source, "{}").unwrap();
+        let backup = locked.join("settings.json.bak");
+        fs::write(&backup, "old backup").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = copy_backup(&source, &backup);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        result.unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_does_not_rewrite_a_hard_linked_backup_in_a_locked_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let locked = temp.path().join("claude");
+        fs::create_dir(&locked).unwrap();
+        let source = temp.path().join("settings.json");
+        fs::write(&source, "{}").unwrap();
+        let other = locked.join("other.json");
+        fs::write(&other, "other").unwrap();
+        let backup = locked.join("settings.json.bak");
+        fs::hard_link(&other, &backup).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let _ = copy_backup(&source, &backup);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(fs::read_to_string(&other).unwrap(), "other");
     }
 
     #[test]

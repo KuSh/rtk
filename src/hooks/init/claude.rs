@@ -512,7 +512,7 @@ fn remove_legacy_settings_entries(ctx: InitContext) -> Result<()> {
 
     // Backup before modifying
     let backup_path = settings_path.with_extension("json.bak");
-    fs::copy(&settings_path, &backup_path)
+    copy_backup(&settings_path, &backup_path)
         .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
 
     let serialized =
