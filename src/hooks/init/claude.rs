@@ -71,9 +71,7 @@ fn run_claude_md_mode_with(
 
 /// Patch CLAUDE.md: add @RTK.md, migrate if old block exists
 fn patch_claude_md(path: &Path, ctx: InitContext) -> Result<bool> {
-    let InitContext {
-        verbose, dry_run, ..
-    } = ctx;
+    let InitContext { verbose, .. } = ctx;
     let mut content = if path.exists() {
         fs::read_to_string(path)?
     } else {
@@ -100,15 +98,11 @@ fn patch_claude_md(path: &Path, ctx: InitContext) -> Result<bool> {
             eprintln!("@RTK.md reference already present in CLAUDE.md");
         }
         if migrated {
-            if dry_run {
-                preview(path, WriteKind::Instructions);
-                println!(
-                    "[dry-run] would migrate old RTK block in CLAUDE.md: {}",
-                    path.display()
-                );
-            } else {
-                patch_instructions(path, &content)?;
-            }
+            let report = Report::new(format!(
+                "[dry-run] would migrate old RTK block in CLAUDE.md: {}",
+                path.display()
+            ));
+            write_reported(path, WriteKind::Instructions, &content, ctx, report)?;
         }
         return Ok(migrated);
     }
@@ -120,22 +114,13 @@ fn patch_claude_md(path: &Path, ctx: InitContext) -> Result<bool> {
         format!("{}\n\n@RTK.md\n", content.trim())
     };
 
-    if dry_run {
-        preview(path, WriteKind::Instructions);
-        println!(
-            "[dry-run] would add @RTK.md reference to CLAUDE.md: {}",
-            path.display()
-        );
-        if verbose > 0 {
-            println!("[dry-run] content:\n{}", new_content);
-        }
-    } else {
-        patch_instructions(path, &new_content)?;
-
-        if verbose > 0 {
-            eprintln!("Added @RTK.md reference to CLAUDE.md");
-        }
-    }
+    let report = Report::new(format!(
+        "[dry-run] would add @RTK.md reference to CLAUDE.md: {}",
+        path.display()
+    ))
+    .with_content()
+    .done_verbose("Added @RTK.md reference to CLAUDE.md");
+    write_reported(path, WriteKind::Instructions, &new_content, ctx, report)?;
 
     Ok(migrated)
 }
@@ -169,12 +154,12 @@ pub(super) fn remove_hook_from_settings(ctx: InitContext) -> Result<bool> {
             &root,
             ctx,
             "settings.json",
-            &format!(
+            Report::new(format!(
                 "[dry-run] would remove RTK hook entry from {}",
                 settings_path.display()
-            ),
-            true,
-            Written::Line("Removed RTK hook from settings.json".to_string()),
+            ))
+            .with_content()
+            .done_verbose("Removed RTK hook from settings.json".to_string()),
         )?;
     }
 
@@ -245,12 +230,11 @@ fn patch_settings_json_command(
         &root,
         ctx,
         "settings.json",
-        &format!(
+        Report::new(format!(
             "[dry-run] would patch settings.json: {}",
             settings_path.display()
-        ),
-        true,
-        Written::Backup,
+        ))
+        .with_content(),
     )?;
     if dry_run {
         return Ok(PatchResult::WouldPatch);
@@ -480,9 +464,6 @@ fn migrate_old_hook_script(ctx: InitContext) {
 /// Remove only legacy `rtk-rewrite.sh` entries from settings.json.
 /// Preserves any existing `rtk hook claude` entries (new format).
 fn remove_legacy_settings_entries(ctx: InitContext) -> Result<()> {
-    let InitContext {
-        verbose, dry_run, ..
-    } = ctx;
     let claude_dir = resolve_claude_dir()?;
     let settings_path = claude_dir.join(SETTINGS_JSON);
 
@@ -504,22 +485,14 @@ fn remove_legacy_settings_entries(ctx: InitContext) -> Result<()> {
         return Ok(());
     }
 
-    if dry_run {
-        preview(&settings_path, WriteKind::Config);
-        println!(
-            "[dry-run] would remove legacy rtk-rewrite.sh entry from {}",
-            settings_path.display()
-        );
-        return Ok(());
-    }
-
     let serialized =
         serde_json::to_string_pretty(&root).context("Failed to serialize settings.json")?;
-    patch_config(&settings_path, &serialized)?;
-
-    if verbose > 0 {
-        eprintln!("  [ok] Removed legacy rtk-rewrite.sh entry from settings.json");
-    }
+    let report = Report::new(format!(
+        "[dry-run] would remove legacy rtk-rewrite.sh entry from {}",
+        settings_path.display()
+    ))
+    .done_verbose("  [ok] Removed legacy rtk-rewrite.sh entry from settings.json");
+    write_reported(&settings_path, WriteKind::Config, &serialized, ctx, report)?;
     Ok(())
 }
 

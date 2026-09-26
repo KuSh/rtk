@@ -165,7 +165,7 @@ fn uninstall_copilot_at(base: &Path, ctx: InitContext) -> Result<Vec<String>> {
     }
 
     let instructions_path = github_dir.join(COPILOT_INSTRUCTIONS_FILE);
-    let block_removed = match remove_copilot_instructions_block(&instructions_path, dry_run) {
+    let block_removed = match remove_copilot_instructions_block(&instructions_path, ctx) {
         Ok(block_removed) => block_removed,
         Err(error) => {
             return Err(match hook_refused {
@@ -207,7 +207,7 @@ fn uninstall_copilot_at(base: &Path, ctx: InitContext) -> Result<Vec<String>> {
 
 /// Remove the rtk-instructions block from the Copilot instructions file, if it has one.
 /// Returns whether it did (or, under `--dry-run`, would).
-fn remove_copilot_instructions_block(instructions_path: &Path, dry_run: bool) -> Result<bool> {
+fn remove_copilot_instructions_block(instructions_path: &Path, ctx: InitContext) -> Result<bool> {
     if !instructions_path.exists() {
         return Ok(false);
     }
@@ -220,16 +220,18 @@ fn remove_copilot_instructions_block(instructions_path: &Path, dry_run: bool) ->
     if !did_remove {
         return Ok(false);
     }
-    if dry_run {
-        preview(instructions_path, WriteKind::Instructions);
-        println!(
-            "[dry-run] would remove rtk-instructions block from {}",
-            instructions_path.display()
-        );
-    } else {
-        patch_instructions(instructions_path, &cleaned)
-            .with_context(|| format!("Failed to write {}", instructions_path.display()))?;
-    }
+    let report = Report::new(format!(
+        "[dry-run] would remove rtk-instructions block from {}",
+        instructions_path.display()
+    ));
+    write_reported(
+        instructions_path,
+        WriteKind::Instructions,
+        &cleaned,
+        ctx,
+        report,
+    )
+    .with_context(|| format!("Failed to write {}", instructions_path.display()))?;
     Ok(true)
 }
 
@@ -335,17 +337,18 @@ fn uninstall_copilot_global_at(copilot_dir: &Path, ctx: InitContext) -> Result<V
         if content.contains(RTK_BLOCK_START) {
             let (cleaned, did_remove) = remove_rtk_block(&content);
             if did_remove {
-                if dry_run {
-                    preview(&instructions_path, WriteKind::Instructions);
-                    println!(
-                        "[dry-run] would remove rtk-instructions block from {}",
-                        instructions_path.display()
-                    );
-                } else {
-                    patch_instructions(&instructions_path, &cleaned).with_context(|| {
-                        format!("Failed to write {}", instructions_path.display())
-                    })?;
-                }
+                let report = Report::new(format!(
+                    "[dry-run] would remove rtk-instructions block from {}",
+                    instructions_path.display()
+                ));
+                write_reported(
+                    &instructions_path,
+                    WriteKind::Instructions,
+                    &cleaned,
+                    ctx,
+                    report,
+                )
+                .with_context(|| format!("Failed to write {}", instructions_path.display()))?;
                 removed.push(format!(
                     "{}: removed rtk-instructions block",
                     COPILOT_INSTRUCTIONS_FILE

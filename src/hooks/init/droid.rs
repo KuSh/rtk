@@ -216,9 +216,11 @@ fn patch_droid_hook_file(file: &DroidHookFile, ctx: InitContext) -> Result<bool>
         &root,
         ctx,
         "Droid hook file",
-        &format!("[dry-run] would patch Droid hook file: {}", path.display()),
-        true,
-        Written::Backup,
+        Report::new(format!(
+            "[dry-run] would patch Droid hook file: {}",
+            path.display()
+        ))
+        .with_content(),
     )?;
     Ok(true)
 }
@@ -377,12 +379,11 @@ fn remove_droid_hook_from_file(file: &DroidHookFile, ctx: InitContext) -> Result
         &root,
         ctx,
         "Droid hook file",
-        &format!(
+        Report::new(format!(
             "[dry-run] would remove RTK entry from Droid hook file: {}",
             path.display()
-        ),
-        false,
-        Written::Line(format!("Removed RTK hook from {}", path.display())),
+        ))
+        .done_verbose(format!("Removed RTK hook from {}", path.display())),
     )?;
     Ok(true)
 }

@@ -621,16 +621,19 @@ fn uninstall_codex_with_paths(
             }
         }
 
-        if agents_changed && dry_run {
-            preview(agents_md_path, WriteKind::Instructions);
-            println!(
+        if agents_changed {
+            let report = Report::new(format!(
                 "[dry-run] would remove rtk-instructions block from AGENTS.md: {}",
                 agents_md_path.display()
-            );
-        } else if agents_changed {
-            patch_instructions(agents_md_path, &working_content).with_context(|| {
-                format!("Failed to write AGENTS.md: {}", agents_md_path.display())
-            })?;
+            ));
+            write_reported(
+                agents_md_path,
+                WriteKind::Instructions,
+                &working_content,
+                ctx,
+                report,
+            )
+            .with_context(|| format!("Failed to write AGENTS.md: {}", agents_md_path.display()))?;
         }
     }
 
@@ -680,9 +683,12 @@ fn patch_codex_hooks_json(path: &Path, ctx: InitContext) -> Result<bool> {
         &root,
         ctx,
         "Codex hooks.json",
-        &format!("[dry-run] would patch Codex hooks: {}", path.display()),
-        true,
-        Written::Line(format!("Patched Codex hooks: {}", path.display())),
+        Report::new(format!(
+            "[dry-run] would patch Codex hooks: {}",
+            path.display()
+        ))
+        .with_content()
+        .done_verbose(format!("Patched Codex hooks: {}", path.display())),
     )?;
 
     Ok(true)
@@ -707,12 +713,12 @@ fn remove_codex_hook_from_file(path: &Path, ctx: InitContext) -> Result<bool> {
         &root,
         ctx,
         "Codex hooks.json",
-        &format!(
+        Report::new(format!(
             "[dry-run] would remove RTK hook entry from {}",
             path.display()
-        ),
-        true,
-        Written::Line(format!("Removed Codex RTK hook: {}", path.display())),
+        ))
+        .with_content()
+        .done_verbose(format!("Removed Codex RTK hook: {}", path.display())),
     )?;
 
     Ok(true)
@@ -1701,7 +1707,7 @@ mod tests {
     }
 
     /// A chain can point back into the project and still be written outside it: with its end
-    /// missing, `atomic_write` cannot canonicalize either and lands on the last link itself,
+    /// missing, `write_file` cannot canonicalize either and lands on the last link itself,
     /// wherever that link happens to sit.
     #[cfg(unix)]
     #[test]

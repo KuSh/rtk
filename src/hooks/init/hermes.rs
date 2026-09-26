@@ -122,23 +122,20 @@ fn uninstall_hermes_at(hermes_home: &Path, ctx: InitContext) -> Result<Vec<Strin
         let patched_config = unpatch_hermes_config(&existing_config);
 
         if patched_config != existing_config {
-            if dry_run {
-                preview(&config_path, WriteKind::Config);
-                println!(
-                    "[dry-run] would update Hermes config: {}",
-                    config_path.display()
-                );
-                if verbose > 0 {
-                    println!("[dry-run] content:\n{}", patched_config);
-                }
-            } else {
-                patch_config(&config_path, &patched_config).with_context(|| {
-                    format!("Failed to write Hermes config: {}", config_path.display())
-                })?;
-                if verbose > 0 {
-                    eprintln!("Updated Hermes config: {}", config_path.display());
-                }
-            }
+            let report = Report::new(format!(
+                "[dry-run] would update Hermes config: {}",
+                config_path.display()
+            ))
+            .with_content()
+            .done_verbose(format!("Updated Hermes config: {}", config_path.display()));
+            write_reported(
+                &config_path,
+                WriteKind::Config,
+                &patched_config,
+                ctx,
+                report,
+            )
+            .with_context(|| format!("Failed to write Hermes config: {}", config_path.display()))?;
             removed.push("Hermes config: removed RTK plugin entry".to_string());
         }
     }
