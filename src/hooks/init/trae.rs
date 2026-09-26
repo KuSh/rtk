@@ -144,7 +144,7 @@ fn patch_trae_hooks_json_paths(paths: &[PathBuf], ctx: InitContext) -> Result<Ve
 
             if patch.existed {
                 let backup_path = patch.path.with_extension("json.bak");
-                fs::copy(&patch.path, &backup_path)
+                copy_backup(&patch.path, &backup_path)
                     .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
                 if ctx.verbose > 0 {
                     eprintln!("Backup: {}", backup_path.display());
@@ -301,7 +301,7 @@ fn remove_trae_hooks_json_paths(paths: &[PathBuf], ctx: InitContext) -> Result<V
 
         let write_result: Result<()> = (|| {
             let backup_path = removal.path.with_extension("json.bak");
-            fs::copy(&removal.path, &backup_path)
+            copy_backup(&removal.path, &backup_path)
                 .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
             atomic_write(&removal.path, &removal.serialized)
         })();
