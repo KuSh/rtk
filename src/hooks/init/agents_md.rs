@@ -96,18 +96,20 @@ pub(super) fn write_rtk_block(
     match action {
         RtkBlockUpsert::Added => {
             if dry_run {
+                preview(path, WriteKind::Instructions);
                 println!("[dry-run] would add {} to {}", label, path.display());
             } else {
-                atomic_write(path, &new_content)
+                patch_instructions(path, &new_content)
                     .with_context(|| format!("Failed to write {}", path.display()))?;
                 println!("[ok] Added {} to {}", label, path.display());
             }
         }
         RtkBlockUpsert::Updated => {
             if dry_run {
+                preview(path, WriteKind::Instructions);
                 println!("[dry-run] would update {} in {}", label, path.display());
             } else {
-                atomic_write(path, &new_content)
+                patch_instructions(path, &new_content)
                     .with_context(|| format!("Failed to write {}", path.display()))?;
                 println!("[ok] Updated {} in {}", label, path.display());
             }
@@ -177,6 +179,7 @@ pub(super) fn patch_agents_md(path: &Path, rtk_md_ref: &str, ctx: InitContext) -
         {
             content = content.replace(RTK_MD_REF, rtk_md_ref);
             if dry_run {
+                preview(path, WriteKind::Instructions);
                 println!(
                     "[dry-run] would migrate {} to {} in {}",
                     RTK_MD_REF,
@@ -184,7 +187,7 @@ pub(super) fn patch_agents_md(path: &Path, rtk_md_ref: &str, ctx: InitContext) -
                     path.display()
                 );
             } else {
-                atomic_write(path, &content)
+                patch_instructions(path, &content)
                     .with_context(|| format!("Failed to write AGENTS.md: {}", path.display()))?;
                 if verbose > 0 {
                     eprintln!("Migrated {} to {}", RTK_MD_REF, rtk_md_ref);
@@ -194,12 +197,13 @@ pub(super) fn patch_agents_md(path: &Path, rtk_md_ref: &str, ctx: InitContext) -
         }
         if migrated {
             if dry_run {
+                preview(path, WriteKind::Instructions);
                 println!(
                     "[dry-run] would write migrated AGENTS.md: {}",
                     path.display()
                 );
             } else {
-                atomic_write(path, &content)
+                patch_instructions(path, &content)
                     .with_context(|| format!("Failed to write AGENTS.md: {}", path.display()))?;
             }
         }
@@ -213,6 +217,7 @@ pub(super) fn patch_agents_md(path: &Path, rtk_md_ref: &str, ctx: InitContext) -
     };
 
     if dry_run {
+        preview(path, WriteKind::Instructions);
         println!(
             "[dry-run] would add {} reference to AGENTS.md: {}",
             rtk_md_ref,
@@ -222,7 +227,7 @@ pub(super) fn patch_agents_md(path: &Path, rtk_md_ref: &str, ctx: InitContext) -
             println!("[dry-run] content:\n{}", new_content);
         }
     } else {
-        atomic_write(path, &new_content)
+        patch_instructions(path, &new_content)
             .with_context(|| format!("Failed to write AGENTS.md: {}", path.display()))?;
         if verbose > 0 {
             eprintln!("Added {} reference to AGENTS.md", rtk_md_ref);
@@ -268,6 +273,7 @@ pub(super) fn remove_rtk_reference_from_agents(
     let cleaned = clean_double_blanks(&new_content);
 
     if dry_run {
+        preview(path, WriteKind::Instructions);
         println!(
             "[dry-run] would remove RTK.md reference from AGENTS.md: {}",
             path.display()
@@ -278,7 +284,7 @@ pub(super) fn remove_rtk_reference_from_agents(
         return Ok(true);
     }
 
-    atomic_write(path, &cleaned)
+    patch_instructions(path, &cleaned)
         .with_context(|| format!("Failed to write AGENTS.md: {}", path.display()))?;
 
     if verbose > 0 {

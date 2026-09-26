@@ -23,6 +23,7 @@ fn print_instructions_agents_awareness_note(agent: &str, ctx: InitContext) {
 // Cline / Roo Code support
 
 pub(super) fn run_cline_mode(ctx: InitContext) -> Result<()> {
+    let _scope = ProjectScope::enter(ctx);
     let InitContext {
         verbose, dry_run, ..
     } = ctx;
@@ -42,6 +43,7 @@ pub(super) fn run_cline_mode(ctx: InitContext) -> Result<()> {
             format!("{}\n\n{}", existing.trim(), RTK_AWARENESS_FULL)
         };
         if dry_run {
+            preview(&rules_path, WriteKind::Instructions);
             println!(
                 "[dry-run] would write .clinerules: {}",
                 rules_path.display()
@@ -50,7 +52,7 @@ pub(super) fn run_cline_mode(ctx: InitContext) -> Result<()> {
                 println!("[dry-run] content:\n{}", new_content);
             }
         } else {
-            fs::write(&rules_path, &new_content).context("Failed to write .clinerules")?;
+            patch_instructions(&rules_path, &new_content).context("Failed to write .clinerules")?;
 
             if verbose > 0 {
                 eprintln!("Wrote .clinerules");
@@ -70,6 +72,7 @@ pub(super) fn run_cline_mode(ctx: InitContext) -> Result<()> {
 }
 
 pub(super) fn run_windsurf_mode(ctx: InitContext) -> Result<()> {
+    let _scope = ProjectScope::enter(ctx);
     let InitContext {
         verbose, dry_run, ..
     } = ctx;
@@ -90,6 +93,7 @@ pub(super) fn run_windsurf_mode(ctx: InitContext) -> Result<()> {
             format!("{}\n\n{}", existing.trim(), RTK_AWARENESS_FULL)
         };
         if dry_run {
+            preview(&rules_path, WriteKind::Instructions);
             println!(
                 "[dry-run] would write .windsurfrules: {}",
                 rules_path.display()
@@ -98,7 +102,8 @@ pub(super) fn run_windsurf_mode(ctx: InitContext) -> Result<()> {
                 println!("[dry-run] content:\n{}", new_content);
             }
         } else {
-            fs::write(&rules_path, &new_content).context("Failed to write .windsurfrules")?;
+            patch_instructions(&rules_path, &new_content)
+                .context("Failed to write .windsurfrules")?;
 
             if verbose > 0 {
                 eprintln!("Wrote .windsurfrules");
@@ -120,6 +125,7 @@ pub(super) fn run_windsurf_mode(ctx: InitContext) -> Result<()> {
 // Kilo Code support
 
 pub fn run_kilocode_mode(ctx: InitContext) -> Result<()> {
+    let _scope = ProjectScope::enter(ctx);
     run_kilocode_mode_at(&std::env::current_dir()?, ctx)
 }
 
@@ -144,6 +150,7 @@ fn run_kilocode_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
             format!("{}\n\n{}", existing.trim(), RTK_AWARENESS_FULL)
         };
         if dry_run {
+            preview(&rules_path, WriteKind::Owned);
             println!(
                 "[dry-run] would write {}: (and create parent dir if missing)",
                 rules_path.display()
@@ -152,9 +159,7 @@ fn run_kilocode_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
                 println!("[dry-run] content:\n{}", new_content);
             }
         } else {
-            fs::create_dir_all(&target_dir)
-                .context("Failed to create .kilocode/rules directory")?;
-            fs::write(&rules_path, &new_content)
+            atomic_write(&rules_path, &new_content)
                 .context("Failed to write .kilocode/rules/rtk-rules.md")?;
 
             if verbose > 0 {
@@ -179,6 +184,7 @@ fn run_kilocode_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
 // Google Antigravity support
 
 pub fn run_antigravity_mode(ctx: InitContext) -> Result<()> {
+    let _scope = ProjectScope::enter(ctx);
     run_antigravity_mode_at(&std::env::current_dir()?, ctx)
 }
 
@@ -203,6 +209,7 @@ fn run_antigravity_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
             format!("{}\n\n{}", existing.trim(), RTK_AWARENESS_FULL)
         };
         if dry_run {
+            preview(&rules_path, WriteKind::Owned);
             println!(
                 "[dry-run] would write {}: (and create parent dir if missing)",
                 rules_path.display()
@@ -211,8 +218,7 @@ fn run_antigravity_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
                 println!("[dry-run] content:\n{}", new_content);
             }
         } else {
-            fs::create_dir_all(&target_dir).context("Failed to create .agents/rules directory")?;
-            fs::write(&rules_path, &new_content)
+            atomic_write(&rules_path, &new_content)
                 .context("Failed to write .agents/rules/antigravity-rtk-rules.md")?;
 
             if verbose > 0 {
@@ -244,6 +250,7 @@ fn run_antigravity_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
 // inject an RTK instructions block into AGENTS.md — same mechanism as Codex.
 
 pub fn run_kimi_mode(ctx: InitContext) -> Result<()> {
+    let _scope = ProjectScope::enter(ctx);
     run_kimi_mode_at(&std::env::current_dir()?, ctx)
 }
 
@@ -275,6 +282,24 @@ mod tests {
     use super::codex::{codex_rtk_md_content, run_codex_mode_with_paths};
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_kilocode_rules_file_is_rtks_own_and_takes_no_backup() {
+        let temp = TempDir::new().unwrap();
+        let rules = temp.path().join(".kilocode/rules/rtk-rules.md");
+        fs::create_dir_all(rules.parent().unwrap()).unwrap();
+        fs::write(&rules, "team notes\n").unwrap();
+
+        run_kilocode_mode_at(temp.path(), InitContext::default()).unwrap();
+
+        assert!(fs::read_to_string(&rules).unwrap().contains("rtk"));
+        assert!(
+            !temp
+                .path()
+                .join(".kilocode/rules/rtk-rules.md.bak")
+                .exists()
+        );
+    }
 
     #[test]
     fn test_kilocode_mode_creates_rules_file() {

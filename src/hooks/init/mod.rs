@@ -30,8 +30,10 @@ mod hermes;
 mod instructions_agents;
 mod opencode;
 mod pi;
+mod symlinks;
 mod trae;
 mod vibe;
+mod write;
 
 // `agents_md` and `pi` hold helpers that several submodules share, so they are
 // glob-imported and reach siblings through `use super::*`; every other submodule is used only
@@ -51,6 +53,8 @@ use opencode::{
     opencode_plugin_path, remove_opencode_plugin, resolve_opencode_dir, run_opencode_only_mode,
 };
 use pi::*;
+use symlinks::*;
+use write::*;
 
 pub(crate) use copilot::{COPILOT_HOOK_JSON, copilot_user_dir};
 pub use copilot::{run_copilot, run_copilot_global, uninstall_copilot, uninstall_copilot_global};
@@ -111,9 +115,10 @@ const RTK_BLOCK_VERSION: &str = "v2";
 pub(super) const RTK_BLOCK_END: &str = "<!-- /rtk-instructions -->";
 
 /// Control flow for settings.json patching
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum PatchMode {
-    Ask,  // Default: prompt user [y/N]
+    #[default]
+    Ask, // Default: prompt user [y/N]
     Auto, // --auto-patch: no prompt
     Skip, // --no-patch: manual instructions
 }
@@ -148,6 +153,9 @@ pub struct InitContext {
     /// `awareness.level` from config.toml. Agents with a command hook receive the matching
     /// awareness file; agents without a hook always receive `full` (see `print_instructions_agents_awareness_note`).
     pub awareness: AwarenessLevel,
+    /// `--auto-patch` / `--no-patch`, for the decisions that are not about one agent's
+    /// settings file, such as a project write that resolves outside the project.
+    pub patch_mode: PatchMode,
 }
 
 pub(super) fn awareness_content(level: AwarenessLevel) -> &'static str {
@@ -326,6 +334,7 @@ pub fn run(
     patch_mode: PatchMode,
     ctx: InitContext,
 ) -> Result<()> {
+    let _scope = (!global).then(|| ProjectScope::enter(ctx));
     let InitContext { dry_run, .. } = ctx;
     // Validation: Codex mode conflicts
     if codex {
@@ -337,12 +346,6 @@ pub fn run(
         }
         if hook_only {
             anyhow::bail!("--codex cannot be combined with --hook-only");
-        }
-        if matches!(patch_mode, PatchMode::Auto) {
-            anyhow::bail!("--codex cannot be combined with --auto-patch");
-        }
-        if matches!(patch_mode, PatchMode::Skip) {
-            anyhow::bail!("--codex cannot be combined with --no-patch");
         }
         run_codex_mode(global, ctx)?;
     } else {
@@ -438,7 +441,18 @@ pub(super) fn write_if_changed(
     name: &str,
     ctx: InitContext,
 ) -> Result<bool> {
-    write_if_changed_internal(path, content, name, ctx, false)
+    write_if_changed_internal(path, content, name, ctx, false, WriteKind::Owned)
+}
+
+/// [`write_if_changed`] for a config file RTK edits but does not own: the existing file is
+/// backed up, then replaced atomically (see [`patch_config`]).
+pub(super) fn patch_if_changed(
+    path: &Path,
+    content: &str,
+    name: &str,
+    ctx: InitContext,
+) -> Result<bool> {
+    write_if_changed_internal(path, content, name, ctx, false, WriteKind::Config)
 }
 
 /// Variant used for protected RTK files. A file that cannot be decoded is
@@ -451,7 +465,7 @@ pub(super) fn write_if_changed_allow_read_error(
     name: &str,
     ctx: InitContext,
 ) -> Result<bool> {
-    write_if_changed_internal(path, content, name, ctx, true)
+    write_if_changed_internal(path, content, name, ctx, true, WriteKind::Owned)
 }
 
 fn write_if_changed_internal(
@@ -460,6 +474,7 @@ fn write_if_changed_internal(
     name: &str,
     ctx: InitContext,
     allow_read_error: bool,
+    kind: WriteKind,
 ) -> Result<bool> {
     let InitContext {
         verbose, dry_run, ..
@@ -469,12 +484,14 @@ fn write_if_changed_internal(
             Ok(existing) => existing,
             Err(_) if allow_read_error => {
                 if dry_run {
+                    preview(path, kind);
                     println!("[dry-run] would update {}: {}", name, path.display());
                     if verbose > 0 {
                         println!("[dry-run] content:\n{}", content);
                     }
                 } else {
-                    atomic_write(path, content)
+                    write_file(path, kind, content)
+                        .map(|_| ())
                         .with_context(|| format!("Failed to write {}: {}", name, path.display()))?;
                     if verbose > 0 {
                         eprintln!("Updated {}: {}", name, path.display());
@@ -495,12 +512,14 @@ fn write_if_changed_internal(
             Ok(false)
         } else {
             if dry_run {
+                preview(path, kind);
                 println!("[dry-run] would update {}: {}", name, path.display());
                 if verbose > 0 {
                     println!("[dry-run] content:\n{}", content);
                 }
             } else {
-                atomic_write(path, content)
+                write_file(path, kind, content)
+                    .map(|_| ())
                     .with_context(|| format!("Failed to write {}: {}", name, path.display()))?;
                 if verbose > 0 {
                     eprintln!("Updated {}: {}", name, path.display());
@@ -510,13 +529,14 @@ fn write_if_changed_internal(
         }
     } else {
         if dry_run {
+            preview(path, kind);
             println!("[dry-run] would create {}: {}", name, path.display());
             if verbose > 0 {
                 println!("[dry-run] content:\n{}", content);
             }
         } else {
-            ensure_parent_dir(path)?;
-            atomic_write(path, content)
+            write_file(path, kind, content)
+                .map(|_| ())
                 .with_context(|| format!("Failed to write {}: {}", name, path.display()))?;
             if verbose > 0 {
                 eprintln!("Created {}: {}", name, path.display());
@@ -524,57 +544,6 @@ fn write_if_changed_internal(
         }
         Ok(true)
     }
-}
-
-pub(super) fn ensure_parent_dir(path: &Path) -> Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-
-    if parent.as_os_str().is_empty() {
-        return Ok(());
-    }
-
-    fs::create_dir_all(parent)
-        .with_context(|| format!("Failed to create directory: {}", parent.display()))
-}
-
-/// Resolve the final write target: if `path` is a symlink, follow it so
-/// the atomic rename lands on the real file and the symlink is preserved.
-fn resolve_atomic_target(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// Atomic write using tempfile + rename
-/// Prevents corruption on crash/interrupt
-/// Follows symlinks so the link itself is preserved.
-pub(super) fn atomic_write(path: &Path, content: &str) -> Result<()> {
-    let target = resolve_atomic_target(path);
-    let parent = target.parent().with_context(|| {
-        format!(
-            "Cannot write to {}: path has no parent directory",
-            target.display()
-        )
-    })?;
-
-    // Create temp file in same directory (ensures same filesystem for atomic rename)
-    let mut temp_file = NamedTempFile::new_in(parent)
-        .with_context(|| format!("Failed to create temp file in {}", parent.display()))?;
-
-    // Write content
-    temp_file
-        .write_all(content.as_bytes())
-        .with_context(|| format!("Failed to write {} bytes to temp file", content.len()))?;
-
-    // Atomic rename
-    temp_file.persist(&target).with_context(|| {
-        format!(
-            "Failed to atomically replace {} (disk full?)",
-            target.display()
-        )
-    })?;
-
-    Ok(())
 }
 
 /// Read a JSON file with path-aware errors. Missing files return `None` and
@@ -629,10 +598,12 @@ pub(super) fn canonicalize_path_for_comparison(path: &Path) -> PathBuf {
     }
 }
 
-/// Where [`backup_and_atomic_write`] puts the copy it takes before overwriting `path`. Named
+/// Where [`patch_config`] and [`patch_instructions`] put the copy they take before writing `path`. Named
 /// so a caller that has to vouch for where it writes can vouch for this one too.
 pub(super) fn backup_path_for(path: &Path) -> PathBuf {
-    path.with_extension("json.bak")
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".bak");
+    path.with_file_name(name)
 }
 
 /// What to say on stderr, under `-v`, once [`update_json_file`] has written a file.
@@ -658,13 +629,14 @@ pub(super) fn update_json_file(
     let serialized = serde_json::to_string_pretty(root)
         .with_context(|| format!("Failed to serialize {label}"))?;
     if ctx.dry_run {
+        preview(path, WriteKind::Config);
         println!("{dry_run_message}");
         if content_on_dry_run && ctx.verbose > 0 {
             println!("[dry-run] content:\n{serialized}");
         }
         return Ok(());
     }
-    let backup = backup_and_atomic_write(path, &serialized)?;
+    let backup = patch_config(path, &serialized)?;
     if ctx.verbose > 0 {
         match written {
             Written::Backup => {
@@ -676,114 +648,6 @@ pub(super) fn update_json_file(
         }
     }
     Ok(())
-}
-
-/// Copy `source` to `destination` without opening what sits at `destination`: the copy goes
-/// to a temp file renamed over it, so a `.bak` that is a symlink or a hard link -- which a
-/// cloned repository can ship -- is replaced rather than written through (#4157). The temp
-/// file is created with the source's permission bits, so the copy is never more readable than
-/// the file it saves. A `.bak` this user cannot write is refused, as a plain copy would refuse
-/// it.
-pub(super) fn copy_backup(source: &Path, destination: &Path) -> Result<()> {
-    if fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.is_file())
-        && let Err(error) = open_backup_like_a_copy(destination)
-        && error.kind() == std::io::ErrorKind::PermissionDenied
-    {
-        anyhow::bail!("{} is read-only", destination.display());
-    }
-    let dir = match destination.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    let permissions = fs::metadata(source)?.permissions();
-    let mut temp_file = match backup_temp_file(dir, &permissions) {
-        Ok(temp_file) => temp_file,
-        // A directory that takes no new file still lets an existing backup be rewritten, as
-        // the plain copy RTK used to make did; opened without following a link.
-        Err(error)
-            if error.kind() == std::io::ErrorKind::PermissionDenied
-                && fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.is_file())
-                && !shares_content(destination, source) =>
-        {
-            let mut backup = open_backup_like_a_copy(destination)?;
-            backup.set_len(0)?;
-            std::io::copy(&mut fs::File::open(source)?, &mut backup)?;
-            return Ok(());
-        }
-        Err(error) => return Err(error.into()),
-    };
-    std::io::copy(&mut fs::File::open(source)?, temp_file.as_file_mut())?;
-    temp_file
-        .persist(destination)
-        .map_err(|error| error.error)?;
-    Ok(())
-}
-
-/// Whether rewriting `backup` in place would also change `source` or another file: it is a
-/// hard link to something.
-fn shares_content(backup: &Path, source: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let (Ok(backup), Ok(source)) = (fs::metadata(backup), fs::metadata(source)) else {
-            return false;
-        };
-        backup.nlink() > 1 || (backup.dev() == source.dev() && backup.ino() == source.ino())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (backup, source);
-        false
-    }
-}
-
-/// Open an existing regular `.bak` for writing as a copy would, without truncating it or
-/// following a link, so the answer is the one the copy would have got.
-fn open_backup_like_a_copy(path: &Path) -> std::io::Result<fs::File> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    options.open(path)
-}
-
-#[cfg(unix)]
-fn backup_temp_file(dir: &Path, permissions: &fs::Permissions) -> std::io::Result<NamedTempFile> {
-    let temp_file = tempfile::Builder::new()
-        .permissions(permissions.clone())
-        .tempfile_in(dir)?;
-    // The umask may have narrowed the bits at creation; restore them.
-    temp_file.as_file().set_permissions(permissions.clone())?;
-    Ok(temp_file)
-}
-
-#[cfg(not(unix))]
-fn backup_temp_file(dir: &Path, _permissions: &fs::Permissions) -> std::io::Result<NamedTempFile> {
-    NamedTempFile::new_in(dir)
-}
-
-/// Back up an existing JSON file before replacing it atomically.
-fn backup_and_atomic_write(path: &Path, content: &str) -> Result<Option<PathBuf>> {
-    let backup_path = if path.exists() {
-        let backup_path = backup_path_for(path);
-        copy_backup(path, &backup_path).with_context(|| {
-            format!(
-                "Failed to backup {} to {}",
-                path.display(),
-                backup_path.display()
-            )
-        })?;
-        Some(backup_path)
-    } else {
-        None
-    };
-
-    atomic_write(path, content)
-        .with_context(|| format!("Failed to update JSON file: {}", path.display()))?;
-    Ok(backup_path)
 }
 
 /// Prompt user for confirmation.
@@ -934,6 +798,7 @@ pub fn uninstall_with_patch_mode(
     patch_mode: PatchMode,
     ctx: InitContext,
 ) -> Result<()> {
+    let _scope = (!global).then(|| ProjectScope::enter(ctx));
     let InitContext {
         verbose, dry_run, ..
     } = ctx;
@@ -1107,6 +972,7 @@ pub fn uninstall_with_patch_mode(
                 removed.retain(|r| !r.starts_with("CLAUDE.md:"));
                 removed.push("CLAUDE.md: removed (was empty after cleanup)".to_string());
             } else if dry_run {
+                preview(&claude_md_path, WriteKind::Instructions);
                 println!(
                     "[dry-run] would update CLAUDE.md: {}",
                     claude_md_path.display()
@@ -1115,7 +981,7 @@ pub fn uninstall_with_patch_mode(
                     println!("[dry-run] content:\n{}", working_content);
                 }
             } else {
-                fs::write(&claude_md_path, &working_content).with_context(|| {
+                patch_instructions(&claude_md_path, &working_content).with_context(|| {
                     format!("Failed to write CLAUDE.md: {}", claude_md_path.display())
                 })?;
             }
@@ -1326,12 +1192,15 @@ pub(super) fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str
 }
 
 /// Generate .rtk/filters.toml template in the current directory if not present.
+pub(super) fn project_filters_template_path() -> PathBuf {
+    Path::new(".rtk").join("filters.toml")
+}
+
 pub(super) fn generate_project_filters_template(ctx: InitContext) -> Result<()> {
     let InitContext {
         verbose, dry_run, ..
     } = ctx;
-    let rtk_dir = std::path::Path::new(".rtk");
-    let path = rtk_dir.join("filters.toml");
+    let path = project_filters_template_path();
 
     if path.exists() {
         if verbose > 0 {
@@ -1341,6 +1210,7 @@ pub(super) fn generate_project_filters_template(ctx: InitContext) -> Result<()> 
     }
 
     if dry_run {
+        preview(&path, WriteKind::Owned);
         println!(
             "[dry-run] would create .rtk/filters.toml template: {}",
             path.display()
@@ -1348,9 +1218,7 @@ pub(super) fn generate_project_filters_template(ctx: InitContext) -> Result<()> 
         return Ok(());
     }
 
-    fs::create_dir_all(rtk_dir)
-        .with_context(|| format!("Failed to create directory: {}", rtk_dir.display()))?;
-    fs::write(&path, FILTERS_TEMPLATE)
+    atomic_write(&path, FILTERS_TEMPLATE)
         .with_context(|| format!("Failed to write {}", path.display()))?;
 
     println!(
@@ -1384,9 +1252,7 @@ pub(super) fn generate_global_filters_template(ctx: InitContext) -> Result<()> {
         return Ok(());
     }
 
-    fs::create_dir_all(&rtk_dir)
-        .with_context(|| format!("Failed to create directory: {}", rtk_dir.display()))?;
-    fs::write(&path, FILTERS_GLOBAL_TEMPLATE)
+    atomic_write(&path, FILTERS_GLOBAL_TEMPLATE)
         .with_context(|| format!("Failed to write {}", path.display()))?;
 
     println!(
@@ -1779,6 +1645,12 @@ impl Drop for CwdGuard {
     }
 }
 
+/// Whether this process is refused writing a read-only file; root is not.
+#[cfg(test)]
+pub(super) fn read_only_is_enforced(path: &Path) -> bool {
+    fs::OpenOptions::new().write(true).open(path).is_err()
+}
+
 #[cfg(test)]
 pub(super) fn with_claude_dir_override<F: FnOnce(&Path)>(tmp: &TempDir, f: F) {
     let claude_dir = tmp.path().join(CLAUDE_DIR);
@@ -2130,6 +2002,496 @@ mod tests {
         assert_eq!(written, content);
     }
 
+    #[test]
+    fn test_atomic_write_creates_missing_parent_dirs() {
+        let temp = TempDir::new().unwrap();
+        let file_path = temp.path().join("agent").join("hooks").join("hooks.json");
+
+        atomic_write(&file_path, "{}").unwrap();
+
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_write_through_a_dangling_symlink_creates_its_target() {
+        let temp = TempDir::new().unwrap();
+        let link_path = temp.path().join("hooks.json");
+        let real_path = temp.path().join("dotfiles").join("hooks.json");
+        fs::create_dir(temp.path().join("dotfiles")).unwrap();
+        std::os::unix::fs::symlink("dotfiles/hooks.json", &link_path).unwrap();
+
+        atomic_write(&link_path, "{}").unwrap();
+
+        assert!(fs::symlink_metadata(&link_path).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(&real_path).unwrap(), "{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_write_keeps_the_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        for mode in [0o644, 0o600, 0o755, 0o664] {
+            let file_path = temp.path().join(format!("file-{mode:o}"));
+            fs::write(&file_path, "old").unwrap();
+            fs::set_permissions(&file_path, fs::Permissions::from_mode(mode)).unwrap();
+
+            atomic_write(&file_path, "new").unwrap();
+
+            let actual = fs::metadata(&file_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(actual, mode, "mode of {}", file_path.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_patch_file_replaces_a_symlinked_backup_instead_of_following_it() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("hooks.json");
+        let other = temp.path().join("CLAUDE.md");
+        fs::write(&path, "{}").unwrap();
+        fs::write(&other, "notes").unwrap();
+        std::os::unix::fs::symlink("CLAUDE.md", backup_path_for(&path)).unwrap();
+
+        patch_config(&path, "{\"new\":1}").unwrap();
+
+        assert_eq!(fs::read_to_string(&other).unwrap(), "notes");
+        let backup = backup_path_for(&path);
+        assert!(!fs::symlink_metadata(&backup).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(backup).unwrap(), "{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_patch_file_does_not_create_a_dangling_backup_target() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("hooks.json");
+        fs::write(&path, "{}").unwrap();
+        std::os::unix::fs::symlink("outside.json", backup_path_for(&path)).unwrap();
+
+        patch_config(&path, "{}").unwrap();
+
+        assert!(!temp.path().join("outside.json").exists());
+    }
+
+    #[test]
+    fn test_patch_file_leaves_a_file_hard_linked_to_the_backup_alone() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("hooks.json");
+        let other = temp.path().join("notes.txt");
+        fs::write(&path, "{}").unwrap();
+        fs::write(&other, "notes").unwrap();
+        fs::hard_link(&other, backup_path_for(&path)).unwrap();
+
+        patch_config(&path, "{\"new\":1}").unwrap();
+
+        assert_eq!(fs::read_to_string(&other).unwrap(), "notes");
+        assert_eq!(fs::read_to_string(backup_path_for(&path)).unwrap(), "{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_patch_file_writes_in_place_and_keeps_hard_links() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("CLAUDE.md");
+        let other = temp.path().join("other-checkout-CLAUDE.md");
+        fs::write(&path, "notes\n").unwrap();
+        fs::hard_link(&path, &other).unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+
+        let backup = patch_instructions(&path, "notes\n\n@RTK.md\n")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(fs::read_to_string(&other).unwrap(), "notes\n\n@RTK.md\n");
+        assert_eq!(backup, temp.path().join("CLAUDE.md.bak"));
+        assert_eq!(fs::read_to_string(backup).unwrap(), "notes\n");
+    }
+
+    #[test]
+    fn test_atomic_write_takes_no_backup() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("RTK.md");
+        fs::write(&path, "old").unwrap();
+
+        atomic_write(&path, "new").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        assert!(!temp.path().join("RTK.md.bak").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_patch_config_replaces_the_file_atomically_after_a_backup() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("settings.json");
+        fs::write(&path, "{}").unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+
+        let backup = patch_config(&path, "{\"hooks\":{}}").unwrap().unwrap();
+
+        assert_ne!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"hooks\":{}}");
+        assert_eq!(fs::read_to_string(backup).unwrap(), "{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_an_existing_backup_link_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("CLAUDE.md");
+        let protected = temp.path().join("protected");
+        fs::write(&path, "notes\n").unwrap();
+        fs::write(&protected, "keep\n").unwrap();
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o444)).unwrap();
+        std::os::unix::fs::symlink("protected", backup_path_for(&path)).unwrap();
+
+        patch_instructions(&path, "notes\n\n@RTK.md\n").unwrap();
+
+        assert_eq!(fs::read_to_string(&protected).unwrap(), "keep\n");
+        assert!(
+            fs::symlink_metadata(backup_path_for(&path))
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "notes\n\n@RTK.md\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_read_only_backup_left_over_does_not_block_creating_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("CLAUDE.md");
+        fs::write(backup_path_for(&path), "old backup\n").unwrap();
+        fs::set_permissions(backup_path_for(&path), fs::Permissions::from_mode(0o444)).unwrap();
+
+        patch_instructions(&path, "@RTK.md\n").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "@RTK.md\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_an_instruction_file_with_a_read_only_backup_is_written_without_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("CLAUDE.md");
+        fs::write(&path, "notes\n").unwrap();
+        fs::write(backup_path_for(&path), "kept\n").unwrap();
+        fs::set_permissions(backup_path_for(&path), fs::Permissions::from_mode(0o444)).unwrap();
+        if !read_only_is_enforced(&backup_path_for(&path)) {
+            return;
+        }
+
+        let backup = patch_instructions(&path, "notes\n\n@RTK.md\n").unwrap();
+
+        assert_eq!(backup, None);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "notes\n\n@RTK.md\n");
+        assert_eq!(
+            fs::read_to_string(backup_path_for(&path)).unwrap(),
+            "kept\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_config_with_a_read_only_backup_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("settings.json");
+        fs::write(&path, "{}").unwrap();
+        fs::write(backup_path_for(&path), "kept").unwrap();
+        fs::set_permissions(backup_path_for(&path), fs::Permissions::from_mode(0o444)).unwrap();
+        if !read_only_is_enforced(&backup_path_for(&path)) {
+            return;
+        }
+
+        let error = patch_config(&path, "{\"hooks\":{}}").unwrap_err();
+
+        assert!(format!("{error:#}").contains("backup"), "{error:#}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_an_instruction_file_linked_into_a_missing_directory_is_refused() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("CLAUDE.md");
+        std::os::unix::fs::symlink("unmounted/dotfiles/CLAUDE.md", &path).unwrap();
+
+        let error = patch_instructions(&path, "@RTK.md\n").unwrap_err();
+
+        assert!(format!("{error:#}").contains("does not exist"), "{error:#}");
+        assert!(fs::symlink_metadata(&path).unwrap().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_patch_config_rewrites_an_existing_backup_when_the_directory_is_locked() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let locked = temp.path().join("claude");
+        let dotfiles = temp.path().join("dotfiles");
+        fs::create_dir_all(&locked).unwrap();
+        fs::create_dir_all(&dotfiles).unwrap();
+        fs::write(dotfiles.join("settings.json"), "{}").unwrap();
+        let path = locked.join("settings.json");
+        std::os::unix::fs::symlink("../dotfiles/settings.json", &path).unwrap();
+        fs::write(backup_path_for(&path), "old backup").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores the directory's mode, and then the backup is simply replaced.
+        let locked_for_us = NamedTempFile::new_in(&locked).is_err();
+
+        let result = patch_config(&path, "{\"hooks\":{}}");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        result.unwrap();
+        assert_eq!(fs::read_to_string(backup_path_for(&path)).unwrap(), "{}");
+        assert_eq!(
+            fs::read_to_string(dotfiles.join("settings.json")).unwrap(),
+            "{\"hooks\":{}}"
+        );
+        if locked_for_us {
+            assert!(fs::symlink_metadata(&path).unwrap().is_symlink());
+        }
+    }
+
+    #[test]
+    fn test_an_earlier_instruction_backup_is_kept() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("CLAUDE.md");
+        fs::write(&path, "# mine\n").unwrap();
+        fs::write(backup_path_for(&path), "my hand-made rescue copy\n").unwrap();
+
+        let backup = patch_instructions(&path, "# mine\n\n@RTK.md\n").unwrap();
+
+        assert_eq!(backup, None);
+        assert_eq!(
+            fs::read_to_string(backup_path_for(&path)).unwrap(),
+            "my hand-made rescue copy\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_config_whose_backup_is_a_hard_link_to_it_is_not_emptied() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let locked = temp.path().join("claude");
+        let dotfiles = temp.path().join("dotfiles");
+        fs::create_dir_all(&locked).unwrap();
+        fs::create_dir_all(&dotfiles).unwrap();
+        let real = dotfiles.join("settings.json");
+        fs::write(&real, "{\"keep\":1}").unwrap();
+        let path = locked.join("settings.json");
+        std::os::unix::fs::symlink("../dotfiles/settings.json", &path).unwrap();
+        fs::hard_link(&real, backup_path_for(&path)).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        let locked_for_us = NamedTempFile::new_in(&locked).is_err();
+
+        let result = patch_config(&path, "{}");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        if locked_for_us {
+            assert!(result.is_err());
+            assert_eq!(fs::read_to_string(&real).unwrap(), "{\"keep\":1}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_link_loop_is_reported_as_one() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("CLAUDE.md");
+        std::os::unix::fs::symlink("CLAUDE.md", &path).unwrap();
+
+        let error = patch_instructions(&path, "x").unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("cannot be followed"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_file_under_a_dangling_directory_link_is_refused() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join("dotfiles")).unwrap();
+        let cursor_dir = temp.path().join(".cursor");
+        std::os::unix::fs::symlink("dotfiles/cursor", &cursor_dir).unwrap();
+
+        let error = patch_config(&cursor_dir.join("hooks.json"), "{}").unwrap_err();
+
+        assert!(format!("{error:#}").contains("does not exist"), "{error:#}");
+        assert!(ensure_patchable(&cursor_dir.join("hooks.json")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_two_hop_dangling_chain_names_the_missing_directory() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("CLAUDE.md");
+        std::os::unix::fs::symlink("link2", &path).unwrap();
+        std::os::unix::fs::symlink("missing/dir/CLAUDE.md", temp.path().join("link2")).unwrap();
+
+        let error = patch_instructions(&path, "x").unwrap_err();
+
+        assert!(format!("{error:#}").contains("does not exist"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_config_whose_backup_is_the_file_itself_is_refused() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("settings.json");
+        fs::write(&path, "{\"keep\":1}").unwrap();
+        std::os::unix::fs::symlink("settings.json", backup_path_for(&path)).unwrap();
+
+        let error = patch_config(&path, "{}").unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("the file itself"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"keep\":1}");
+    }
+
+    #[test]
+    fn test_a_file_patched_twice_in_one_run_is_backed_up_once() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("AGENTS.md");
+        fs::write(&path, "original\n").unwrap();
+
+        patch_instructions(&path, "first edit\n").unwrap();
+        patch_instructions(&path, "second edit\n").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(backup_path_for(&path)).unwrap(),
+            "original\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_patch_instructions_writes_without_a_backup_when_the_directory_is_locked() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("shared");
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join(".clinerules");
+        fs::write(&path, "team rules\n").unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores the directory's mode, and then the backup is simply taken.
+        let locked = NamedTempFile::new_in(&dir).is_err();
+
+        let result = patch_instructions(&path, "team rules\nrtk\n");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backup = result.unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "team rules\nrtk\n");
+        if locked {
+            assert_eq!(backup, None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_keeps_the_source_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        for mode in [0o600, 0o644] {
+            let path = temp.path().join(format!("settings-{mode:o}.json"));
+            fs::write(&path, "{\"token\":1}").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+
+            patch_config(&path, "{}").unwrap();
+
+            let backup = fs::metadata(backup_path_for(&path)).unwrap();
+            assert_eq!(backup.permissions().mode() & 0o777, mode);
+        }
+    }
+
+    #[test]
+    fn test_patch_file_refuses_a_read_only_file_before_the_backup() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("settings.json");
+        let backup = backup_path_for(&path);
+        fs::write(&path, "current").unwrap();
+        fs::write(&backup, "earlier").unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions.clone()).unwrap();
+        if !read_only_is_enforced(&path) {
+            return;
+        }
+
+        let err = patch_config(&path, "new").unwrap_err();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&path, permissions).unwrap();
+
+        assert!(format!("{err:#}").contains("read-only"), "{err:#}");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "earlier");
+    }
+
+    #[test]
+    fn test_atomic_write_refuses_a_read_only_file() {
+        let temp = TempDir::new().unwrap();
+        let file_path = temp.path().join(".clinerules");
+        fs::write(&file_path, "mine").unwrap();
+        let mut permissions = fs::metadata(&file_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&file_path, permissions.clone()).unwrap();
+        if !read_only_is_enforced(&file_path) {
+            return;
+        }
+
+        let err = atomic_write(&file_path, "new").unwrap_err();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&file_path, permissions).unwrap();
+
+        assert!(format!("{err:#}").contains("read-only"), "{err:#}");
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "mine");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_write_does_not_carry_setuid_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let file_path = temp.path().join("tool");
+        fs::write(&file_path, "old").unwrap();
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o4755)).unwrap();
+
+        atomic_write(&file_path, "new").unwrap();
+
+        let actual = fs::metadata(&file_path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(actual, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_write_new_file_gets_the_same_mode_as_fs_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let reference = temp.path().join("reference");
+        let file_path = temp.path().join("written");
+        fs::write(&reference, "x").unwrap();
+
+        atomic_write(&file_path, "x").unwrap();
+
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file_path), mode(&reference));
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_atomic_write_preserves_symlink() {
@@ -2467,142 +2829,13 @@ mod tests {
         assert!(format!("{read_error:#}").contains(&temp.path().display().to_string()));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn test_backup_and_atomic_write_replaces_a_symlinked_backup_instead_of_following_it() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("hooks.json");
-        let other = temp.path().join("CLAUDE.md");
-        fs::write(&path, "{}").unwrap();
-        fs::write(&other, "notes").unwrap();
-        std::os::unix::fs::symlink("CLAUDE.md", backup_path_for(&path)).unwrap();
-
-        backup_and_atomic_write(&path, "{\"new\":1}").unwrap();
-
-        assert_eq!(fs::read_to_string(&other).unwrap(), "notes");
-        let backup = backup_path_for(&path);
-        assert!(!fs::symlink_metadata(&backup).unwrap().is_symlink());
-        assert_eq!(fs::read_to_string(backup).unwrap(), "{}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_backup_and_atomic_write_does_not_create_a_dangling_backup_target() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("hooks.json");
-        fs::write(&path, "{}").unwrap();
-        std::os::unix::fs::symlink("outside.json", backup_path_for(&path)).unwrap();
-
-        backup_and_atomic_write(&path, "{}").unwrap();
-
-        assert!(!temp.path().join("outside.json").exists());
-    }
-
-    #[test]
-    fn test_backup_and_atomic_write_leaves_a_file_hard_linked_to_the_backup_alone() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("hooks.json");
-        let other = temp.path().join("notes.txt");
-        fs::write(&path, "{}").unwrap();
-        fs::write(&other, "notes").unwrap();
-        fs::hard_link(&other, backup_path_for(&path)).unwrap();
-
-        backup_and_atomic_write(&path, "{\"new\":1}").unwrap();
-
-        assert_eq!(fs::read_to_string(&other).unwrap(), "notes");
-        assert_eq!(fs::read_to_string(backup_path_for(&path)).unwrap(), "{}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_backup_keeps_the_source_mode() {
-        use std::os::unix::fs::PermissionsExt;
-        let temp = TempDir::new().unwrap();
-        for mode in [0o600, 0o644] {
-            let path = temp.path().join(format!("settings-{mode:o}.json"));
-            fs::write(&path, "{}").unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
-
-            backup_and_atomic_write(&path, "{\"new\":1}").unwrap();
-
-            let backup = fs::metadata(backup_path_for(&path)).unwrap();
-            assert_eq!(backup.permissions().mode() & 0o777, mode);
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_backup_and_atomic_write_refuses_a_backup_it_cannot_write() {
-        use std::os::unix::fs::PermissionsExt;
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("hooks.json");
-        fs::write(&path, "{}").unwrap();
-        fs::write(backup_path_for(&path), "kept").unwrap();
-        fs::set_permissions(backup_path_for(&path), fs::Permissions::from_mode(0o444)).unwrap();
-        // Root writes a read-only file, as a plain copy would.
-        let refused = fs::OpenOptions::new()
-            .write(true)
-            .open(backup_path_for(&path))
-            .is_err();
-
-        let result = backup_and_atomic_write(&path, "{\"new\":1}");
-
-        if refused {
-            assert!(result.is_err());
-            assert_eq!(fs::read_to_string(backup_path_for(&path)).unwrap(), "kept");
-        } else {
-            result.unwrap();
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_backup_rewrites_an_existing_backup_when_the_directory_is_locked() {
-        use std::os::unix::fs::PermissionsExt;
-        let temp = TempDir::new().unwrap();
-        let locked = temp.path().join("claude");
-        fs::create_dir(&locked).unwrap();
-        let source = temp.path().join("settings.json");
-        fs::write(&source, "{}").unwrap();
-        let backup = locked.join("settings.json.bak");
-        fs::write(&backup, "old backup").unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
-
-        let result = copy_backup(&source, &backup);
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-
-        result.unwrap();
-        assert_eq!(fs::read_to_string(&backup).unwrap(), "{}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_backup_does_not_rewrite_a_hard_linked_backup_in_a_locked_directory() {
-        use std::os::unix::fs::PermissionsExt;
-        let temp = TempDir::new().unwrap();
-        let locked = temp.path().join("claude");
-        fs::create_dir(&locked).unwrap();
-        let source = temp.path().join("settings.json");
-        fs::write(&source, "{}").unwrap();
-        let other = locked.join("other.json");
-        fs::write(&other, "other").unwrap();
-        let backup = locked.join("settings.json.bak");
-        fs::hard_link(&other, &backup).unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
-
-        let _ = copy_backup(&source, &backup);
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-
-        assert_eq!(fs::read_to_string(&other).unwrap(), "other");
-    }
-
-    #[test]
-    fn test_backup_and_atomic_write_preserves_previous_content() {
+    fn test_patch_file_preserves_previous_content() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("hooks.json");
         fs::write(&path, "old").unwrap();
 
-        let backup = backup_and_atomic_write(&path, "new").unwrap().unwrap();
+        let backup = patch_config(&path, "new").unwrap().unwrap();
 
         assert_eq!(backup, path.with_extension("json.bak"));
         assert_eq!(fs::read_to_string(path).unwrap(), "new");
@@ -2610,13 +2843,13 @@ mod tests {
     }
 
     #[test]
-    fn test_backup_and_atomic_write_failure_preserves_original() {
+    fn test_patch_file_failure_preserves_original() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("hooks.json");
         fs::write(&path, "old").unwrap();
         fs::create_dir(path.with_extension("json.bak")).unwrap();
 
-        let err = backup_and_atomic_write(&path, "new").unwrap_err();
+        let err = patch_config(&path, "new").unwrap_err();
 
         assert!(format!("{err:#}").contains("backup"));
         assert_eq!(fs::read_to_string(path).unwrap(), "old");
