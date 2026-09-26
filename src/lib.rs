@@ -2983,7 +2983,15 @@ fn run_cli() -> Result<i32> {
             copilot,
             dry_run,
         } => {
+            let patch_mode = if auto_patch {
+                hooks::init::PatchMode::Auto
+            } else if no_patch {
+                hooks::init::PatchMode::Skip
+            } else {
+                hooks::init::PatchMode::Ask
+            };
             let ctx = hooks::init::InitContext {
+                patch_mode,
                 verbose: cli.verbose,
                 dry_run,
                 awareness: if show || uninstall {
@@ -2991,13 +2999,6 @@ fn run_cli() -> Result<i32> {
                 } else {
                     configured_awareness_level()
                 },
-            };
-            let patch_mode = if auto_patch {
-                hooks::init::PatchMode::Auto
-            } else if no_patch {
-                hooks::init::PatchMode::Skip
-            } else {
-                hooks::init::PatchMode::Ask
             };
             if show {
                 hooks::init::show_config(codex, agent == Some(AgentTarget::Omp))?;
