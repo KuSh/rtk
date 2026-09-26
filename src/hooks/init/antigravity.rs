@@ -47,9 +47,7 @@ pub fn run_antigravity_mode(global: bool, ctx: InitContext) -> Result<()> {
 }
 
 pub fn run_antigravity_mode_at(base_dir: &Path, global: bool, ctx: InitContext) -> Result<()> {
-    let InitContext {
-        verbose, dry_run, ..
-    } = ctx;
+    let InitContext { dry_run, .. } = ctx;
     let plugin_dir = if global {
         base_dir.join("plugins/rtk")
     } else {
@@ -74,41 +72,41 @@ pub fn run_antigravity_mode_at(base_dir: &Path, global: bool, ctx: InitContext) 
             "[dry-run] would create plugin directory: {}",
             plugin_dir.display()
         );
-        preview(&rules_path, WriteKind::Owned);
-        println!("[dry-run] would write {}", rules_path.display());
-        preview(&hooks_json_path, WriteKind::Owned);
-        println!("[dry-run] would write {}", hooks_json_path.display());
-        preview(&plugin_json_path, WriteKind::Owned);
-        println!("[dry-run] would write {}", plugin_json_path.display());
-        if verbose > 0 {
-            println!(
-                "[dry-run] plugin.json content:\n{}",
-                ANTIGRAVITY_PLUGIN_JSON
-            );
-            println!("[dry-run] hooks.json content:\n{}", ANTIGRAVITY_HOOKS_JSON);
-            println!(
-                "[dry-run] rules/{ANTIGRAVITY_RULES_FILE} content:\n{}",
-                rules_content
-            );
-        }
+    }
+    // plugin.json is what makes Antigravity discover the directory, so it goes last: a first
+    // install that fails halfway leaves no plugin rather than one missing its rules. A re-run
+    // over an existing plugin has no such guarantee.
+    let rules_name = format!("rules/{ANTIGRAVITY_RULES_FILE}");
+    for (path, content, name, what) in [
+        (
+            &rules_path,
+            rules_content,
+            rules_name.as_str(),
+            "plugin rules",
+        ),
+        (
+            &hooks_json_path,
+            ANTIGRAVITY_HOOKS_JSON,
+            "hooks.json",
+            "hooks.json",
+        ),
+        (
+            &plugin_json_path,
+            ANTIGRAVITY_PLUGIN_JSON,
+            "plugin.json",
+            "plugin.json",
+        ),
+    ] {
+        let report = Report::new(format!("[dry-run] would write {}", path.display()))
+            .with_detail(format!("[dry-run] {name} content:\n{content}"))
+            .done_verbose(format!("Wrote {}", path.display()));
+        write_reported(path, WriteKind::Owned, content, ctx, report)
+            .with_context(|| format!("Failed to write Antigravity {what}"))?;
+    }
+
+    if dry_run {
         print_dry_run_footer();
     } else {
-        // plugin.json is what makes Antigravity discover the directory, so it goes last:
-        // a first install that fails halfway leaves no plugin rather than one missing its
-        // rules. A re-run over an existing plugin has no such guarantee.
-        atomic_write(&rules_path, rules_content)
-            .context("Failed to write Antigravity plugin rules")?;
-        atomic_write(&hooks_json_path, ANTIGRAVITY_HOOKS_JSON)
-            .context("Failed to write Antigravity hooks.json")?;
-        atomic_write(&plugin_json_path, ANTIGRAVITY_PLUGIN_JSON)
-            .context("Failed to write Antigravity plugin.json")?;
-
-        if verbose > 0 {
-            eprintln!("Wrote {}", rules_path.display());
-            eprintln!("Wrote {}", hooks_json_path.display());
-            eprintln!("Wrote {}", plugin_json_path.display());
-        }
-
         println!("\nRTK plugin configured for Google Antigravity.\n");
         println!("  Plugin: {} (installed)", plugin_dir.display());
         println!("  Hooks:  PreToolUse -> rtk hook antigravity");
