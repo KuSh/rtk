@@ -870,7 +870,12 @@ fn uninstall_codex_with_paths(
             }
         }
 
-        if agents_changed {
+        if agents_changed && dry_run {
+            println!(
+                "[dry-run] would remove rtk-instructions block from AGENTS.md: {}",
+                agents_md_path.display()
+            );
+        } else if agents_changed {
             atomic_write(agents_md_path, &working_content).with_context(|| {
                 format!("Failed to write AGENTS.md: {}", agents_md_path.display())
             })?;
@@ -1469,6 +1474,35 @@ mod tests {
             !removed.iter().any(|item| item.starts_with("RTK.md")),
             "and must not be reported as removed: {removed:?}"
         );
+    }
+
+    #[test]
+    fn test_codex_uninstall_dry_run_leaves_the_agents_md_block_in_place() {
+        let dir = TempDir::new().expect("tempdir");
+        let rtk_md = dir.path().join(RTK_MD);
+        let agents_md = dir.path().join(AGENTS_MD);
+        let hooks_json = dir.path().join(CODEX_DIR).join(HOOKS_JSON);
+        let original = format!("# Agents\n\n{RTK_BLOCK_START} -->\nold\n{RTK_BLOCK_END}\n");
+        fs::write(&agents_md, &original).expect("write");
+
+        let removed = uninstall_codex_with_paths(
+            &agents_md,
+            &rtk_md,
+            RtkMdScope::ProjectRoot,
+            Some(&hooks_json),
+            &[RTK_MD_REF],
+            InitContext {
+                dry_run: true,
+                ..InitContext::default()
+            },
+        )
+        .expect("uninstall");
+
+        assert!(
+            removed.iter().any(|item| item.contains("rtk-instructions")),
+            "the block is still reported: {removed:?}"
+        );
+        assert_eq!(fs::read_to_string(&agents_md).expect("read"), original);
     }
 
     #[test]
