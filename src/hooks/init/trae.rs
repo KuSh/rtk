@@ -116,19 +116,19 @@ fn patch_trae_hooks_json_paths(paths: &[PathBuf], ctx: InitContext) -> Result<Ve
     }
 
     for patch in pending {
-        if ctx.dry_run {
-            preview(&patch.path, WriteKind::Config);
-            println!(
-                "[dry-run] would patch Trae hooks.json: {}",
-                patch.path.display()
-            );
-            if ctx.verbose > 0 {
-                println!("[dry-run] content:\n{}", patch.serialized);
-            }
-            continue;
-        }
-
-        let backup = patch_config(&patch.path, &patch.serialized).with_context(|| {
+        let report = Report::new(format!(
+            "[dry-run] would patch Trae hooks.json: {}",
+            patch.path.display()
+        ))
+        .with_content();
+        write_reported(
+            &patch.path,
+            WriteKind::Config,
+            &patch.serialized,
+            ctx,
+            report,
+        )
+        .with_context(|| {
             format!(
                 "Trae hooks not fully updated. Already updated: {}",
                 if applied.is_empty() {
@@ -138,12 +138,9 @@ fn patch_trae_hooks_json_paths(paths: &[PathBuf], ctx: InitContext) -> Result<Ve
                 }
             )
         })?;
-        if let Some(backup) = backup
-            && ctx.verbose > 0
-        {
-            eprintln!("Backup: {}", backup.display());
+        if !ctx.dry_run {
+            applied.push(patch.path.display().to_string());
         }
-        applied.push(patch.path.display().to_string());
     }
 
     Ok(results)
@@ -274,16 +271,18 @@ fn remove_trae_hooks_json_paths(paths: &[PathBuf], ctx: InitContext) -> Result<V
     }
 
     for removal in pending {
-        if ctx.dry_run {
-            preview(&removal.path, WriteKind::Config);
-            println!(
-                "[dry-run] would remove RTK entry from Trae hooks.json: {}",
-                removal.path.display()
-            );
-            continue;
-        }
-
-        patch_config(&removal.path, &removal.serialized).with_context(|| {
+        let report = Report::new(format!(
+            "[dry-run] would remove RTK entry from Trae hooks.json: {}",
+            removal.path.display()
+        ));
+        write_reported(
+            &removal.path,
+            WriteKind::Config,
+            &removal.serialized,
+            ctx,
+            report,
+        )
+        .with_context(|| {
             format!(
                 "Trae hooks not fully updated. Already updated: {}",
                 if applied.is_empty() {
@@ -293,7 +292,9 @@ fn remove_trae_hooks_json_paths(paths: &[PathBuf], ctx: InitContext) -> Result<V
                 }
             )
         })?;
-        applied.push(removal.path.display().to_string());
+        if !ctx.dry_run {
+            applied.push(removal.path.display().to_string());
+        }
     }
 
     Ok(results)

@@ -170,6 +170,7 @@ struct Project {
 /// Marks the writes made while it lives as project-scoped: the hook configs and extensions
 /// they write must stay inside the project ([`ensure_project_file_inside`]), and any other
 /// write that resolves outside it is confirmed first (`plan_write`).
+#[must_use = "the scope ends when this value is dropped; bind it with `let _scope = ...`"]
 pub(super) struct ProjectScope {
     previous: Option<Project>,
 }
@@ -518,7 +519,7 @@ mod tests {
         let link = project.join(".clinerules");
         symlink("../outside/newdir/rules", &link).unwrap();
 
-        let error = atomic_write(&link, "rules").unwrap_err();
+        let error = write_file(&link, WriteKind::Owned, "rules").unwrap_err();
 
         assert!(format!("{error:#}").contains("does not exist"), "{error:#}");
         assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
@@ -534,7 +535,12 @@ mod tests {
         fs::create_dir(&shared).unwrap();
         symlink(&shared, project.join(".github")).unwrap();
 
-        atomic_write(&project.join(".github").join("hooks.json"), "{}").unwrap();
+        write_file(
+            &project.join(".github").join("hooks.json"),
+            WriteKind::Owned,
+            "{}",
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(shared.join("hooks.json")).unwrap(), "{}");
     }
@@ -548,7 +554,7 @@ mod tests {
         let link = home.join("settings.json");
         symlink("../dotfiles/claude/settings.json", &link).unwrap();
 
-        atomic_write(&link, "{}").unwrap();
+        write_file(&link, WriteKind::Owned, "{}").unwrap();
 
         assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
         assert_eq!(
@@ -563,7 +569,7 @@ mod tests {
         let _cwd = CwdGuard::enter(temp.path());
         symlink("AGENTS.md", "CLAUDE.md").unwrap();
 
-        atomic_write(Path::new("CLAUDE.md"), "notes").unwrap();
+        write_file(Path::new("CLAUDE.md"), WriteKind::Owned, "notes").unwrap();
 
         assert!(fs::symlink_metadata("CLAUDE.md").unwrap().is_symlink());
         assert_eq!(fs::read_to_string("AGENTS.md").unwrap(), "notes");
@@ -638,7 +644,7 @@ mod tests {
         let link = temp.path().join("rules.md");
         symlink("missing/../elsewhere.md", &link).unwrap();
 
-        assert!(atomic_write(&link, "rules").is_err());
+        assert!(write_file(&link, WriteKind::Owned, "rules").is_err());
 
         assert!(!temp.path().join("missing").exists());
         assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
@@ -784,7 +790,7 @@ mod tests {
             ..InitContext::default()
         });
 
-        assert!(patch_config(&path, "{\"new\":1}").is_err());
+        assert!(write_file(&path, WriteKind::Config, "{\"new\":1}").is_err());
 
         assert_eq!(
             fs::read_to_string(backup_path_for(&path)).unwrap(),
@@ -900,7 +906,12 @@ mod tests {
             ..InitContext::default()
         });
 
-        patch_instructions(Path::new("CLAUDE.md"), "SECRET NOTES\n@RTK.md\n").unwrap();
+        write_file(
+            Path::new("CLAUDE.md"),
+            WriteKind::Instructions,
+            "SECRET NOTES\n@RTK.md\n",
+        )
+        .unwrap();
 
         assert!(!project.join("CLAUDE.md.bak").exists());
     }
