@@ -32,13 +32,6 @@ fn run_claude_md_mode_with(
         PathBuf::from(CLAUDE_MD)
     };
 
-    if global
-        && !dry_run
-        && let Some(parent) = path.parent()
-    {
-        fs::create_dir_all(parent)?;
-    }
-
     if verbose > 0 {
         eprintln!("Writing rtk instructions to: {}", path.display());
     }
@@ -108,12 +101,13 @@ fn patch_claude_md(path: &Path, ctx: InitContext) -> Result<bool> {
         }
         if migrated {
             if dry_run {
+                preview(path, WriteKind::Instructions);
                 println!(
                     "[dry-run] would migrate old RTK block in CLAUDE.md: {}",
                     path.display()
                 );
             } else {
-                fs::write(path, content)?;
+                patch_instructions(path, &content)?;
             }
         }
         return Ok(migrated);
@@ -127,6 +121,7 @@ fn patch_claude_md(path: &Path, ctx: InitContext) -> Result<bool> {
     };
 
     if dry_run {
+        preview(path, WriteKind::Instructions);
         println!(
             "[dry-run] would add @RTK.md reference to CLAUDE.md: {}",
             path.display()
@@ -135,7 +130,7 @@ fn patch_claude_md(path: &Path, ctx: InitContext) -> Result<bool> {
             println!("[dry-run] content:\n{}", new_content);
         }
     } else {
-        fs::write(path, new_content)?;
+        patch_instructions(path, &new_content)?;
 
         if verbose > 0 {
             eprintln!("Added @RTK.md reference to CLAUDE.md");
@@ -210,6 +205,16 @@ fn patch_settings_json_command(
         return Ok(PatchResult::AlreadyPresent);
     }
 
+    // A file the patch would refuse is neither asked about nor patched, whatever the mode:
+    // say why, and leave it to the user as a declined prompt does.
+    if mode != PatchMode::Skip
+        && let Err(error) = ensure_patchable(&settings_path)
+    {
+        eprintln!("[warn] {error:#}");
+        print_manual_instructions(hook_command, include_opencode);
+        return Ok(PatchResult::Skipped);
+    }
+
     // Handle mode
     match mode {
         PatchMode::Skip => {
@@ -235,9 +240,6 @@ fn patch_settings_json_command(
 
     insert_hook_entry(&mut root, hook_command)?;
 
-    if !dry_run {
-        ensure_parent_dir(&settings_path)?;
-    }
     update_json_file(
         &settings_path,
         &root,
@@ -503,6 +505,7 @@ fn remove_legacy_settings_entries(ctx: InitContext) -> Result<()> {
     }
 
     if dry_run {
+        preview(&settings_path, WriteKind::Config);
         println!(
             "[dry-run] would remove legacy rtk-rewrite.sh entry from {}",
             settings_path.display()
@@ -510,14 +513,9 @@ fn remove_legacy_settings_entries(ctx: InitContext) -> Result<()> {
         return Ok(());
     }
 
-    // Backup before modifying
-    let backup_path = settings_path.with_extension("json.bak");
-    copy_backup(&settings_path, &backup_path)
-        .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
-
     let serialized =
         serde_json::to_string_pretty(&root).context("Failed to serialize settings.json")?;
-    atomic_write(&settings_path, &serialized)?;
+    patch_config(&settings_path, &serialized)?;
 
     if verbose > 0 {
         eprintln!("  [ok] Removed legacy rtk-rewrite.sh entry from settings.json");
@@ -1007,14 +1005,14 @@ mod tests {
             let path = dir.join(SETTINGS_JSON);
             fs::write(&path, "{}").unwrap();
             fs::create_dir(path.with_extension("json.bak")).unwrap();
-            let error = patch_settings_json_command(
+            let result = patch_settings_json_command(
                 CLAUDE_HOOK_COMMAND,
                 PatchMode::Auto,
                 false,
                 InitContext::default(),
-            )
-            .unwrap_err();
-            assert!(format!("{error:#}").contains(&path.display().to_string()));
+            );
+            // Left to the manual instructions, and untouched.
+            assert!(matches!(result, Ok(PatchResult::Skipped)), "{result:?}");
             assert_eq!(fs::read_to_string(&path).unwrap(), "{}");
         });
     }
@@ -1067,6 +1065,78 @@ mod tests {
                 plugin.exists(),
                 "OpenCode plugin must be installed when ~/.claude was missing"
             );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_patch_settings_json_skips_a_read_only_file_without_asking() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        with_claude_dir_override(&tmp, |claude_dir| {
+            let settings = claude_dir.join(SETTINGS_JSON);
+            fs::write(&settings, "{}").unwrap();
+            fs::set_permissions(&settings, fs::Permissions::from_mode(0o444)).unwrap();
+            if !read_only_is_enforced(&settings) {
+                return;
+            }
+
+            let result = patch_settings_json_command(
+                CLAUDE_HOOK_COMMAND,
+                PatchMode::Ask,
+                false,
+                InitContext::default(),
+            );
+            fs::set_permissions(&settings, fs::Permissions::from_mode(0o644)).unwrap();
+
+            // Not asked about: skipped with the manual instructions, as a declined prompt is.
+            assert!(matches!(result, Ok(PatchResult::Skipped)), "{result:?}");
+            assert_eq!(fs::read_to_string(&settings).unwrap(), "{}");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_patch_settings_json_auto_patch_skips_a_read_only_file_instead_of_failing() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        with_claude_dir_override(&tmp, |claude_dir| {
+            let settings = claude_dir.join(SETTINGS_JSON);
+            fs::write(&settings, "{}").unwrap();
+            fs::set_permissions(&settings, fs::Permissions::from_mode(0o444)).unwrap();
+            if !read_only_is_enforced(&settings) {
+                return;
+            }
+
+            let result = patch_settings_json_command(
+                CLAUDE_HOOK_COMMAND,
+                PatchMode::Auto,
+                false,
+                InitContext::default(),
+            );
+            fs::set_permissions(&settings, fs::Permissions::from_mode(0o644)).unwrap();
+
+            assert!(matches!(result, Ok(PatchResult::Skipped)), "{result:?}");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_patch_settings_json_skips_a_link_into_a_missing_directory_without_asking() {
+        let tmp = TempDir::new().unwrap();
+        with_claude_dir_override(&tmp, |claude_dir| {
+            let settings = claude_dir.join(SETTINGS_JSON);
+            std::os::unix::fs::symlink("../unmounted/settings.json", &settings).unwrap();
+
+            let result = patch_settings_json_command(
+                CLAUDE_HOOK_COMMAND,
+                PatchMode::Ask,
+                false,
+                InitContext::default(),
+            );
+
+            assert!(matches!(result, Ok(PatchResult::Skipped)), "{result:?}");
+            assert!(fs::symlink_metadata(&settings).unwrap().is_symlink());
         });
     }
 
