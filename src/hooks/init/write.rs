@@ -6,6 +6,7 @@
 
 use super::*;
 use std::cell::RefCell;
+use std::io::IsTerminal;
 
 /// Who owns a file RTK writes, which decides how it is written.
 #[derive(Clone, Copy, PartialEq)]
@@ -332,34 +333,6 @@ fn confirm(path: &Path, target: &Path, confirmation: &Confirmation) -> Result<()
     Ok(())
 }
 
-/// Write one of RTK's own files -- created whole by RTK, such as `RTK.md`, a hook script or an
-/// extension -- atomically: a temp file renamed over the target, so a crash never leaves it
-/// half written. Nothing is backed up; the content is RTK's.
-///
-/// Follows symlinks so the link itself is preserved; see [`resolve_write_target_with`] for when
-/// a dangling one is followed. Creates the missing parent directories of the file it writes,
-/// and on Unix leaves it with the mode a plain `fs::write` would: the existing file's, or the
-/// umask default for a new one.
-pub(super) fn atomic_write(path: &Path, content: &str) -> Result<()> {
-    write_file(path, WriteKind::Owned, content).map(|_| ())
-}
-
-/// Write `content` into a config file RTK edits but does not own -- `settings.json`, a hooks
-/// config, Hermes' `config.yaml` -- and return the backup taken. The existing file is copied
-/// to `<name>.bak`, then replaced atomically like one of RTK's own files: agents re-read these
-/// files while they run, so they must never be seen half written.
-pub(super) fn patch_config(path: &Path, content: &str) -> Result<Option<PathBuf>> {
-    write_file(path, WriteKind::Config, content)
-}
-
-/// Write `content` into an instruction file RTK adds to but does not own -- `CLAUDE.md`,
-/// `AGENTS.md`, a rules file -- and return the backup taken. The existing file is copied to
-/// `<name>.bak` unless an earlier backup is already there, then written in place, so it keeps
-/// its owner, group, ACLs and hard links as a plain write would.
-pub(super) fn patch_instructions(path: &Path, content: &str) -> Result<Option<PathBuf>> {
-    write_file(path, WriteKind::Instructions, content)
-}
-
 /// Refuse, before RTK asks whether to patch a config, what the patch would refuse anyway.
 pub(super) fn ensure_patchable(path: &Path) -> Result<()> {
     refusal_as_error(path, WriteKind::Config)
@@ -379,13 +352,13 @@ fn refusal_as_error(path: &Path, kind: WriteKind) -> Result<()> {
 }
 
 /// Under `--dry-run`, say what the real run will do about a write of this `kind` to `path`
-/// that it would refuse, ask about, or make without a backup. Called where a dry run reports
-/// the write it skips.
-pub(super) fn preview(path: &Path, kind: WriteKind) {
+/// that it would refuse, ask about, or make without a backup. Returns whether the real run
+/// would not write it.
+fn preview(path: &Path, kind: WriteKind) -> bool {
     let plan = plan_write(path, kind);
     if let Some(reason) = &plan.refusal {
         println!("[dry-run] would refuse {}: {reason}", path.display());
-        return;
+        return true;
     }
     for confirmation in &plan.confirmations {
         let mode = match confirmation {
@@ -411,8 +384,11 @@ pub(super) fn preview(path: &Path, kind: WriteKind) {
                 *mode
             }
         };
-        if mode != PatchMode::Auto {
-            return;
+        match mode {
+            PatchMode::Auto => {}
+            // Asked in a terminal, the write may still happen.
+            PatchMode::Ask if std::io::stdin().is_terminal() => return false,
+            PatchMode::Ask | PatchMode::Skip => return true,
         }
     }
     if let Backup::Skip(reason) = &plan.backup {
@@ -421,6 +397,99 @@ pub(super) fn preview(path: &Path, kind: WriteKind) {
             path.display()
         );
     }
+    false
+}
+
+/// What a write says about itself: the line a dry run prints instead of writing, what a dry
+/// run shows under `-v`, and the line printed once the write is done.
+pub(crate) struct Report {
+    would: String,
+    detail: Detail,
+    done: Option<(String, Shown)>,
+}
+
+/// What a dry run shows under `-v` besides its line.
+pub(crate) enum Detail {
+    None,
+    Content,
+    Text(String),
+}
+
+/// When the line printed after a write is shown.
+pub(crate) enum Shown {
+    /// On stdout, every time.
+    Always,
+    /// On stderr, under `-v`.
+    Verbose,
+}
+
+impl Report {
+    /// A write that a dry run reports with the `would` line, printed as given.
+    pub(super) fn new(would: impl Into<String>) -> Self {
+        Self {
+            would: would.into(),
+            detail: Detail::None,
+            done: None,
+        }
+    }
+
+    /// Under `-v`, a dry run also shows the content it would write.
+    pub(super) fn with_content(mut self) -> Self {
+        self.detail = Detail::Content;
+        self
+    }
+
+    /// Under `-v`, a dry run also shows `text`.
+    pub(super) fn with_detail(mut self, text: impl Into<String>) -> Self {
+        self.detail = Detail::Text(text.into());
+        self
+    }
+
+    /// Once written, print `line` on stdout.
+    pub(super) fn done(mut self, line: impl Into<String>) -> Self {
+        self.done = Some((line.into(), Shown::Always));
+        self
+    }
+
+    /// Once written, print `line` on stderr under `-v`.
+    pub(super) fn done_verbose(mut self, line: impl Into<String>) -> Self {
+        self.done = Some((line.into(), Shown::Verbose));
+        self
+    }
+}
+
+/// Write `content` to `path` as `kind` and report it -- or, under `--dry-run`, say what the
+/// real run would do instead: its refusal or question if it has one, otherwise the report's
+/// line. Under `-v` the backup taken is named. Returns the backup taken.
+pub(super) fn write_reported(
+    path: &Path,
+    kind: WriteKind,
+    content: &str,
+    ctx: InitContext,
+    report: Report,
+) -> Result<Option<PathBuf>> {
+    let verbose = ctx.verbose > 0;
+    if ctx.dry_run {
+        if !preview(path, kind) {
+            println!("{}", report.would);
+            match report.detail {
+                Detail::Content if verbose => println!("[dry-run] content:\n{content}"),
+                Detail::Text(text) if verbose => println!("{text}"),
+                _ => {}
+            }
+        }
+        return Ok(None);
+    }
+    let backup = write_file(path, kind, content)?;
+    if verbose && let Some(backup) = &backup {
+        eprintln!("Backup: {}", backup.display());
+    }
+    match report.done {
+        Some((line, Shown::Always)) => println!("{line}"),
+        Some((line, Shown::Verbose)) if verbose => eprintln!("{line}"),
+        _ => {}
+    }
+    Ok(backup)
 }
 
 /// The write half of an owned or config write, for a target the plan already vouched for.

@@ -221,12 +221,12 @@ fn patch_gemini_settings(
         &settings,
         ctx,
         "Gemini settings.json",
-        &format!(
+        Report::new(format!(
             "[dry-run] would patch Gemini settings.json: {}",
             settings_path.display()
-        ),
-        true,
-        Written::Line(format!("Patched {}", settings_path.display())),
+        ))
+        .with_content()
+        .done_verbose(format!("Patched {}", settings_path.display())),
     )?;
 
     Ok(false)
@@ -289,16 +289,12 @@ pub(super) fn uninstall_gemini(ctx: InitContext) -> Result<Vec<String>> {
                         .is_some_and(|c| c.contains("rtk"))
                 });
                 if arr.len() < before {
-                    if dry_run {
-                        preview(&settings_path, WriteKind::Config);
-                        println!(
-                            "[dry-run] would remove RTK hook from Gemini settings.json: {}",
-                            settings_path.display()
-                        );
-                    } else {
-                        let new_content = serde_json::to_string_pretty(&settings)?;
-                        patch_config(&settings_path, &new_content)?;
-                    }
+                    let new_content = serde_json::to_string_pretty(&settings)?;
+                    let report = Report::new(format!(
+                        "[dry-run] would remove RTK hook from Gemini settings.json: {}",
+                        settings_path.display()
+                    ));
+                    write_reported(&settings_path, WriteKind::Config, &new_content, ctx, report)?;
                     removed.push("Gemini settings.json: removed RTK hook entry".to_string());
                 }
             }

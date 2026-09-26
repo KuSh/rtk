@@ -169,19 +169,13 @@ fn patch_vibe_hooks_toml(
         format!("{existing}\n\n{entry}")
     };
 
-    if dry_run {
-        preview(hooks_path, WriteKind::Config);
-        println!(
-            "[dry-run] would patch Vibe hooks.toml: {}",
-            hooks_path.display()
-        );
-        if verbose > 0 {
-            println!("[dry-run] appended entry:\n{entry}");
-        }
-    } else {
-        patch_config(hooks_path, &new_content)
-            .with_context(|| format!("Failed to write {}", hooks_path.display()))?;
-    }
+    let report = Report::new(format!(
+        "[dry-run] would patch Vibe hooks.toml: {}",
+        hooks_path.display()
+    ))
+    .with_detail(format!("[dry-run] appended entry:\n{entry}"));
+    write_reported(hooks_path, WriteKind::Config, &new_content, ctx, report)
+        .with_context(|| format!("Failed to write {}", hooks_path.display()))?;
     Ok(VibeHookPatchOutcome::Installed)
 }
 
@@ -283,21 +277,25 @@ fn uninstall_vibe_at(vibe_dir: &Path, ctx: InitContext) -> Result<Vec<String>> {
         let content = fs::read_to_string(&hooks_path)
             .with_context(|| format!("Failed to read {}", hooks_path.display()))?;
         if let Some(new_content) = strip_vibe_rtk_entry(&content) {
-            if dry_run {
-                if !new_content.trim().is_empty() {
-                    preview(&hooks_path, WriteKind::Config);
-                }
-                println!(
-                    "[dry-run] would remove RTK hook from Vibe hooks.toml: {}",
-                    hooks_path.display()
-                );
-            } else if new_content.trim().is_empty() {
+            let would = format!(
+                "[dry-run] would remove RTK hook from Vibe hooks.toml: {}",
+                hooks_path.display()
+            );
+            if !new_content.trim().is_empty() {
+                write_reported(
+                    &hooks_path,
+                    WriteKind::Config,
+                    &new_content,
+                    ctx,
+                    Report::new(would),
+                )
+                .with_context(|| format!("Failed to write {}", hooks_path.display()))?;
+            } else if dry_run {
+                println!("{would}");
+            } else {
                 // nosemgrep: filesystem-deletion -- uninstall removes hooks.toml only when it becomes empty after stripping the RTK entry
                 fs::remove_file(&hooks_path)
                     .with_context(|| format!("Failed to remove {}", hooks_path.display()))?;
-            } else {
-                patch_config(&hooks_path, &new_content)
-                    .with_context(|| format!("Failed to write {}", hooks_path.display()))?;
             }
             removed.push(format!(
                 "Vibe hooks.toml: removed RTK entry ({})",
