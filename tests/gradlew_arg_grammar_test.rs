@@ -8,8 +8,9 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::path::Path;
-use std::process::Command;
 
 /// Gradle-shaped output: a daemon banner and a PASSED line that every filter strips, so their
 /// presence means rtk fell through to unfiltered passthrough.
@@ -42,7 +43,7 @@ impl Stub {
     }
 
     fn run(&self, args: &[&str]) -> (String, Vec<String>) {
-        let out = Command::new(env!("CARGO_BIN_EXE_rtk"))
+        let out = common::rtk_command()
             .current_dir(self.path())
             .arg("gradlew")
             .args(args)
