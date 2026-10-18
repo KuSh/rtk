@@ -661,6 +661,8 @@ fn resolve_atomic_target(path: &Path) -> PathBuf {
 
 /// Atomic write using tempfile + rename
 /// Prevents corruption on crash/interrupt
+/// Flushed to disk before the rename where the filesystem can sync; a sync that
+/// reports lost data fails the write.
 /// Follows symlinks so the link itself is preserved.
 /// On Unix an existing file its owner can read keeps its rwx bits, or is left
 /// owner-only when the filesystem refuses the chmod. Any other file gets the
@@ -703,9 +705,13 @@ pub(super) fn atomic_write(path: &Path, content: &str) -> Result<()> {
         .write_all(content.as_bytes())
         .with_context(|| format!("Failed to write {} bytes to temp file", content.len()))?;
 
-    // After the write: some network filesystems check the mode on every write,
-    // so a read-only mode set first would refuse it. Best effort: a filesystem
-    // that refuses chmod still gets the content.
+    // On disk before the rename where the filesystem can sync, so a crash
+    // cannot leave the target empty
+    sync_to_disk(temp_file.as_file()).context("Failed to flush temp file to disk")?;
+
+    // After the write and its flush: some network filesystems check the mode on
+    // every write, so a read-only mode set first would refuse it. Best effort: a
+    // filesystem that refuses chmod still gets the content.
     #[cfg(unix)]
     if let Some(mode) = kept_mode {
         let _ = temp_file
@@ -722,6 +728,31 @@ pub(super) fn atomic_write(path: &Path, content: &str) -> Result<()> {
     })?;
 
     Ok(())
+}
+
+/// `sync_all`, failing only when the content did not reach the disk: some network
+/// filesystems report a failed write only when it is synced. Any other failure,
+/// such as a filesystem that cannot sync, is no error.
+fn sync_to_disk(file: &fs::File) -> std::io::Result<()> {
+    match file.sync_all() {
+        Err(error) if lost_write(&error) => Err(error),
+        _ => Ok(()),
+    }
+}
+
+fn lost_write(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    let lost = matches!(
+        error.kind(),
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded | ErrorKind::StaleNetworkFileHandle
+    );
+    #[cfg(unix)]
+    let lost = lost || error.raw_os_error() == Some(libc::EIO);
+    // ERROR_NETNAME_DELETED, ERROR_LOST_WRITEBEHIND_DATA and ERROR_IO_DEVICE,
+    // which std files under no `ErrorKind`.
+    #[cfg(windows)]
+    let lost = lost || matches!(error.raw_os_error(), Some(64 | 596 | 1117));
+    lost
 }
 
 /// Read a JSON file with path-aware errors. Missing files return `None` and
@@ -3692,5 +3723,38 @@ level = "high"
             "not a backup"
         );
         assert_eq!(fs::read_to_string(&path).expect("read file"), "current");
+    }
+
+    #[test]
+    fn test_only_a_lost_write_fails_the_sync() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(lost_write(&Error::from(ErrorKind::StorageFull)));
+        assert!(lost_write(&Error::from(ErrorKind::QuotaExceeded)));
+        assert!(lost_write(&Error::from(ErrorKind::StaleNetworkFileHandle)));
+        assert!(!lost_write(&Error::from(ErrorKind::Unsupported)));
+        assert!(!lost_write(&Error::from(ErrorKind::InvalidInput)));
+        #[cfg(unix)]
+        let (lost, excused) = (
+            [libc::EIO, libc::ENOSPC, libc::EDQUOT, libc::ESTALE],
+            [
+                libc::ENOTSUP,
+                libc::EOPNOTSUPP,
+                libc::ENOTTY,
+                libc::ENOSYS,
+                libc::EINVAL,
+            ],
+        );
+        // ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL, ERROR_DISK_QUOTA_EXCEEDED,
+        // ERROR_NETNAME_DELETED, ERROR_LOST_WRITEBEHIND_DATA, ERROR_IO_DEVICE;
+        // ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_INVALID_PARAMETER.
+        #[cfg(windows)]
+        let (lost, excused) = ([112, 39, 1295, 64, 596, 1117], [1, 50, 87]);
+        for code in lost {
+            assert!(lost_write(&Error::from_raw_os_error(code)), "{code}");
+        }
+        for code in excused {
+            assert!(!lost_write(&Error::from_raw_os_error(code)), "{code}");
+        }
     }
 }
