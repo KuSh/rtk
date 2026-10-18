@@ -829,7 +829,7 @@ pub(super) fn update_json_file(
 fn backup_and_atomic_write(path: &Path, content: &str) -> Result<Option<PathBuf>> {
     let backup_path = if path.exists() {
         let backup_path = backup_path_for(path);
-        fs::copy(path, &backup_path).with_context(|| {
+        replace_backup(path, &backup_path).with_context(|| {
             format!(
                 "Failed to backup {} to {}",
                 path.display(),
@@ -844,6 +844,51 @@ fn backup_and_atomic_write(path: &Path, content: &str) -> Result<Option<PathBuf>
     atomic_write(path, content)
         .with_context(|| format!("Failed to update JSON file: {}", path.display()))?;
     Ok(backup_path)
+}
+
+/// `fs::copy` `path` to `backup_path`. The backup takes the file's mode, so a
+/// read-only file leaves a read-only backup; on Unix, the next backup unlocks
+/// it for its owner so the copy can replace it, rather than failing on it.
+fn replace_backup(path: &Path, backup_path: &Path) -> std::io::Result<()> {
+    let Err(error) = fs::copy(path, backup_path) else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    if error.kind() == std::io::ErrorKind::PermissionDenied
+        && unlock_read_only_backup(path, backup_path)
+    {
+        return fs::copy(path, backup_path).map(drop);
+    }
+    Err(error)
+}
+
+/// Give the backup its owner's write permission back when it is what refused
+/// the copy: `path` opens, and the backup is a regular file without owner write,
+/// with no other name and not `path` itself. A symlink or a hard link may lead
+/// to a file that is no backup at all, and a backup that is `path` would be
+/// emptied by the copy.
+#[cfg(unix)]
+fn unlock_read_only_backup(path: &Path, backup_path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let (Ok(source), Ok(backup)) = (
+        fs::File::open(path).and_then(|file| file.metadata()),
+        fs::symlink_metadata(backup_path),
+    ) else {
+        return false;
+    };
+    let same_file = (source.dev(), source.ino()) == (backup.dev(), backup.ino());
+    if !backup.file_type().is_file()
+        || backup.nlink() > 1
+        || same_file
+        || backup.mode() & 0o200 != 0
+    {
+        return false;
+    }
+    fs::set_permissions(
+        backup_path,
+        fs::Permissions::from_mode(backup.mode() & 0o7777 | 0o200),
+    )
+    .is_ok()
 }
 
 /// Prompt user for confirmation.
@@ -2309,6 +2354,21 @@ pub(super) fn with_missing_claude_dir_override<F: FnOnce(&Path)>(tmp: &TempDir, 
     });
 }
 
+/// Write `content` to `path` and make it read-only. False, with a notice, when a
+/// read-only file can still be opened for writing here (as root), so the caller skips.
+#[cfg(all(test, unix))]
+pub(super) fn seed_read_only(path: &Path, content: &str) -> bool {
+    fs::write(path, content).expect("seed file");
+    let mut permissions = fs::metadata(path).expect("stat seed").permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions).expect("make seed read-only");
+    let refused = fs::OpenOptions::new().write(true).open(path).is_err();
+    if !refused {
+        eprintln!("skipping: a read-only file is writable here (running as root?)");
+    }
+    refused
+}
+
 #[cfg(test)]
 mod tests {
     use crate::hooks::constants::POST_TOOL_USE_KEY;
@@ -3480,5 +3540,157 @@ level = "high"
 
         assert!(format!("{err:#}").contains("backup"));
         assert_eq!(fs::read_to_string(path).unwrap(), "old");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_and_atomic_write_replaces_read_only_backup() {
+        let temp = TempDir::new().expect("create temp dir");
+        let path = temp.path().join("hooks.json");
+        let backup = backup_path_for(&path);
+        fs::write(&path, "current").expect("seed file");
+        if !seed_read_only(&backup, "older") {
+            return;
+        }
+
+        backup_and_atomic_write(&path, "new").expect("replace the read-only backup");
+
+        assert_eq!(fs::read_to_string(&path).expect("read file"), "new");
+        assert_eq!(fs::read_to_string(&backup).expect("read backup"), "current");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_read_only_backup_that_is_the_file_itself_is_left_alone() {
+        use std::os::unix::fs::symlink;
+
+        for shared in ["hard link", "symlinked file"] {
+            let temp = TempDir::new().expect("create temp dir");
+            let path = temp.path().join("hooks.json");
+            let backup = backup_path_for(&path);
+            if !seed_read_only(&backup, "current") {
+                return;
+            }
+            if shared == "hard link" {
+                fs::hard_link(&backup, &path).expect("link the file to its backup");
+            } else {
+                symlink(&backup, &path).expect("link the file to its backup");
+            }
+
+            backup_and_atomic_write(&path, "new").expect_err("the backup is the file itself");
+
+            assert_eq!(
+                fs::read_to_string(&backup).expect("read backup"),
+                "current",
+                "{shared}: the copy must not empty the file"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_read_only_backup_with_another_name_is_left_alone() {
+        let temp = TempDir::new().expect("create temp dir");
+        let path = temp.path().join("hooks.json");
+        let archived = temp.path().join("archived.json");
+        fs::write(&path, "current").expect("seed file");
+        if !seed_read_only(&archived, "archived") {
+            return;
+        }
+        fs::hard_link(&archived, backup_path_for(&path)).expect("link the backup");
+
+        backup_and_atomic_write(&path, "new").expect_err("the backup has another name");
+
+        assert_eq!(
+            fs::read_to_string(&archived).expect("read archived file"),
+            "archived"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_read_only_backup_of_an_unreadable_file_is_not_unlocked() {
+        let temp = TempDir::new().expect("create temp dir");
+        let path = temp.path().join("hooks.json");
+        let backup = backup_path_for(&path);
+        if !seed_with_mode(&path, b"unreadable", 0o200) || !seed_read_only(&backup, "older") {
+            return;
+        }
+        let read_only = mode_of(&backup);
+
+        backup_and_atomic_write(&path, "new").expect_err("the file cannot be read");
+
+        assert_eq!(
+            mode_of(&backup),
+            read_only,
+            "the backup must stay read-only"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_backup_its_owner_can_write_is_not_unlocked() {
+        let temp = TempDir::new().expect("create temp dir");
+        let path = temp.path().join("hooks.json");
+        let backup = backup_path_for(&path);
+        fs::write(&path, "current").expect("seed file");
+        if !seed_with_mode(&backup, b"older", 0o640) {
+            return;
+        }
+
+        assert!(!unlock_read_only_backup(&path, &backup));
+        assert_eq!(mode_of(&backup), 0o640, "the backup's mode must not change");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_read_only_fifo_backup_is_not_unlocked() {
+        let temp = TempDir::new().expect("create temp dir");
+        let path = temp.path().join("hooks.json");
+        let backup = backup_path_for(&path);
+        fs::write(&path, "current").expect("seed file");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&backup)
+            .status()
+            .is_ok_and(|status| status.success());
+        if !made {
+            eprintln!("skipping: mkfifo is not available");
+            return;
+        }
+        let mut permissions = fs::metadata(&backup).expect("stat fifo").permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&backup, permissions).expect("make fifo read-only");
+
+        assert!(!unlock_read_only_backup(&path, &backup));
+        assert_eq!(mode_of(&backup) & 0o200, 0, "the FIFO must stay read-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_symlinked_read_only_backup_is_left_alone() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("create temp dir");
+        let path = temp.path().join("hooks.json");
+        let elsewhere = temp.path().join("elsewhere");
+        fs::write(&path, "current").expect("seed file");
+        if !seed_read_only(&elsewhere, "not a backup") {
+            return;
+        }
+        symlink(&elsewhere, backup_path_for(&path)).expect("link the backup");
+        let read_only = mode_of(&elsewhere);
+
+        backup_and_atomic_write(&path, "new").expect_err("the link's target is read-only");
+
+        assert_eq!(
+            mode_of(&elsewhere),
+            read_only,
+            "the target must stay read-only"
+        );
+        assert_eq!(
+            fs::read_to_string(&elsewhere).expect("read target"),
+            "not a backup"
+        );
+        assert_eq!(fs::read_to_string(&path).expect("read file"), "current");
     }
 }
