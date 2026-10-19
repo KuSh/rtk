@@ -1132,6 +1132,30 @@ mod tests {
         assert_eq!(fs::read_to_string(path).unwrap(), modified);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_pi_install_refuses_an_extension_link_loop() {
+        let tmp = test_isolation::tempdir();
+        with_pi_dir_override(&tmp, |pi_dir| {
+            let dir = pi_dir.join(PI_EXTENSIONS_SUBDIR);
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(PI_PLUGIN_FILE);
+            std::os::unix::fs::symlink("other.ts", &path).unwrap();
+            std::os::unix::fs::symlink(PI_PLUGIN_FILE, dir.join("other.ts")).unwrap();
+
+            for patch_mode in [PatchMode::Ask, PatchMode::Auto, PatchMode::Skip] {
+                let error = run_pi_mode_with_patch_mode(true, patch_mode, InitContext::default())
+                    .unwrap_err();
+
+                assert!(
+                    format!("{error:#}").contains("cannot be followed"),
+                    "{patch_mode:?}: {error:#}"
+                );
+                assert_eq!(fs::read_link(&path).unwrap(), Path::new("other.ts"));
+            }
+        });
+    }
+
     #[test]
     fn test_pi_uninstall_modified_extension_bails() {
         let tmp = test_isolation::tempdir();
