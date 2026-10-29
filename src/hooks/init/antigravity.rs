@@ -237,9 +237,11 @@ pub fn migrate_legacy_rules_at(
         }
 
         if ctx.dry_run {
-            preview(&legacy_file, WriteKind::Instructions);
+            if !dry_run_would_write(&legacy_file, WriteKind::Instructions) {
+                return None;
+            }
         } else {
-            if let Err(e) = patch_instructions(&legacy_file, remaining_bytes) {
+            if let Err(e) = write_file(&legacy_file, WriteKind::Instructions, remaining_bytes) {
                 eprintln!(
                     "  [warn] Failed to clean legacy Antigravity rules file {}: {e}",
                     legacy_file.display()
@@ -307,9 +309,7 @@ fn run_antigravity_mode_with_workspace(
     workspace_dir: Option<&Path>,
     ctx: InitContext,
 ) -> Result<()> {
-    let InitContext {
-        verbose, dry_run, ..
-    } = ctx;
+    let InitContext { dry_run, .. } = ctx;
     let plugin_dir = if global {
         base_dir.join("plugins/rtk")
     } else {
@@ -334,45 +334,43 @@ fn run_antigravity_mode_with_workspace(
             "[dry-run] would create plugin directory: {}",
             plugin_dir.display()
         );
-        preview(&rules_path, WriteKind::Owned);
-        println!("[dry-run] would write {}", rules_path.display());
-        preview(&hooks_json_path, WriteKind::Owned);
-        println!("[dry-run] would write {}", hooks_json_path.display());
-        preview(&plugin_json_path, WriteKind::Owned);
-        println!("[dry-run] would write {}", plugin_json_path.display());
-        if verbose > 0 {
-            println!(
-                "[dry-run] plugin.json content:\n{}",
-                ANTIGRAVITY_PLUGIN_JSON
-            );
-            println!("[dry-run] hooks.json content:\n{}", ANTIGRAVITY_HOOKS_JSON);
-            println!(
-                "[dry-run] rules/{ANTIGRAVITY_RULES_FILE} content:\n{}",
-                rules_content
-            );
-        }
-        let legacy_action = workspace_dir.and_then(|ws| migrate_legacy_rules_at(ws, ctx));
+    }
+    // plugin.json is what makes Antigravity discover the directory, so it goes last: a first
+    // install that fails halfway leaves no plugin rather than one missing its rules. A re-run
+    // over an existing plugin has no such guarantee.
+    let rules_name = format!("rules/{ANTIGRAVITY_RULES_FILE}");
+    for (path, content, name, what) in [
+        (
+            &rules_path,
+            rules_content,
+            rules_name.as_str(),
+            "plugin rules",
+        ),
+        (
+            &hooks_json_path,
+            ANTIGRAVITY_HOOKS_JSON,
+            "hooks.json",
+            "hooks.json",
+        ),
+        (
+            &plugin_json_path,
+            ANTIGRAVITY_PLUGIN_JSON,
+            "plugin.json",
+            "plugin.json",
+        ),
+    ] {
+        let report = Report::new(format!("[dry-run] would write {}", path.display()))
+            .with_detail(format!("[dry-run] {name} content:\n{content}"))
+            .done_verbose(format!("Wrote {}", path.display()));
+        write_reported(path, WriteKind::Owned, content, ctx, report)
+            .with_context(|| format!("Failed to write Antigravity {what}"))?;
+    }
+    let legacy_action = workspace_dir.and_then(|ws| migrate_legacy_rules_at(ws, ctx));
+
+    if dry_run {
         print_legacy_install_action(&legacy_action, true);
         print_dry_run_footer();
     } else {
-        // plugin.json is what makes Antigravity discover the directory, so it goes last:
-        // a first install that fails halfway leaves no plugin rather than one missing its
-        // rules. A re-run over an existing plugin has no such guarantee.
-        atomic_write(&rules_path, rules_content)
-            .context("Failed to write Antigravity plugin rules")?;
-        atomic_write(&hooks_json_path, ANTIGRAVITY_HOOKS_JSON)
-            .context("Failed to write Antigravity hooks.json")?;
-        atomic_write(&plugin_json_path, ANTIGRAVITY_PLUGIN_JSON)
-            .context("Failed to write Antigravity plugin.json")?;
-
-        if verbose > 0 {
-            eprintln!("Wrote {}", rules_path.display());
-            eprintln!("Wrote {}", hooks_json_path.display());
-            eprintln!("Wrote {}", plugin_json_path.display());
-        }
-
-        let legacy_action = workspace_dir.and_then(|ws| migrate_legacy_rules_at(ws, ctx));
-
         println!("\nRTK plugin configured for Google Antigravity.\n");
         println!("  Plugin: {} (installed)", plugin_dir.display());
         println!("  Hooks:  PreToolUse -> rtk hook antigravity");
@@ -966,6 +964,39 @@ mod tests {
             outside_plugin.join("plugin.json").exists(),
             "a directory outside the project is not removed"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_migration_dry_run_does_not_announce_a_strip_the_real_run_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let legacy_file = temp.path().join(LEGACY_RULES_REL_PATH);
+        fs::create_dir_all(legacy_file.parent().unwrap()).unwrap();
+        let content = format!("# Mine\n\n{LEGACY_ANTIGRAVITY_RULES_V036}");
+        fs::write(&legacy_file, &content).unwrap();
+        fs::set_permissions(&legacy_file, fs::Permissions::from_mode(0o444)).unwrap();
+        // Root ignores the file's mode, and then the strip is simply made.
+        let locked_for_us = fs::OpenOptions::new()
+            .write(true)
+            .open(&legacy_file)
+            .is_err();
+
+        let dry_run = migrate_legacy_rules_at(
+            temp.path(),
+            InitContext {
+                dry_run: true,
+                ..InitContext::default()
+            },
+        );
+        let real_run = migrate_legacy_rules_at(temp.path(), InitContext::default());
+
+        assert_eq!(dry_run.is_some(), real_run.is_some());
+        if locked_for_us {
+            assert_eq!(real_run, None);
+            assert_eq!(fs::read_to_string(&legacy_file).unwrap(), content);
+        }
     }
 
     #[cfg(unix)]

@@ -25,9 +25,7 @@ fn print_instructions_agents_awareness_note(agent: &str, ctx: InitContext) {
 
 pub(super) fn run_cline_mode(ctx: InitContext) -> Result<()> {
     let _scope = ProjectScope::enter(ctx);
-    let InitContext {
-        verbose, dry_run, ..
-    } = ctx;
+    let InitContext { dry_run, .. } = ctx;
     // Cline reads .clinerules from the project root (workspace-scoped)
     let rules_path = user_dirs::in_working_dir(".clinerules");
 
@@ -43,22 +41,21 @@ pub(super) fn run_cline_mode(ctx: InitContext) -> Result<()> {
         } else {
             format!("{}\n\n{}", existing.trim(), RTK_AWARENESS_FULL)
         };
-        if dry_run {
-            preview(&rules_path, WriteKind::Instructions);
-            println!(
-                "[dry-run] would write .clinerules: {}",
-                rules_path.display()
-            );
-            if verbose > 0 {
-                println!("[dry-run] content:\n{}", new_content);
-            }
-        } else {
-            patch_instructions(&rules_path, &new_content).context("Failed to write .clinerules")?;
-
-            if verbose > 0 {
-                eprintln!("Wrote .clinerules");
-            }
-
+        let report = Report::new(format!(
+            "[dry-run] would write .clinerules: {}",
+            rules_path.display()
+        ))
+        .with_content()
+        .done_verbose("Wrote .clinerules");
+        write_reported(
+            &rules_path,
+            WriteKind::Instructions,
+            &new_content,
+            ctx,
+            report,
+        )
+        .context("Failed to write .clinerules")?;
+        if !dry_run {
             println!("\nRTK configured for Cline.\n");
             println!("  Rules: .clinerules (installed)");
         }
@@ -74,9 +71,7 @@ pub(super) fn run_cline_mode(ctx: InitContext) -> Result<()> {
 
 pub(super) fn run_windsurf_mode(ctx: InitContext) -> Result<()> {
     let _scope = ProjectScope::enter(ctx);
-    let InitContext {
-        verbose, dry_run, ..
-    } = ctx;
+    let InitContext { dry_run, .. } = ctx;
     // Windsurf reads .windsurfrules from the project root (workspace-scoped).
     // Global rules (~/.codeium/windsurf/memories/global_rules.md) are unreliable.
     let rules_path = user_dirs::in_working_dir(".windsurfrules");
@@ -93,23 +88,21 @@ pub(super) fn run_windsurf_mode(ctx: InitContext) -> Result<()> {
         } else {
             format!("{}\n\n{}", existing.trim(), RTK_AWARENESS_FULL)
         };
-        if dry_run {
-            preview(&rules_path, WriteKind::Instructions);
-            println!(
-                "[dry-run] would write .windsurfrules: {}",
-                rules_path.display()
-            );
-            if verbose > 0 {
-                println!("[dry-run] content:\n{}", new_content);
-            }
-        } else {
-            patch_instructions(&rules_path, &new_content)
-                .context("Failed to write .windsurfrules")?;
-
-            if verbose > 0 {
-                eprintln!("Wrote .windsurfrules");
-            }
-
+        let report = Report::new(format!(
+            "[dry-run] would write .windsurfrules: {}",
+            rules_path.display()
+        ))
+        .with_content()
+        .done_verbose("Wrote .windsurfrules");
+        write_reported(
+            &rules_path,
+            WriteKind::Instructions,
+            &new_content,
+            ctx,
+            report,
+        )
+        .context("Failed to write .windsurfrules")?;
+        if !dry_run {
             println!("\nRTK configured for Windsurf Cascade.\n");
             println!("  Rules: .windsurfrules (installed)");
         }
@@ -131,9 +124,7 @@ pub fn run_kilocode_mode(ctx: InitContext) -> Result<()> {
 }
 
 fn run_kilocode_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
-    let InitContext {
-        verbose, dry_run, ..
-    } = ctx;
+    let InitContext { dry_run, .. } = ctx;
     // Kilo Code reads .kilocode/rules/ from the project root (workspace-scoped)
     let target_dir = base_dir.join(".kilocode/rules");
     let rules_path = target_dir.join("rtk-rules.md");
@@ -150,23 +141,15 @@ fn run_kilocode_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
         } else {
             format!("{}\n\n{}", existing.trim(), RTK_AWARENESS_FULL)
         };
-        if dry_run {
-            preview(&rules_path, WriteKind::Owned);
-            println!(
-                "[dry-run] would write {}: (and create parent dir if missing)",
-                rules_path.display()
-            );
-            if verbose > 0 {
-                println!("[dry-run] content:\n{}", new_content);
-            }
-        } else {
-            atomic_write(&rules_path, &new_content)
-                .context("Failed to write .kilocode/rules/rtk-rules.md")?;
-
-            if verbose > 0 {
-                eprintln!("Wrote .kilocode/rules/rtk-rules.md");
-            }
-
+        let report = Report::new(format!(
+            "[dry-run] would write {}: (and create parent dir if missing)",
+            rules_path.display()
+        ))
+        .with_content()
+        .done_verbose("Wrote .kilocode/rules/rtk-rules.md");
+        write_reported(&rules_path, WriteKind::Owned, &new_content, ctx, report)
+            .context("Failed to write .kilocode/rules/rtk-rules.md")?;
+        if !dry_run {
             println!("\nRTK configured for Kilo Code.\n");
             println!("  Rules: .kilocode/rules/rtk-rules.md (installed)");
         }
