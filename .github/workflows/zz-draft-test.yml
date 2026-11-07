@@ -1,0 +1,49 @@
+name: zz draft flow test
+on:
+  push:
+    branches: [develop]
+    paths: ['.github/workflows/zz-draft-test.yml']
+permissions:
+  contents: write
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      T: zz-draft-flow
+    steps:
+      - run: echo one > one.txt
+      - name: first upload
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ env.T }}
+          files: one.txt
+          prerelease: true
+          draft: true
+          token: ${{ github.token }}
+      - name: no tag after the first upload
+        run: |
+          git ls-remote --tags "https://github.com/$REPO" "refs/tags/$T" | tee tag.txt
+          test ! -s tag.txt
+          gh release view "$T" --repo "$REPO" --json isDraft,isPrerelease,assets --jq '"isDraft=\(.isDraft) isPrerelease=\(.isPrerelease) assets=\(.assets|length)"'
+      - run: echo two > two.txt
+      - name: second upload reuses the draft, as a re-run would
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ env.T }}
+          files: two.txt
+          prerelease: true
+          draft: true
+          token: ${{ github.token }}
+      - name: publish, the step release.yml runs
+        run: |
+          git ls-remote --tags "https://github.com/$REPO" "refs/tags/$T" | tee tag.txt
+          test ! -s tag.txt
+          gh release edit "$T" --repo "$REPO" --draft=false
+      - name: tag exists, still one prerelease with both assets
+        run: |
+          git ls-remote --tags "https://github.com/$REPO" "refs/tags/$T" | tee tag.txt
+          test -s tag.txt
+          gh release view "$T" --repo "$REPO" --json isDraft,isPrerelease,assets --jq '"isDraft=\(.isDraft) isPrerelease=\(.isPrerelease) assets=\(.assets|length)"'
+          test "$(gh api "repos/$REPO/releases" --jq "[.[]|select(.tag_name==\"$T\" or .draft)]|length")" = 1
