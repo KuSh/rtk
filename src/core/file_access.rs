@@ -559,21 +559,19 @@ mod windows {
                 .share_mode(FILE_SHARE_ALL)
                 .open(path)
         };
-        let copied = open(WRITE_DAC | WRITE_OWNER)
-            .or_else(|_| open(WRITE_DAC))
-            .and_then(|file| {
-                let descriptor = security.descriptor;
-                set(
-                    &file,
-                    descriptor,
-                    DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
-                )
-                .or_else(|_| set(&file, descriptor, DACL_SECURITY_INFORMATION))?;
-                if security.auto_inherited {
-                    restore_auto_inherited(&file, descriptor)?;
-                }
-                Ok(())
-            });
+        let copied = open(WRITE_DAC | WRITE_OWNER).and_then(|file| {
+            let descriptor = security.descriptor;
+            set(
+                &file,
+                descriptor,
+                DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+            )
+            .or_else(|_| set(&file, descriptor, DACL_SECURITY_INFORMATION))?;
+            if security.auto_inherited {
+                restore_auto_inherited(&file, descriptor)?;
+            }
+            Ok(())
+        });
         // A volume that refuses WRITE_DAC, such as an SMB share granting Change,
         // or one that builds DACLs it cannot set, is no obstacle when the new
         // file already has the DACL, as it does when the replaced one only
