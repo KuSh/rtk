@@ -3578,8 +3578,8 @@ level = "high"
         let path = temp.path().join("settings.json");
         fs::write(&path, "{}").expect("seed file");
         // Read only, for whoever owns the file, by the OWNER RIGHTS SID so no user name
-        // is needed; nothing else is granted, not even to Administrators, so without a
-        // privilege the process cannot change the DACL once it is on the file.
+        // is needed; nothing else is granted, so without a privilege the owner cannot
+        // change the DACL once it is on the file. On CI the owner is Administrators.
         seed_windows_dacl(&path, "D:PAI(A;;FR;;;OW)");
         let before = windows_dacl(&path);
         assert_eq!(
@@ -3651,6 +3651,39 @@ level = "high"
         }
     }
 
+    /// In a directory that lets its users modify files but not take them over, a
+    /// new file's owner may change its DACL but not its owner: the copy still
+    /// keeps the replaced file's own entries.
+    #[cfg(windows)]
+    #[test]
+    fn test_atomic_write_keeps_the_dacl_in_a_directory_granting_modify() {
+        let temp = TempDir::new().expect("create temp dir");
+        let dir = temp.path().join("modify");
+        fs::create_dir(&dir).expect("create dir");
+        // Modify for Authenticated Users and nothing else, by SID so no name's
+        // language matters.
+        icacls(
+            &dir,
+            &["/inheritance:r", "/grant:r", "*S-1-5-11:(OI)(CI)(M)"],
+        );
+        let path = dir.join("settings.json");
+        fs::write(&path, "{}").expect("seed file");
+        icacls(&path, &["/grant", "*S-1-5-32-546:(R)"]);
+        let before = windows_dacl(&path);
+        assert!(
+            before.contains(";BG)") && before.contains(";AU)"),
+            "the seed must grant Guests and inherit Authenticated Users: {before}"
+        );
+
+        atomic_write(&path, "{\"rtk\":true}").expect("rewrite file");
+
+        assert_eq!(
+            windows_dacl(&path),
+            before,
+            "the replaced file's DACL must stay"
+        );
+    }
+
     /// A file moved in from a stricter directory keeps the entries it inherited
     /// there, unprotected, and gains none from its new directory.
     #[cfg(windows)]
@@ -3660,7 +3693,7 @@ level = "high"
         let (strict, open) = (temp.path().join("strict"), temp.path().join("open"));
         fs::create_dir(&strict).expect("create strict dir");
         fs::create_dir(&open).expect("create open dir");
-        // In `strict` only a file's owner (RTK's user) has access; `open` also lets
+        // In `strict` only a file's owner has access; `open` also lets
         // the built-in Guests group read what it holds. By SID, so no name's
         // language matters.
         icacls(
