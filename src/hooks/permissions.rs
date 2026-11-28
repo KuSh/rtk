@@ -254,6 +254,41 @@ pub(crate) fn check_command_with_rules_and_prefixes(
     allow_rules: &[String],
     transparent_prefixes: &[String],
 ) -> PermissionVerdict {
+    let verdict = verdict_with_rules(
+        cmd,
+        deny_rules,
+        ask_rules,
+        allow_rules,
+        transparent_prefixes,
+    );
+    if verdict == PermissionVerdict::Deny || !cmd.contains('\\') {
+        return verdict;
+    }
+    let bash_joined = cmd.replace("\\\n", "");
+    let space_joined = registry::collapse_line_continuations(cmd);
+    if bash_joined == cmd && space_joined == cmd {
+        return verdict;
+    }
+    let denied_once_joined = [bash_joined.as_str(), space_joined.as_ref()]
+        .into_iter()
+        .any(|joined| {
+            verdict_with_rules(joined, deny_rules, &[], &[], transparent_prefixes)
+                == PermissionVerdict::Deny
+        });
+    if denied_once_joined {
+        PermissionVerdict::Defer
+    } else {
+        verdict
+    }
+}
+
+fn verdict_with_rules(
+    cmd: &str,
+    deny_rules: &[String],
+    ask_rules: &[String],
+    allow_rules: &[String],
+    transparent_prefixes: &[String],
+) -> PermissionVerdict {
     let segments = split_compound_command(cmd);
     // Each segment read every way a deny or ask rule may name it, once: as
     // written, then without the grammar a split leaves behind (`{`, `!`,
@@ -2545,6 +2580,39 @@ mod tests {
             ),
             PermissionVerdict::Ask
         );
+    }
+
+    #[test]
+    fn test_deny_rule_reads_past_a_line_continuation_the_rewrite_joins() {
+        let deny = vec!["git push:*".to_string()];
+        let allow = vec!["*".to_string()];
+        for cmd in [
+            "D=1 \\\na1=x git push origin main",
+            "D=\"a b\" \\\nx=1 git push origin main",
+            "x=1 git\\\npush origin main",
+            "x=1 git push\\\r\norigin main",
+        ] {
+            assert!(
+                registry::rewrite_command(cmd, &[], &[]).is_some(),
+                "{cmd:?}"
+            );
+            assert_eq!(
+                check_command_with_rules(cmd, &deny, &[], &allow),
+                PermissionVerdict::Defer,
+                "{cmd:?}"
+            );
+        }
+        for cmd in [
+            "D=1 \\\na1=x git status",
+            "x=1 git log \\\n--oneline",
+            "echo 'git \\\npush'",
+        ] {
+            assert_eq!(
+                check_command_with_rules(cmd, &deny, &[], &allow),
+                PermissionVerdict::Allow,
+                "{cmd:?}"
+            );
+        }
     }
 
     #[test]
